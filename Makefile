@@ -16,17 +16,17 @@ lint:
 
 # Build WASM
 wasm:
-	wasm-pack build infrastructure/wasm --target web --out-dir ../../infrastructure/web/pkg
+	wasm-pack build infrastructure/wasm --target web --out-dir ../../ui/web/pkg
 
 # Build everything
 build: wasm
 
-# Development server (requires web infrastructure)
+# Development server
 dev: wasm
-	@echo "Web infrastructure not yet set up"
+	cd ui/web && npm run dev
 
 # Clean build artifacts
 clean:
 	cargo clean
-	rm -rf infrastructure/web/pkg
-	rm -rf infrastructure/web/dist
+	rm -rf ui/web/pkg
+	rm -rf ui/web/dist
