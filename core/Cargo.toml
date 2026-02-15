@@ -1,0 +1,13 @@
+[package]
+name = "zapsquad-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+glam = { workspace = true }
+serde = { workspace = true }
+
+# NO external game engine deps here - core is pure business logic

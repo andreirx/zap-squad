@@ -1,0 +1,19 @@
+[package]
+name = "zapsquad-wasm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+zapsquad-core = { path = "../../core" }
+zapsquad-adapters = { path = "../../adapters" }
+zap-engine = { path = "../../../zap-engine/crates/zap-engine" }
+zap-web = { path = "../../../zap-engine/crates/zap-web" }
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1"
+console_log = "1.0"
+log = "0.4"
+glam = { workspace = true }
+getrandom = { version = "0.3", features = ["wasm_js"] }
