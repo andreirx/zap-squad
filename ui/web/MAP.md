@@ -8,6 +8,17 @@ This is the frontend application. It is a "Detail" in Clean Architecture terms. 
 - **Build Tool:** Vite
 - **Language:** TypeScript
 
+## Dependencies
+- **Depends on:** `infrastructure/wasm` (to communicate with the Core).
+- **Depends on:** `adapters` (types and interfaces, if shared).
+
+## Navigation
+- [Editors](./src/editors/MAP.md)
+- [Pages](./src/pages/MAP.md)
+- [Storage](./src/storage/MAP.md)
+- [Hooks](./src/hooks/MAP.md)
+- [Components](./src/components/MAP.md)
+
 ## Responsibilities
 - **Rendering:** Displaying the game state to the user.
 - **Input:** Capturing user input and sending it to the `Wasm` bridge (which forwards to `adapters`).
