@@ -1,0 +1,19 @@
+{
+  "name": "zap-squad-tools",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "pack": "tsx pack-sprites.ts",
+    "pack:watch": "nodemon --watch ../infrastructure/web/public/mods -e png,json --exec 'tsx pack-sprites.ts'"
+  },
+  "dependencies": {
+    "canvas": "^2.11.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "nodemon": "^3.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.7.0"
+  }
+}

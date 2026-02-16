@@ -1,19 +1,24 @@
 import { useState, useCallback } from 'react';
 import { createStorage } from '../storage';
+import { packAllSprites, savePackedAssets, type ZapManifest } from '../utils/spritePacker';
 
 interface HotReloadCallbacks {
   onReloadStart?: () => void;
   onReloadComplete?: (data: ReloadedData) => void;
   onReloadError?: (error: Error) => void;
+  onPackStart?: () => void;
+  onPackComplete?: () => void;
 }
 
-interface ReloadedData {
+export interface ReloadedData {
   scripts: Record<string, string>;
   levels: string[];
-  manifest: AssetManifest;
+  gameManifest: GameManifest;
+  spriteManifest: ZapManifest;
 }
 
-interface AssetManifest {
+/** Game manifest for actor/weapon definitions (used by Rust) */
+interface GameManifest {
   bodies: Record<string, BodyDefinition>;
   weapons: Record<string, WeaponDefinition>;
 }
@@ -35,9 +40,35 @@ interface WeaponDefinition {
 
 export function useHotReload(callbacks?: HotReloadCallbacks) {
   const [isReloading, setIsReloading] = useState(false);
+  const [isPacking, setIsPacking] = useState(false);
   const [lastReloadTime, setLastReloadTime] = useState<Date | null>(null);
   const [reloadedData, setReloadedData] = useState<ReloadedData | null>(null);
 
+  /**
+   * Pack sprites into atlases without full reload
+   */
+  const packSprites = useCallback(async () => {
+    setIsPacking(true);
+    callbacks?.onPackStart?.();
+
+    try {
+      console.log('Packing sprites...');
+      const result = await packAllSprites();
+      await savePackedAssets(result);
+      console.log('Sprite packing complete');
+      callbacks?.onPackComplete?.();
+      return result.manifest;
+    } catch (error) {
+      console.error('Sprite packing failed:', error);
+      throw error;
+    } finally {
+      setIsPacking(false);
+    }
+  }, [callbacks]);
+
+  /**
+   * Full reload: pack sprites + load scripts + load levels
+   */
   const reload = useCallback(async () => {
     setIsReloading(true);
     callbacks?.onReloadStart?.();
@@ -45,7 +76,12 @@ export function useHotReload(callbacks?: HotReloadCallbacks) {
     try {
       const storage = createStorage();
 
-      // Load all scripts
+      // Step 1: Pack sprites into atlases
+      console.log('Step 1: Packing sprites...');
+      const spriteManifest = await packSprites();
+
+      // Step 2: Load all scripts
+      console.log('Step 2: Loading scripts...');
       const scriptFiles = await storage.list('scripts');
       const scripts: Record<string, string> = {};
 
@@ -56,46 +92,52 @@ export function useHotReload(callbacks?: HotReloadCallbacks) {
         }
       }
 
-      // Load all levels
+      // Step 3: Load all levels
+      console.log('Step 3: Loading levels...');
       const levelFiles = await storage.list('levels');
       const levels = levelFiles.filter(f => f.endsWith('.json'));
 
-      // Build manifest from character/weapon definitions
-      const manifest = await buildManifest(storage);
+      // Step 4: Build game manifest from definitions
+      console.log('Step 4: Building game manifest...');
+      const gameManifest = await buildGameManifest(storage);
 
-      const data: ReloadedData = { scripts, levels, manifest };
+      const data: ReloadedData = { scripts, levels, gameManifest, spriteManifest };
 
       setReloadedData(data);
       setLastReloadTime(new Date());
       callbacks?.onReloadComplete?.(data);
 
-      // TODO: Send to WASM worker
-      // sendEvent({ type: 'reload_mods', data });
-
       console.log('Hot reload complete:', {
         scripts: Object.keys(scripts).length,
         levels: levels.length,
-        bodies: Object.keys(manifest.bodies).length,
-        weapons: Object.keys(manifest.weapons).length,
+        bodies: Object.keys(gameManifest.bodies).length,
+        weapons: Object.keys(gameManifest.weapons).length,
+        atlases: spriteManifest.atlases.length,
+        sprites: Object.keys(spriteManifest.sprites).length,
       });
+
+      return data;
     } catch (error) {
       callbacks?.onReloadError?.(error as Error);
       console.error('Hot reload failed:', error);
+      throw error;
     } finally {
       setIsReloading(false);
     }
-  }, [callbacks]);
+  }, [callbacks, packSprites]);
 
   return {
     reload,
+    packSprites,
     isReloading,
+    isPacking,
     lastReloadTime,
     reloadedData,
   };
 }
 
-async function buildManifest(storage: ReturnType<typeof createStorage>): Promise<AssetManifest> {
-  const manifest: AssetManifest = {
+async function buildGameManifest(storage: ReturnType<typeof createStorage>): Promise<GameManifest> {
+  const manifest: GameManifest = {
     bodies: {},
     weapons: {},
   };

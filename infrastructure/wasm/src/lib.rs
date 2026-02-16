@@ -67,6 +67,7 @@ pub struct ZapSquadGame {
     pending_scripts: Option<HashMap<String, String>>,
     pending_manifest: Option<String>,
     pending_level: Option<String>,
+    pending_sprite_manifest: Option<String>,
 }
 
 impl ZapSquadGame {
@@ -83,6 +84,7 @@ impl ZapSquadGame {
             pending_scripts: None,
             pending_manifest: None,
             pending_level: None,
+            pending_sprite_manifest: None,
         }
     }
 
@@ -122,8 +124,30 @@ impl ZapSquadGame {
         id
     }
 
-    /// Process pending hot-reload data
-    fn process_pending_reloads(&mut self) {
+    /// Process pending hot-reload data (returns sprite manifest to load in update with ctx)
+    fn process_pending_reloads(&mut self) -> Option<String> {
+        // Check thread_local storage for pending reloads from WASM exports
+        PENDING_SCRIPTS.with(|p| {
+            if let Some(scripts) = p.borrow_mut().take() {
+                self.pending_scripts = Some(scripts);
+            }
+        });
+        PENDING_GAME_MANIFEST.with(|p| {
+            if let Some(manifest) = p.borrow_mut().take() {
+                self.pending_manifest = Some(manifest);
+            }
+        });
+        PENDING_SPRITE_MANIFEST.with(|p| {
+            if let Some(manifest) = p.borrow_mut().take() {
+                self.pending_sprite_manifest = Some(manifest);
+            }
+        });
+        PENDING_LEVEL.with(|p| {
+            if let Some(level) = p.borrow_mut().take() {
+                self.pending_level = Some(level);
+            }
+        });
+
         // Reload scripts
         if let Some(scripts) = self.pending_scripts.take() {
             self.scripts.clear_scripts();
@@ -137,15 +161,15 @@ impl ZapSquadGame {
             web_sys::console::log_1(&format!("Loaded {} scripts", self.scripts.list_scripts().len()).into());
         }
 
-        // Reload manifest
+        // Reload game manifest (body/weapon definitions for CompositeRenderer)
         if let Some(manifest_json) = self.pending_manifest.take() {
             match AssetManifest::from_json(&manifest_json) {
                 Ok(manifest) => {
                     self.composite_renderer.reload_manifest(manifest);
-                    web_sys::console::log_1(&"Manifest reloaded".into());
+                    web_sys::console::log_1(&"Game manifest reloaded".into());
                 }
                 Err(e) => {
-                    web_sys::console::error_1(&format!("Failed to parse manifest: {:?}", e).into());
+                    web_sys::console::error_1(&format!("Failed to parse game manifest: {:?}", e).into());
                 }
             }
         }
@@ -154,6 +178,9 @@ impl ZapSquadGame {
         if let Some(level_json) = self.pending_level.take() {
             self.load_level_from_json(&level_json);
         }
+
+        // Return sprite manifest for loading in update() with ctx
+        self.pending_sprite_manifest.take()
     }
 
     /// Load level from LDtk JSON
@@ -359,7 +386,14 @@ impl Game for ZapSquadGame {
         self.time += dt;
 
         // Process any pending hot-reloads
-        self.process_pending_reloads();
+        if let Some(sprite_manifest_json) = self.process_pending_reloads() {
+            // Load sprite manifest into zap-engine's registry
+            if let Err(e) = ctx.load_manifest(&sprite_manifest_json) {
+                web_sys::console::error_1(&format!("Failed to load sprite manifest: {}", e).into());
+            } else {
+                web_sys::console::log_1(&"Sprite manifest loaded into zap-engine".into());
+            }
+        }
 
         // Process zap-engine input events
         for event in input.iter() {
@@ -463,27 +497,51 @@ impl ZapSquadGame {
 }
 
 // Additional WASM exports for hot-reload
+// Note: These use thread_local storage since we can't directly access the game instance
+// The game checks these in its update loop
+
+thread_local! {
+    static PENDING_SCRIPTS: std::cell::RefCell<Option<HashMap<String, String>>> = std::cell::RefCell::new(None);
+    static PENDING_GAME_MANIFEST: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+    static PENDING_SPRITE_MANIFEST: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+    static PENDING_LEVEL: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+}
+
+/// Reload Rhai scripts
+/// Format: { "script_name": "source code", ... }
 #[wasm_bindgen]
 pub fn reload_scripts(scripts_json: &str) {
-    // Parse scripts JSON and store for processing
-    // Format: { "script_name": "source code", ... }
     if let Ok(scripts) = serde_json::from_str::<HashMap<String, String>>(scripts_json) {
-        // Store in a thread-local or pass via custom event
-        web_sys::console::log_1(&format!("Received {} scripts for reload", scripts.len()).into());
-        // Note: Actual reload happens in game update loop
+        PENDING_SCRIPTS.with(|p| *p.borrow_mut() = Some(scripts.clone()));
+        web_sys::console::log_1(&format!("Queued {} scripts for reload", scripts.len()).into());
     }
 }
 
+/// Reload game manifest (body/weapon definitions)
 #[wasm_bindgen]
-pub fn reload_manifest(manifest_json: &str) {
-    web_sys::console::log_1(&format!("Received manifest: {} bytes", manifest_json.len()).into());
-    // Note: Actual reload happens in game update loop
+pub fn reload_game_manifest(manifest_json: &str) {
+    PENDING_GAME_MANIFEST.with(|p| *p.borrow_mut() = Some(manifest_json.to_string()));
+    web_sys::console::log_1(&format!("Queued game manifest for reload: {} bytes", manifest_json.len()).into());
 }
 
+/// Reload sprite manifest (zap-engine atlas format)
+#[wasm_bindgen]
+pub fn reload_sprite_manifest(manifest_json: &str) {
+    PENDING_SPRITE_MANIFEST.with(|p| *p.borrow_mut() = Some(manifest_json.to_string()));
+    web_sys::console::log_1(&format!("Queued sprite manifest for reload: {} bytes", manifest_json.len()).into());
+}
+
+/// Load an LDtk level
 #[wasm_bindgen]
 pub fn load_level(level_json: &str) {
-    web_sys::console::log_1(&format!("Received level: {} bytes", level_json.len()).into());
-    // Note: Actual load happens in game update loop
+    PENDING_LEVEL.with(|p| *p.borrow_mut() = Some(level_json.to_string()));
+    web_sys::console::log_1(&format!("Queued level for load: {} bytes", level_json.len()).into());
+}
+
+/// Legacy alias for reload_game_manifest
+#[wasm_bindgen]
+pub fn reload_manifest(manifest_json: &str) {
+    reload_game_manifest(manifest_json);
 }
 
 // Export the game using zap-web macro
