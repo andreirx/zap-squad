@@ -1,6 +1,6 @@
 import { BrowserRouter, Routes, Route, Link, useLocation } from 'react-router-dom';
 import { GamePage } from './pages/GamePage';
-import { CharacterEditor, TileEditor, WeaponEditor } from './editors';
+import { CharacterEditor, TileEditor, WeaponEditor, MapEditor } from './editors';
 
 export default function App() {
   return (
@@ -13,6 +13,7 @@ export default function App() {
             <Route path="/editor/character" element={<CharacterEditor />} />
             <Route path="/editor/weapon" element={<WeaponEditor />} />
             <Route path="/editor/tile" element={<TileEditor />} />
+            <Route path="/editor/map" element={<MapEditor />} />
           </Routes>
         </main>
       </div>
@@ -54,6 +55,9 @@ function Navigation() {
       </Link>
       <Link to="/editor/tile" style={linkStyle('/editor/tile')}>
         Tiles
+      </Link>
+      <Link to="/editor/map" style={linkStyle('/editor/map')}>
+        Maps
       </Link>
     </nav>
   );
