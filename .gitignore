@@ -15,6 +15,10 @@ pnpm-debug.log*
 .env
 .env.local
 
+# Generated/imported assets (not tracked - regenerate with make bake-atlases)
+ui/web/public/assets/
+ui/web/public/mods/
+
 # IDE
 .idea
 .vscode

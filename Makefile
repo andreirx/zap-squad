@@ -1,4 +1,4 @@
-.PHONY: test lint build clean wasm dev check pack-sprites tools-install
+.PHONY: test lint build clean wasm dev check pack-sprites tools-install import-hexmanos bake-atlases
 
 # Run all tests (core must pass without WASM)
 test:
@@ -36,6 +36,14 @@ dev: wasm
 # Full development setup with initial sprite pack
 dev-full: build
 	cd ui/web && npm run dev
+
+# Import hexmanos assets (requires sharp, no canvas needed)
+import-hexmanos:
+	cd tools && npm install sharp tsx && npx tsx import-hexmanos.ts --source ~/hexmanos_uploads --output ../ui/web/public/mods --size 128
+
+# Bake sprites into atlases (run after import or editing)
+bake-atlases:
+	cd tools && npm install sharp tsx && npx tsx bake-atlases.ts --input ../ui/web/public/mods --output ../ui/web/public/assets --size 128
 
 # Clean build artifacts
 clean:
