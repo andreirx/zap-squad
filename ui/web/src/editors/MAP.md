@@ -1,14 +1,65 @@
 # Editors (`ui/web/src/editors/`)
 
 ## Role: Content Creation Tools
-This directory contains the tools used to create content for the game (Levels, Characters, Weapons, Tiles). These are "Editor" mode features, distinct from the main "Game" mode.
+This directory contains the tools used to create content for the game (Levels, Characters, Objects, Tiles). These are "Editor" mode features, distinct from the main "Game" mode.
 
-## Components
-- **CharacterEditor**: For defining character sprites and stats.
-- **TileEditor**: For creating tile definitions and pixel art.
-- **WeaponEditor**: For defining weapon properties and animations.
-- **PixelCanvas**: A shared component for pixel art editing.
+## Editors
+
+### CharacterEditor
+Creates character sprites with visual states and animations.
+- **Visual States:** full, hurt1, hurt2, critical (health-based appearance)
+- **Animations:** idle, walk, melee_attack, throw_attack
+- **Directions:** north, east, south, west
+- **Output:** `characters/{id}/{id}_{visualState}_{animation}_{direction}_{frame}.png`
+
+### ObjectEditor
+Creates object sprites with visual states.
+- **Visual States:** new, worn, damaged, broken
+- **Animations:** idle, landed (for throwables)
+- **Output:** `objects/{id}/{id}_{visualState}_{animation}_{frame}.png`
+
+### TileEditor
+Creates tile definitions with pixel art variations.
+- **Tile Types:**
+  - `TILE` - Terrain tiles with 1-8 random variations
+  - `PATH` - Connectable paths with 15 connectivity variations
+  - `BRIDGE` - Bridge tiles rendered under paths crossing water
+- **Terrain Types:** LAND, WATER
+- **Bridge Association:** PATH tiles can reference a BRIDGE tile via `bridgeAssetId`
+- **Generation Tools:** Random fill, auto-generate all 15 path variations
+- **Output:** `tiles/{id}/properties.json` + `tile_{0-14}.png`
+
+### MapEditor
+Full-featured level editor with layer support.
+- **Layers:**
+  - Terrain - Base terrain tiles
+  - Paths - PATH and BRIDGE tiles with auto-connectivity
+  - Entities - Characters and objects
+- **Features:**
+  - Pan/zoom canvas (scroll to zoom, right-click/middle-click/space+drag to pan)
+  - Continuous painting with Bresenham line interpolation
+  - Auto-bridge placement when ground paths cross water
+  - Path connectivity auto-calculation (15 variations based on neighbors)
+  - Terrain transitions (edge blending between different terrain types)
+- **Output:** `levels/{name}.json` (LDtk-compatible format)
+
+## Shared Components
+
+### PixelCanvas
+Core pixel art editing component used by all sprite editors.
+- 128x128 canvas (standard tile/sprite size)
+- Tools: pencil, eraser, fill, line, rectangle, ellipse, color picker
+- Undo/redo support
+- Zoom and grid overlay
+- Color palette with recent colors
+
+### Toolbar
+Shared toolbar component for tool selection, zoom, brush size, and undo/redo.
+
+### ColorPicker
+HSL color picker with opacity support and recent colors.
 
 ## Dependencies
-- Uses `storage` to save definitions.
-- Uses `hooks` for common functionality.
+- Uses `storage` to save definitions and images.
+- Uses `hooks/useCanvasTransform` for pan/zoom functionality.
+- Uses `components/PanZoomCanvas` for the map editor canvas.

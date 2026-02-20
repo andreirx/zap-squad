@@ -350,8 +350,8 @@ export function GameCanvas({
                   charImagesRef.current.set(charId, img);
                   setRenderKey(k => k + 1);
                 }).catch(() => {
-                  // Try objects folder (with idle animation)
-                  const objUrl = storage.getReadUrl(`objects/${charId}/${charId}_idle_0.png`);
+                  // Try objects folder (with new/idle animation)
+                  const objUrl = storage.getReadUrl(`objects/${charId}/${charId}_new_idle_0.png`);
                   loadImage(objUrl).then(img => {
                     charImagesRef.current.set(charId, img);
                     setRenderKey(k => k + 1);
@@ -527,40 +527,51 @@ export function GameCanvas({
       }
 
       // ========== RENDER PASS 3: Auto-bridges (under ground paths) ==========
-      const bridgeGrid = new Map<string, GridTile>();
+      // Store both bridge asset and source path type for connectivity matching
+      const bridgeGrid = new Map<string, { bridgeSrc: string; pathSrc: string; px: [number, number] }>();
       for (const { tile, bridgeAssetId } of autoBridges) {
-        bridgeGrid.set(`${tile.px[0]},${tile.px[1]}`, { ...tile, src: bridgeAssetId });
+        bridgeGrid.set(`${tile.px[0]},${tile.px[1]}`, {
+          bridgeSrc: bridgeAssetId,
+          pathSrc: tile.src, // The path type above this bridge
+          px: tile.px
+        });
       }
       // Add explicit bridge tiles
       for (const tile of bridgeTiles) {
-        bridgeGrid.set(`${tile.px[0]},${tile.px[1]}`, tile);
+        // For explicit bridges, find the ground path above to get the path type
+        const groundPathAbove = groundPathGrid.get(`${tile.px[0]},${tile.px[1]}`);
+        bridgeGrid.set(`${tile.px[0]},${tile.px[1]}`, {
+          bridgeSrc: tile.src,
+          pathSrc: groundPathAbove?.src || '',
+          px: tile.px
+        });
       }
 
-      for (const [, tile] of bridgeGrid) {
-        const images = tileImagesRef.current.get(tile.src);
+      for (const [, bridge] of bridgeGrid) {
+        const images = tileImagesRef.current.get(bridge.bridgeSrc);
         if (images) {
-          // For bridges, calculate connectivity based on ground paths at this and neighbor positions
+          // Calculate bridge connectivity based on neighboring ground paths OF THE SAME TYPE
           let bits = 0;
-          const x = tile.px[0];
-          const y = tile.px[1];
+          const x = bridge.px[0];
+          const y = bridge.px[1];
           const gridX = x / TILE_SIZE;
           const gridY = y / TILE_SIZE;
 
-          // Check if there's a ground path in each direction
-          const northKey = `${x},${y - TILE_SIZE}`;
-          const southKey = `${x},${y + TILE_SIZE}`;
-          const westKey = `${x - TILE_SIZE},${y}`;
-          const eastKey = `${x + TILE_SIZE},${y}`;
+          // Only connect if neighbor has the same path type
+          const northPath = groundPathGrid.get(`${x},${y - TILE_SIZE}`);
+          const southPath = groundPathGrid.get(`${x},${y + TILE_SIZE}`);
+          const westPath = groundPathGrid.get(`${x - TILE_SIZE},${y}`);
+          const eastPath = groundPathGrid.get(`${x + TILE_SIZE},${y}`);
 
-          if (gridY > 0 && groundPathGrid.has(northKey)) bits |= 8;
-          if (gridY < level.pxHei / TILE_SIZE - 1 && groundPathGrid.has(southKey)) bits |= 4;
-          if (gridX > 0 && groundPathGrid.has(westKey)) bits |= 2;
-          if (gridX < level.pxWid / TILE_SIZE - 1 && groundPathGrid.has(eastKey)) bits |= 1;
+          if (gridY > 0 && northPath?.src === bridge.pathSrc) bits |= 8;
+          if (gridY < level.pxHei / TILE_SIZE - 1 && southPath?.src === bridge.pathSrc) bits |= 4;
+          if (gridX > 0 && westPath?.src === bridge.pathSrc) bits |= 2;
+          if (gridX < level.pxWid / TILE_SIZE - 1 && eastPath?.src === bridge.pathSrc) bits |= 1;
 
           const bridgeVariation = bits === 0 ? 0 : bits - 1;
           const img = images.get(bridgeVariation) || images.get(0);
           if (img) {
-            ctx.drawImage(img, tile.px[0], tile.px[1], TILE_SIZE, TILE_SIZE);
+            ctx.drawImage(img, bridge.px[0], bridge.px[1], TILE_SIZE, TILE_SIZE);
           }
         }
       }

@@ -268,8 +268,8 @@ export function useCanvasTransform(options: UseCanvasTransformOptions = {}): Use
     (e: React.MouseEvent) => {
       if (!enablePan) return;
 
-      // Middle mouse button OR (left button + space held)
-      const shouldPan = e.button === 1 || (e.button === 0 && spaceHeldRef.current);
+      // Middle mouse button OR right mouse button OR (left button + space held)
+      const shouldPan = e.button === 1 || e.button === 2 || (e.button === 0 && spaceHeldRef.current);
 
       if (shouldPan) {
         e.preventDefault();

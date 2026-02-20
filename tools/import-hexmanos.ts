@@ -145,6 +145,8 @@ interface ZapSquadTileDef {
   damagePerTurn: number;
   tileType: string; // TILE, PATH, BRIDGE
   terrainType: string; // LAND, WATER
+  bridgeAssetId?: string; // Reference to bridge tile for water crossings
+  variations: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -308,7 +310,7 @@ async function importTiles(): Promise<Map<string, string>> {
     const outDir = path.join(outputDir, 'tiles', cleanId);
     fs.mkdirSync(outDir, { recursive: true });
 
-    // Write new definition
+    // Write new definition (bridgeAssetId will be resolved in second pass)
     const now = new Date().toISOString();
     const newDef: ZapSquadTileDef = {
       id: cleanId,
@@ -318,6 +320,8 @@ async function importTiles(): Promise<Map<string, string>> {
       damagePerTurn: 0,
       tileType: def.tileType || 'TILE',
       terrainType: def.terrainType || 'LAND',
+      bridgeAssetId: def.bridgeAssetId, // Store raw UUID for now
+      variations: def.variations || 1,
       createdAt: now,
       updatedAt: now,
     };
@@ -338,6 +342,24 @@ async function importTiles(): Promise<Map<string, string>> {
     }
 
     console.log(`  ${uuid} -> ${cleanId} (${spriteCount} sprites)`);
+  }
+
+  // Second pass: resolve bridgeAssetId UUIDs to clean tile IDs
+  console.log('\nResolving bridge references...');
+  for (const [uuid, cleanId] of idMapping) {
+    const defPath = path.join(outputDir, 'tiles', cleanId, 'definition.json');
+    if (fs.existsSync(defPath)) {
+      const def = JSON.parse(fs.readFileSync(defPath, 'utf-8'));
+      if (def.bridgeAssetId && idMapping.has(def.bridgeAssetId)) {
+        def.bridgeAssetId = idMapping.get(def.bridgeAssetId);
+        fs.writeFileSync(defPath, JSON.stringify(def, null, 2));
+        console.log(`  ${cleanId} -> bridge: ${def.bridgeAssetId}`);
+      } else if (def.bridgeAssetId) {
+        // Remove invalid bridge reference
+        delete def.bridgeAssetId;
+        fs.writeFileSync(defPath, JSON.stringify(def, null, 2));
+      }
+    }
   }
 
   return idMapping;

@@ -293,6 +293,8 @@ export function MapEditor() {
 
   // Tile images for rendering
   const tileImagesRef = useRef<Map<string, TileAsset>>(new Map());
+  // Entity images for rendering (characters and objects)
+  const charImagesRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const [renderKey, setRenderKey] = useState(0);
 
   // Load available assets on mount
@@ -427,7 +429,7 @@ export function MapEditor() {
           loadedObjs.push({
             id,
             name: def.name || id,
-            imageUrl: storage.getReadUrl(`objects/${id}/${id}_idle_0.png`),
+            imageUrl: storage.getReadUrl(`objects/${id}/${id}_new_idle_0.png`),
           });
         } catch (e) {
           console.warn(`Failed to load object ${id}:`, e);
@@ -489,19 +491,71 @@ export function MapEditor() {
                 const defJson = await storage.readText(`tiles/${tileId}/definition.json`);
                 props = JSON.parse(defJson);
               }
+              const tileType = (props.tileType as string) || 'TILE';
+              const variations = (props.variations as number) || 1;
               const asset: TileAsset = {
                 id: tileId,
                 name: (props.name as string) || tileId,
-                tileType: (props.tileType as string) || 'TILE',
+                tileType,
                 terrainType: props.terrainType as string,
-                variations: (props.variations as number) || 1,
+                variations,
                 bridgeAssetId: props.bridgeAssetId as string,
                 images: new Map(),
               };
               tileImagesRef.current.set(tileId, asset);
+
+              // Load tile images
+              const maxVar = tileType === 'PATH' || tileType === 'BRIDGE' ? 15 : variations;
+              for (let v = 0; v < maxVar; v++) {
+                const varUrl = storage.getReadUrl(`tiles/${tileId}/tile_${v}.png`);
+                loadImage(varUrl).then(img => {
+                  asset.images!.set(v, img);
+                  setRenderKey(k => k + 1);
+                }).catch(() => {});
+              }
             } catch {
               // Tile definition not found - assume it's a terrain tile
             }
+          }
+        }
+
+        // Also load bridge tiles referenced by bridgeAssetId
+        const bridgeIds = new Set<string>();
+        for (const [, asset] of tileImagesRef.current) {
+          if (asset.bridgeAssetId && !tileImagesRef.current.has(asset.bridgeAssetId)) {
+            bridgeIds.add(asset.bridgeAssetId);
+          }
+        }
+        for (const bridgeId of bridgeIds) {
+          try {
+            let props: Record<string, unknown> = {};
+            try {
+              const propsJson = await storage.readText(`tiles/${bridgeId}/properties.json`);
+              props = JSON.parse(propsJson);
+            } catch {
+              const defJson = await storage.readText(`tiles/${bridgeId}/definition.json`);
+              props = JSON.parse(defJson);
+            }
+            const bridgeAsset: TileAsset = {
+              id: bridgeId,
+              name: (props.name as string) || bridgeId,
+              tileType: 'BRIDGE',
+              terrainType: props.terrainType as string,
+              variations: (props.variations as number) || 15,
+              images: new Map(),
+            };
+            tileImagesRef.current.set(bridgeId, bridgeAsset);
+
+            // Load bridge images (15 variations for connectivity)
+            for (let v = 0; v < 15; v++) {
+              const varUrl = storage.getReadUrl(`tiles/${bridgeId}/tile_${v}.png`);
+              loadImage(varUrl).then(img => {
+                bridgeAsset.images!.set(v, img);
+                setRenderKey(k => k + 1);
+              }).catch(() => {});
+            }
+          } catch {
+            // Bridge tile not found
           }
         }
 
@@ -534,6 +588,28 @@ export function MapEditor() {
             defId: resolvedId,
           };
         });
+
+        // Load entity images
+        for (const entity of normalizedEntities) {
+          const charId = entity.defId;
+          if (charId && charId !== 'unknown' && !charImagesRef.current.has(charId)) {
+            // Try characters folder first (with visual state prefix)
+            const charUrl = storage.getReadUrl(`characters/${charId}/${charId}_full_idle_south_0.png`);
+            loadImage(charUrl).then(img => {
+              charImagesRef.current.set(charId, img);
+              setRenderKey(k => k + 1);
+            }).catch(() => {
+              // Try objects folder (with new/idle animation)
+              const objUrl = storage.getReadUrl(`objects/${charId}/${charId}_new_idle_0.png`);
+              loadImage(objUrl).then(img => {
+                charImagesRef.current.set(charId, img);
+                setRenderKey(k => k + 1);
+              }).catch(() => {
+                // Neither exists - fallback will show circle
+              });
+            });
+          }
+        }
 
         setLevel({
           identifier: loadedLevel.identifier,
@@ -882,6 +958,23 @@ export function MapEditor() {
       groundPathGrid.set(`${tile.px[0]},${tile.px[1]}`, tile);
     }
 
+    // Auto-detect bridges: ground paths over water terrain or water paths
+    const autoBridges: { tile: GridTile; bridgeAssetId: string }[] = [];
+    for (const tile of groundPaths) {
+      const asset = tileImagesRef.current.get(tile.src);
+      if (asset?.bridgeAssetId) {
+        const key = `${tile.px[0]},${tile.px[1]}`;
+        const terrainBelow = terrainGrid.get(key);
+        const terrainAsset = terrainBelow ? tileImagesRef.current.get(terrainBelow.src) : null;
+        const waterPathBelow = waterPathGrid.has(key);
+
+        // If this ground path is over water terrain or water path, add auto-bridge
+        if (terrainAsset?.terrainType === 'WATER' || waterPathBelow) {
+          autoBridges.push({ tile, bridgeAssetId: asset.bridgeAssetId });
+        }
+      }
+    }
+
     // Pass 2a: Draw water paths (rivers) with connectivity
     for (const tile of waterPaths) {
       const asset = tileImagesRef.current.get(tile.src);
@@ -899,25 +992,51 @@ export function MapEditor() {
     }
 
     // Pass 2b: Draw bridges with connectivity (based on ground paths above)
+    // Combine explicit bridges and auto-detected bridges
+    // Store both the bridge asset and the source path type for connectivity matching
+    const bridgeGrid = new Map<string, { bridgeSrc: string; pathSrc: string; px: [number, number] }>();
+    for (const { tile, bridgeAssetId } of autoBridges) {
+      bridgeGrid.set(`${tile.px[0]},${tile.px[1]}`, {
+        bridgeSrc: bridgeAssetId,
+        pathSrc: tile.src, // The path type above this bridge
+        px: tile.px
+      });
+    }
     for (const tile of bridges) {
-      const asset = tileImagesRef.current.get(tile.src);
+      // For explicit bridges, find the ground path above to get the path type
+      const groundPathAbove = groundPathGrid.get(`${tile.px[0]},${tile.px[1]}`);
+      bridgeGrid.set(`${tile.px[0]},${tile.px[1]}`, {
+        bridgeSrc: tile.src,
+        pathSrc: groundPathAbove?.src || '',
+        px: tile.px
+      });
+    }
+
+    for (const [, bridge] of bridgeGrid) {
+      const asset = tileImagesRef.current.get(bridge.bridgeSrc);
       if (asset?.images) {
-        // Calculate bridge variation based on neighboring ground paths
+        // Calculate bridge variation based on neighboring ground paths OF THE SAME TYPE
         let bits = 0;
-        const x = tile.px[0];
-        const y = tile.px[1];
+        const x = bridge.px[0];
+        const y = bridge.px[1];
         const gridX = x / TILE_SIZE;
         const gridY = y / TILE_SIZE;
 
-        if (gridY > 0 && groundPathGrid.has(`${x},${y - TILE_SIZE}`)) bits |= 8;
-        if (gridY < level.pxHei / TILE_SIZE - 1 && groundPathGrid.has(`${x},${y + TILE_SIZE}`)) bits |= 4;
-        if (gridX > 0 && groundPathGrid.has(`${x - TILE_SIZE},${y}`)) bits |= 2;
-        if (gridX < level.pxWid / TILE_SIZE - 1 && groundPathGrid.has(`${x + TILE_SIZE},${y}`)) bits |= 1;
+        // Only connect if neighbor has the same path type
+        const northPath = groundPathGrid.get(`${x},${y - TILE_SIZE}`);
+        const southPath = groundPathGrid.get(`${x},${y + TILE_SIZE}`);
+        const westPath = groundPathGrid.get(`${x - TILE_SIZE},${y}`);
+        const eastPath = groundPathGrid.get(`${x + TILE_SIZE},${y}`);
+
+        if (gridY > 0 && northPath?.src === bridge.pathSrc) bits |= 8;
+        if (gridY < level.pxHei / TILE_SIZE - 1 && southPath?.src === bridge.pathSrc) bits |= 4;
+        if (gridX > 0 && westPath?.src === bridge.pathSrc) bits |= 2;
+        if (gridX < level.pxWid / TILE_SIZE - 1 && eastPath?.src === bridge.pathSrc) bits |= 1;
 
         const variation = bits === 0 ? 0 : bits - 1;
         const img = asset.images.get(variation) || asset.images.get(0);
         if (img) {
-          ctx.drawImage(img, tile.px[0], tile.px[1], TILE_SIZE, TILE_SIZE);
+          ctx.drawImage(img, bridge.px[0], bridge.px[1], TILE_SIZE, TILE_SIZE);
         }
       }
     }
@@ -941,18 +1060,35 @@ export function MapEditor() {
     // Pass 3: Draw entities
     if (entitiesLayer?.entityInstances) {
       for (const entity of entitiesLayer.entityInstances) {
-        const isCharacter = entity.__identifier === 'Character';
-        ctx.fillStyle = isCharacter ? '#4ecca3' : '#ffd93d';
-        ctx.beginPath();
-        ctx.arc(entity.px[0], entity.px[1], 24, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.strokeStyle = '#fff';
-        ctx.lineWidth = 2;
-        ctx.stroke();
+        const charId = entity.defId;
+        const img = charImagesRef.current.get(charId);
+
+        if (img) {
+          // Draw character sprite centered on position
+          ctx.drawImage(
+            img,
+            entity.px[0] - TILE_SIZE / 2,
+            entity.px[1] - TILE_SIZE / 2,
+            TILE_SIZE,
+            TILE_SIZE
+          );
+        } else {
+          // Fallback: colored circle
+          const isCharacter = entity.__identifier === 'Character';
+          ctx.fillStyle = isCharacter ? '#4ecca3' : '#ffd93d';
+          ctx.beginPath();
+          ctx.arc(entity.px[0], entity.px[1], 24, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = '#fff';
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        }
+
+        // Draw entity label
         ctx.fillStyle = '#fff';
         ctx.font = '12px sans-serif';
         ctx.textAlign = 'center';
-        ctx.fillText(entity.defId, entity.px[0], entity.px[1] + 40);
+        ctx.fillText(charId, entity.px[0], entity.px[1] + TILE_SIZE / 2 + 16);
       }
     }
 

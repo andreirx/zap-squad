@@ -25,6 +25,7 @@ interface TileProperties {
   movementCost: number;
   variations: number;
   pathWidth?: number;
+  bridgeAssetId?: string;  // For PATH tiles: which bridge tile to render when crossing water
   createdAt?: string;
   updatedAt?: string;
 }
@@ -63,6 +64,8 @@ export function TileEditor() {
   const [passable, setPassable] = useState(true);
   const [movementCost, setMovementCost] = useState(1);
   const [pathWidth, setPathWidth] = useState(DEFAULT_PATH_WIDTH);
+  const [bridgeAssetId, setBridgeAssetId] = useState<string | undefined>(undefined);
+  const [availableBridges, setAvailableBridges] = useState<{ id: string; name: string }[]>([]);
 
   // Variations data
   const [variations, setVariations] = useState<Map<number, ImageData>>(new Map());
@@ -155,6 +158,27 @@ export function TileEditor() {
           ),
         ];
         setExistingTiles(ids);
+
+        // Load bridge tiles for the bridge selector
+        const bridges: { id: string; name: string }[] = [];
+        for (const id of ids) {
+          try {
+            let props: Record<string, unknown> = {};
+            try {
+              const propsJson = await storage.readText(`tiles/${id}/properties.json`);
+              props = JSON.parse(propsJson);
+            } catch {
+              const defJson = await storage.readText(`tiles/${id}/definition.json`);
+              props = JSON.parse(defJson);
+            }
+            if (props.tileType === 'BRIDGE') {
+              bridges.push({ id, name: (props.name as string) || id });
+            }
+          } catch {
+            // Skip tiles that fail to load
+          }
+        }
+        setAvailableBridges(bridges);
       } catch (e) {
         console.error('Failed to load tiles:', e);
       }
@@ -186,6 +210,7 @@ export function TileEditor() {
       setPassable(props.passable ?? true);
       setMovementCost(props.movementCost ?? 1);
       setPathWidth(props.pathWidth ?? DEFAULT_PATH_WIDTH);
+      setBridgeAssetId((props as TileProperties).bridgeAssetId);
 
       const varCount = props.variations || 1;
       setVariationCount(varCount);
@@ -247,6 +272,7 @@ export function TileEditor() {
         movementCost,
         variations: tileType === 'TILE' ? variationCount : PATH_VARIATIONS,
         pathWidth: tileType !== 'TILE' ? pathWidth : undefined,
+        bridgeAssetId: tileType === 'PATH' && terrainType === 'LAND' ? bridgeAssetId : undefined,
         createdAt: now,
         updatedAt: now,
       };
@@ -275,7 +301,7 @@ export function TileEditor() {
     } finally {
       setIsSaving(false);
     }
-  }, [tileId, tileName, tileType, terrainType, passable, movementCost, pathWidth, variationCount, variations, existingTiles, saveCurrentVariation]);
+  }, [tileId, tileName, tileType, terrainType, passable, movementCost, pathWidth, bridgeAssetId, variationCount, variations, existingTiles, saveCurrentVariation]);
 
   // Add variation (TILE type only)
   const addVariation = useCallback(() => {
@@ -458,6 +484,7 @@ export function TileEditor() {
     setPassable(true);
     setMovementCost(1);
     setPathWidth(DEFAULT_PATH_WIDTH);
+    setBridgeAssetId(undefined);
     setVariations(new Map());
     setVariationCount(1);
     setCurrentVariation(0);
@@ -770,6 +797,39 @@ export function TileEditor() {
                     style={{ width: '100%', padding: '0.5rem', border: 'none', borderRadius: '4px', background: '#ffd93d', color: '#1a1a2e', cursor: 'pointer', fontSize: '0.75rem', fontWeight: 'bold' }}>
                     Generate All 15 Paths
                   </button>
+
+                  {/* Bridge selector - only for PATH + LAND tiles */}
+                  {terrainType === 'LAND' && availableBridges.length > 0 && (
+                    <div style={{ marginTop: '0.75rem', paddingTop: '0.75rem', borderTop: '1px solid #333' }}>
+                      <div style={{ color: '#888', fontSize: '0.75rem', marginBottom: '0.25rem' }}>
+                        Bridge for Water Crossing
+                      </div>
+                      <select
+                        value={bridgeAssetId || ''}
+                        onChange={(e) => setBridgeAssetId(e.target.value || undefined)}
+                        style={{
+                          width: '100%',
+                          padding: '0.5rem',
+                          background: '#16213e',
+                          border: '1px solid #333',
+                          borderRadius: '4px',
+                          color: '#ccc',
+                          fontSize: '0.75rem',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        <option value="">None</option>
+                        {availableBridges.map((bridge) => (
+                          <option key={bridge.id} value={bridge.id}>
+                            {bridge.name} ({bridge.id})
+                          </option>
+                        ))}
+                      </select>
+                      <div style={{ color: '#666', fontSize: '0.65rem', marginTop: '0.25rem' }}>
+                        This bridge tile renders when path crosses water
+                      </div>
+                    </div>
+                  )}
                 </>
               )}
             </div>

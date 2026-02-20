@@ -1,6 +1,6 @@
 # ZAP-SQUAD Asset Schema
 
-This document defines the schema for all game assets, ported from hexmanos with simplifications (no visual states).
+This document defines the schema for all game assets, ported from hexmanos with visual state support.
 
 ## Core Constants
 
@@ -16,7 +16,7 @@ DEFAULT_BRIDGE_WIDTH = 72  // Default center width for bridges
 
 ## 1. CHARACTERS
 
-Characters are animated entities with full movement and combat animations.
+Characters are animated entities with visual states, movement, and combat animations.
 
 ### Definition Schema
 
@@ -29,6 +29,15 @@ interface CharacterDefinition {
   updatedAt: string;
 }
 ```
+
+### Visual States (Health-Based Appearance)
+
+| State | Health Range | Description |
+|-------|--------------|-------------|
+| full | 75-100% | Normal appearance |
+| hurt1 | 50-74% | Light damage |
+| hurt2 | 25-49% | Heavy damage |
+| critical | 0-24% | Near death |
 
 ### Animation States
 
@@ -56,32 +65,29 @@ interface CharacterDefinition {
 ```
 mods/characters/{id}/
 ├── definition.json
-├── {id}_idle_south_0.png
-├── {id}_idle_south_1.png
-├── {id}_walk_east_0.png
-├── {id}_walk_east_1.png
-├── {id}_walk_east_2.png
-├── {id}_walk_east_3.png
+├── {id}_full_idle_south_0.png      # Default appearance
+├── {id}_full_idle_south_1.png
+├── {id}_full_walk_east_0.png
+├── {id}_hurt1_idle_south_0.png     # Damaged appearance
+├── {id}_critical_idle_south_0.png  # Near-death appearance
 └── ...
 ```
 
 ### File Naming
 
-**New format (no visual states):**
 ```
-{id}_{animation}_{direction}_{frame}.png
+{id}_{visualState}_{animation}_{direction}_{frame}.png
 ```
 
-**Legacy format (for backward compatibility when loading):**
-```
-{id}_full_{animation}_{direction}_{frame}.png
-```
+Examples:
+- `zombie_full_idle_south_0.png` - Healthy zombie facing south
+- `zombie_hurt2_walk_east_1.png` - Heavily damaged zombie walking east
 
 ---
 
 ## 2. OBJECTS
 
-Objects are simplified entities with only idle/landed animations. Used for projectiles, items, decorations.
+Objects are simplified entities with visual states and idle/landed animations. Used for projectiles, items, decorations.
 
 ### Definition Schema
 
@@ -95,6 +101,15 @@ interface ObjectDefinition {
 }
 ```
 
+### Visual States (Condition-Based)
+
+| State | Description |
+|-------|-------------|
+| new | Brand new/pristine |
+| worn | Slightly used |
+| damaged | Visibly damaged |
+| broken | Nearly destroyed |
+
 ### Animation States
 
 | State | Required | Loop | Description |
@@ -107,10 +122,17 @@ interface ObjectDefinition {
 ```
 mods/objects/{id}/
 ├── definition.json
-├── {id}_idle_0.png
-├── {id}_idle_1.png
-├── {id}_landed_0.png
+├── {id}_new_idle_0.png           # Default appearance
+├── {id}_new_idle_1.png
+├── {id}_new_landed_0.png
+├── {id}_damaged_idle_0.png       # Damaged appearance
 └── ...
+```
+
+### File Naming
+
+```
+{id}_{visualState}_{animation}_{frame}.png
 ```
 
 ---
@@ -148,32 +170,53 @@ interface TileDefinition {
 - Exactly 15 directional variations
 - LAND terrain: passable walkways/roads
 - WATER terrain: non-passable rivers/streams
-- Auto-connects based on adjacent paths
+- Auto-connects based on adjacent paths of the same type
+- LAND paths can specify `bridgeAssetId` for water crossings
 
 #### BRIDGE
 - Exactly 15 directional variations
 - Always LAND terrain, always passable
-- Rendered over water when LAND PATH crosses
+- Auto-rendered when LAND PATH crosses water terrain or water paths
+- Connectivity matches the path type above it
+
+### Bridge Rendering Logic
+
+When a ground path (PATH + LAND) is placed over water terrain or a water path (river):
+1. The renderer detects the overlap
+2. Looks up the path's `bridgeAssetId`
+3. Renders the bridge tile UNDER the path
+4. Bridge connectivity matches the path connectivity (same neighbors = same shape)
+5. Different path types crossing the same water do NOT have connected bridges
+
+### Path Connectivity Bitmask
+
+Connectivity is calculated using a 4-bit bitmask:
+- N (North) = 8
+- S (South) = 4
+- W (West) = 2
+- E (East) = 1
+
+Variation index = (bits === 0) ? 0 : bits - 1
 
 ### Path Direction Combinations (15 total)
 
-| Index | Up | Down | Left | Right | Description |
-|-------|-----|------|------|-------|-------------|
-| 0 | | | | ✓ | Right only |
-| 1 | | | ✓ | | Left only |
-| 2 | | | ✓ | ✓ | Horizontal |
-| 3 | | ✓ | | | Down only |
-| 4 | | ✓ | | ✓ | Down + Right |
-| 5 | | ✓ | ✓ | | Down + Left |
-| 6 | | ✓ | ✓ | ✓ | T-bottom |
-| 7 | ✓ | | | | Up only |
-| 8 | ✓ | | | ✓ | Up + Right |
-| 9 | ✓ | | ✓ | | Up + Left |
-| 10 | ✓ | | ✓ | ✓ | T-top |
-| 11 | ✓ | ✓ | | | Vertical |
-| 12 | ✓ | ✓ | | ✓ | T-right |
-| 13 | ✓ | ✓ | ✓ | | T-left |
-| 14 | ✓ | ✓ | ✓ | ✓ | Crossroads |
+| Index | N | S | W | E | Bits | Description |
+|-------|---|---|---|---|------|-------------|
+| 0 | | | | ✓ | 1 | Right only |
+| 1 | | | ✓ | | 2 | Left only |
+| 2 | | | ✓ | ✓ | 3 | Horizontal |
+| 3 | | ✓ | | | 4 | Down only |
+| 4 | | ✓ | | ✓ | 5 | Down + Right |
+| 5 | | ✓ | ✓ | | 6 | Down + Left |
+| 6 | | ✓ | ✓ | ✓ | 7 | T-bottom |
+| 7 | ✓ | | | | 8 | Up only |
+| 8 | ✓ | | | ✓ | 9 | Up + Right |
+| 9 | ✓ | | ✓ | | 10 | Up + Left |
+| 10 | ✓ | | ✓ | ✓ | 11 | T-top |
+| 11 | ✓ | ✓ | | | 12 | Vertical |
+| 12 | ✓ | ✓ | | ✓ | 13 | T-right |
+| 13 | ✓ | ✓ | ✓ | | 14 | T-left |
+| 14 | ✓ | ✓ | ✓ | ✓ | 15 | Crossroads |
 
 ### File Structure
 
@@ -187,34 +230,91 @@ mods/tiles/{id}/
 
 ---
 
-## 4. Editor Features to Port
+## 4. LEVELS
+
+Levels are stored in LDtk-compatible JSON format.
+
+### Level Schema
+
+```typescript
+interface LevelData {
+  identifier: string;
+  pxWid: number;           // Width in pixels
+  pxHei: number;           // Height in pixels
+  layerInstances: LayerInstance[];
+}
+
+interface LayerInstance {
+  __identifier: string;    // "Tiles", "Entities"
+  __type: string;          // "Tiles", "Entities"
+  __gridSize: number;      // 128
+  gridTiles?: GridTile[];
+  entityInstances?: EntityInstance[];
+}
+
+interface GridTile {
+  px: [number, number];    // Position in pixels
+  t: number | null;        // Variation seed
+  src: string;             // Tile asset ID
+}
+
+interface EntityInstance {
+  __identifier: string;    // "Character" or "Object"
+  px: [number, number];    // Position in pixels
+  defId: string;           // Character/object ID
+}
+```
+
+### File Structure
+
+```
+mods/levels/{name}.json
+```
+
+---
+
+## 5. Editor Features (Status)
 
 ### Character/Object Editor
 
-- [ ] **Add Frame** button (up to 8 max)
-- [ ] **Duplicate Frame** button
-- [ ] **Delete Frame** button
-- [ ] **Move Frame** left/right in timeline
+- [x] **Visual States** - full/hurt1/hurt2/critical for characters; new/worn/damaged/broken for objects
+- [x] **Add Frame** button (up to 8 max)
+- [x] **Duplicate Frame** button
+- [x] **Delete Frame** button
+- [x] **Move Frame** left/right in timeline
 - [ ] **Generate Stickman** for all animations
 - [ ] **Import Image** and scale to 128x128
-- [ ] **Pan/Zoom** - mouse wheel zoom to cursor, middle-click/space+drag pan
-- [ ] **Brush sizes** - 1, 2, 4, 8, 16 pixels
+- [x] **Pan/Zoom** - mouse wheel zoom to cursor, right-click/middle-click/space+drag pan
+- [x] **Brush sizes** - 1, 2, 4, 8, 16 pixels
 - [ ] **Transform tools** - rotate, mirror selection/frame
 
 ### Tile Editor
 
-- [ ] **Tile Type switching** - TILE, PATH, BRIDGE
-- [ ] **Terrain Type** - LAND, WATER
-- [ ] **Random Fill** - fill with random picks from 3 colors
-- [ ] **Fill All Backgrounds** - apply random fill to all 15 path variations
-- [ ] **Path Drawing** with configurable width and fade
-- [ ] **Generate All 15 Paths** - auto-generate all direction combinations
+- [x] **Tile Type switching** - TILE, PATH, BRIDGE
+- [x] **Terrain Type** - LAND, WATER
+- [x] **Random Fill** - fill with random picks from 3 colors
+- [x] **Fill All Backgrounds** - apply random fill to all 15 path variations
+- [x] **Path Drawing** with configurable width and fade
+- [x] **Generate All 15 Paths** - auto-generate all direction combinations
+- [x] **Bridge Association** - select which BRIDGE tile to use for water crossings
 - [ ] **Path Guidelines** - show direction indicators on path variations
-- [ ] **Movement Cost** slider (0=impassable, 1=easy, 3+=difficult)
+- [x] **Movement Cost** slider (0=impassable, 1=easy, 3+=difficult)
+
+### Map Editor
+
+- [x] **Layer Support** - Terrain, Paths, Entities
+- [x] **Pan/Zoom Canvas** - infinite canvas with zoom-to-cursor
+- [x] **Continuous Painting** - Bresenham line interpolation for smooth strokes
+- [x] **Path Auto-Connectivity** - automatic variation selection based on neighbors
+- [x] **Bridge Auto-Placement** - bridges rendered when paths cross water
+- [x] **Bridge Connectivity Matching** - bridge shape matches path shape above
+- [x] **Terrain Transitions** - edge blending between different terrain types
+- [x] **Entity Placement** - characters and objects
+- [x] **Tile/Entity Palettes** - visual selection with thumbnails
 
 ---
 
-## 5. Default Colors
+## 6. Default Colors
 
 ### Terrain Fill Colors (Random 3-color fill)
 ```

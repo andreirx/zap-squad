@@ -232,6 +232,7 @@ export function PanZoomCanvas({
       onMouseUp={handlers.onMouseUp}
       onMouseLeave={handlers.onMouseLeave}
       onClick={handleClick}
+      onContextMenu={(e) => e.preventDefault()}
     >
       <canvas
         ref={canvasRef}
