@@ -121,6 +121,9 @@ interface HexmanosMap {
   tileSize: number;
   layers: {
     terrain: Array<Array<{ tileAssetId: string; seed: number } | null>>;
+    waterPaths?: Array<Array<{ pathAssetId: string } | null>>;
+    groundPaths?: Array<Array<{ pathAssetId: string } | null>>;
+    paths?: Array<Array<{ pathAssetId: string } | null>>; // Legacy field
   };
   characters?: Array<{ characterAssetId: string; x: number; y: number }>;
 }
@@ -140,6 +143,8 @@ interface ZapSquadTileDef {
   walkable: boolean;
   blocksVision: boolean;
   damagePerTurn: number;
+  tileType: string; // TILE, PATH, BRIDGE
+  terrainType: string; // LAND, WATER
   createdAt: string;
   updatedAt: string;
 }
@@ -311,6 +316,8 @@ async function importTiles(): Promise<Map<string, string>> {
       walkable: def.passable,
       blocksVision: false,
       damagePerTurn: 0,
+      tileType: def.tileType || 'TILE',
+      terrainType: def.terrainType || 'LAND',
       createdAt: now,
       updatedAt: now,
     };
@@ -336,7 +343,7 @@ async function importTiles(): Promise<Map<string, string>> {
   return idMapping;
 }
 
-// Import objects as weapons
+// Import objects (keep as objects, not weapons)
 async function importObjects(): Promise<Map<string, string>> {
   const idMapping = new Map<string, string>();
   const objectsDir = path.join(sourceDir, 'objects');
@@ -349,7 +356,7 @@ async function importObjects(): Promise<Map<string, string>> {
   const entries = fs.readdirSync(objectsDir, { withFileTypes: true });
   const objectDirs = entries.filter((e) => e.isDirectory() && !e.name.startsWith('.'));
 
-  console.log(`\nImporting ${objectDirs.length} objects as weapons...`);
+  console.log(`\nImporting ${objectDirs.length} objects...`);
 
   for (const dir of objectDirs) {
     const uuid = dir.name;
@@ -370,7 +377,8 @@ async function importObjects(): Promise<Map<string, string>> {
 
     idMapping.set(uuid, cleanId);
 
-    const outDir = path.join(outputDir, 'weapons', cleanId);
+    // Import to OBJECTS folder (not weapons)
+    const outDir = path.join(outputDir, 'objects', cleanId);
     fs.mkdirSync(outDir, { recursive: true });
 
     // Find max frames
@@ -381,22 +389,20 @@ async function importObjects(): Promise<Map<string, string>> {
       }
     }
 
-    // Write new definition
+    // Write new definition (object format - idle/landed animations only)
     const now = new Date().toISOString();
-    const newDef: ZapSquadWeaponDef = {
+    const newDef = {
       id: cleanId,
       name: def.name,
-      weaponType: 'throwable', // Most hexmanos objects are projectiles
+      entityType: def.entityType || 'OBJECT',
       frames: maxFrames,
       frameDuration: 0.1,
-      anchorX: targetSize / 2,
-      anchorY: targetSize / 2,
       createdAt: now,
       updatedAt: now,
     };
     fs.writeFileSync(path.join(outDir, 'definition.json'), JSON.stringify(newDef, null, 2));
 
-    // Import sprites
+    // Import sprites - convert to object naming convention
     const files = fs.readdirSync(path.join(objectsDir, uuid));
     let spriteCount = 0;
 
@@ -404,8 +410,26 @@ async function importObjects(): Promise<Map<string, string>> {
       if (!file.endsWith('.png') || file.includes('-mip')) continue;
 
       const srcPath = path.join(objectsDir, uuid, file);
-      const destPath = path.join(outDir, file);
 
+      // Convert naming: full_idle_0.png -> {cleanId}_idle_0.png
+      // or just copy as-is and rename to match object convention
+      let destName = file;
+
+      // If file has visual state prefix (full_, critical_, etc), strip it for objects
+      const visualStates = ['full_', 'hurt_1_', 'hurt_2_', 'critical_'];
+      for (const vs of visualStates) {
+        if (file.startsWith(vs)) {
+          destName = `${cleanId}_${file.substring(vs.length)}`;
+          break;
+        }
+      }
+
+      // If no visual state prefix, just prepend cleanId
+      if (destName === file && !file.startsWith(cleanId)) {
+        destName = `${cleanId}_${file}`;
+      }
+
+      const destPath = path.join(outDir, destName);
       await resizeImage(srcPath, destPath, targetSize, targetSize);
       spriteCount++;
     }
@@ -497,6 +521,48 @@ async function importMaps(
       }
     }
 
+    // Convert water paths (rivers, moats, lava)
+    const waterPaths = map.layers.waterPaths || map.layers.paths;
+    if (waterPaths) {
+      for (let y = 0; y < map.height && y < waterPaths.length; y++) {
+        const row = waterPaths[y];
+        if (!row) continue;
+
+        for (let x = 0; x < map.width && x < row.length; x++) {
+          const cell = row[x];
+          if (!cell) continue;
+
+          const tileId = tileMapping.get(cell.pathAssetId) || cell.pathAssetId;
+          tilesLayer.gridTiles.push({
+            px: [x * targetSize, y * targetSize],
+            t: Math.floor(Math.random() * 100), // Random seed for paths
+            src: tileId,
+          });
+        }
+      }
+    }
+
+    // Convert ground paths (roads, bridges)
+    const groundPaths = map.layers.groundPaths;
+    if (groundPaths) {
+      for (let y = 0; y < map.height && y < groundPaths.length; y++) {
+        const row = groundPaths[y];
+        if (!row) continue;
+
+        for (let x = 0; x < map.width && x < row.length; x++) {
+          const cell = row[x];
+          if (!cell) continue;
+
+          const tileId = tileMapping.get(cell.pathAssetId) || cell.pathAssetId;
+          tilesLayer.gridTiles.push({
+            px: [x * targetSize, y * targetSize],
+            t: Math.floor(Math.random() * 100), // Random seed for paths
+            src: tileId,
+          });
+        }
+      }
+    }
+
     // Convert characters
     const entitiesLayer = ldtkLevel.layerInstances[1];
     if (map.characters) {
@@ -534,6 +600,7 @@ async function main() {
   fs.mkdirSync(path.join(outputDir, 'characters'), { recursive: true });
   fs.mkdirSync(path.join(outputDir, 'tiles'), { recursive: true });
   fs.mkdirSync(path.join(outputDir, 'weapons'), { recursive: true });
+  fs.mkdirSync(path.join(outputDir, 'objects'), { recursive: true });
   fs.mkdirSync(path.join(outputDir, 'levels'), { recursive: true });
 
   const characterMapping = await importCharacters();

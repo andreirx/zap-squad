@@ -1,33 +1,88 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
+import { Plus, Copy, ChevronLeft, ChevronRight, Trash2 } from 'lucide-react';
 import { PixelCanvas, type PixelCanvasRef } from '../PixelCanvas';
 import { ColorPicker } from '../ColorPicker';
 import { Toolbar } from '../Toolbar';
 import { createStorage } from '../../storage';
-import type { Color, Tool, TileDefinition } from '../types';
+import type { Color, Tool } from '../types';
 
-/** Canvas size for tile sprites */
-const TILE_SIZE = 16;
+/** Canvas size for tile sprites - EVERYTHING IS 128x128 */
+const TILE_SIZE = 128;
+const MAX_VARIATIONS = 8;
+const PATH_VARIATIONS = 15;
+const DEFAULT_PATH_WIDTH = 56;
+const PATH_FADE_PIXELS = 4;
 
-/** Tile editor for creating terrain tiles */
+type TileType = 'TILE' | 'PATH' | 'BRIDGE';
+type TerrainType = 'LAND' | 'WATER';
+
+interface TileProperties {
+  id: string;
+  name: string;
+  tileType: TileType;
+  terrainType: TerrainType;
+  passable: boolean;
+  movementCost: number;
+  variations: number;
+  pathWidth?: number;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+// Path direction combinations (15 total)
+const PATH_DIRECTIONS = [
+  { up: false, down: false, left: false, right: true, label: 'R' },
+  { up: false, down: false, left: true, right: false, label: 'L' },
+  { up: false, down: false, left: true, right: true, label: 'LR' },
+  { up: false, down: true, left: false, right: false, label: 'D' },
+  { up: false, down: true, left: false, right: true, label: 'DR' },
+  { up: false, down: true, left: true, right: false, label: 'DL' },
+  { up: false, down: true, left: true, right: true, label: 'DLR' },
+  { up: true, down: false, left: false, right: false, label: 'U' },
+  { up: true, down: false, left: false, right: true, label: 'UR' },
+  { up: true, down: false, left: true, right: false, label: 'UL' },
+  { up: true, down: false, left: true, right: true, label: 'ULR' },
+  { up: true, down: true, left: false, right: false, label: 'UD' },
+  { up: true, down: true, left: false, right: true, label: 'UDR' },
+  { up: true, down: true, left: true, right: false, label: 'UDL' },
+  { up: true, down: true, left: true, right: true, label: '+' },
+];
+
+// Default colors
+const DEFAULT_TERRAIN_COLORS = ['#228b22', '#2e8b57', '#32cd32'];
+const DEFAULT_PATH_COLORS = ['#8b7355', '#a0826d', '#c4a882'];
+const DEFAULT_WATER_COLORS = ['#1e90ff', '#4169e1', '#6495ed'];
+
+/** Tile editor with variations, types, and generation tools */
 export function TileEditor() {
   // Tile metadata
   const [tileId, setTileId] = useState('');
   const [tileName, setTileName] = useState('');
-  const [walkable, setWalkable] = useState(true);
-  const [blocksVision, setBlocksVision] = useState(false);
-  const [damagePerTurn, setDamagePerTurn] = useState(0);
+  const [tileType, setTileType] = useState<TileType>('TILE');
+  const [terrainType, setTerrainType] = useState<TerrainType>('LAND');
+  const [passable, setPassable] = useState(true);
+  const [movementCost, setMovementCost] = useState(1);
+  const [pathWidth, setPathWidth] = useState(DEFAULT_PATH_WIDTH);
+
+  // Variations data
+  const [variations, setVariations] = useState<Map<number, ImageData>>(new Map());
+  const [currentVariation, setCurrentVariation] = useState(0);
+  const [variationCount, setVariationCount] = useState(1);
+
+  // Generation colors
+  const [terrainColors, setTerrainColors] = useState(DEFAULT_TERRAIN_COLORS);
+  const [pathColors, setPathColors] = useState(DEFAULT_PATH_COLORS);
 
   // Drawing state
   const [tool, setTool] = useState<Tool>('pencil');
-  const [color, setColor] = useState<Color>({ r: 0, g: 0, b: 0, a: 255 });
-  const [zoom, setZoom] = useState(24);
+  const [color, setColor] = useState<Color>({ r: 34, g: 139, b: 34, a: 255 });
+  const [zoom, setZoom] = useState(4);
+  const [brushSize, setBrushSize] = useState(1);
   const [showGrid, setShowGrid] = useState(true);
   const [recentColors, setRecentColors] = useState<Color[]>([]);
 
   // Canvas ref
   const canvasRef = useRef<PixelCanvasRef>(null);
-
-  // Clipboard
   const clipboardRef = useRef<ImageData | null>(null);
 
   // UI state
@@ -36,16 +91,66 @@ export function TileEditor() {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [existingTiles, setExistingTiles] = useState<string[]>([]);
 
+  // Effective variation count based on tile type
+  const effectiveVariationCount = tileType === 'TILE' ? variationCount : PATH_VARIATIONS;
+
+  // Save current canvas to variations
+  const saveCurrentVariation = useCallback(() => {
+    if (!canvasRef.current) return;
+    const data = canvasRef.current.getImageData();
+    setVariations(prev => {
+      const next = new Map(prev);
+      next.set(currentVariation, new ImageData(
+        new Uint8ClampedArray(data.data),
+        data.width,
+        data.height
+      ));
+      return next;
+    });
+  }, [currentVariation]);
+
+  // Load variation to canvas
+  const loadVariation = useCallback((index: number) => {
+    const data = variations.get(index);
+    if (data && canvasRef.current) {
+      canvasRef.current.setImageData(data);
+    } else if (canvasRef.current) {
+      canvasRef.current.clear();
+    }
+  }, [variations]);
+
+  // Change variation
+  const changeVariation = useCallback((index: number) => {
+    saveCurrentVariation();
+    setCurrentVariation(index);
+  }, [saveCurrentVariation]);
+
+  // Load variation when current changes
+  useEffect(() => {
+    loadVariation(currentVariation);
+  }, [currentVariation, loadVariation]);
+
+  // Update variation count when tile type changes
+  useEffect(() => {
+    if (tileType !== 'TILE') {
+      // PATH and BRIDGE always have 15 variations
+      if (currentVariation >= PATH_VARIATIONS) {
+        setCurrentVariation(0);
+      }
+    }
+  }, [tileType, currentVariation]);
+
   // Load existing tiles on mount
   useEffect(() => {
     async function loadTiles() {
       try {
         const storage = createStorage();
         const files = await storage.list('tiles');
+        // Support both properties.json (hexmanos) and definition.json
         const ids = [
           ...new Set(
             files
-              .filter((f) => f.includes('/') && f.endsWith('definition.json'))
+              .filter((f) => f.includes('/') && (f.endsWith('properties.json') || f.endsWith('definition.json')))
               .map((f) => f.split('/')[1])
           ),
         ];
@@ -64,24 +169,51 @@ export function TileEditor() {
     try {
       const storage = createStorage();
 
-      // Load definition
-      const defJson = await storage.readText(`tiles/${id}/definition.json`);
-      const def: TileDefinition = JSON.parse(defJson);
-      setTileId(def.id);
-      setTileName(def.name);
-      setWalkable(def.walkable);
-      setBlocksVision(def.blocksVision);
-      setDamagePerTurn(def.damagePerTurn);
-
-      // Load sprite image
+      // Try properties.json first (hexmanos format), then definition.json
+      let props: TileProperties;
       try {
-        const url = storage.getReadUrl(`tiles/${id}/sprite.png`);
-        const img = await loadImage(url);
-        const data = imageToImageData(img, TILE_SIZE, TILE_SIZE);
-        canvasRef.current?.setImageData(data);
+        const propsJson = await storage.readText(`tiles/${id}/properties.json`);
+        props = JSON.parse(propsJson);
       } catch {
-        // Sprite doesn't exist yet
-        canvasRef.current?.clear();
+        const defJson = await storage.readText(`tiles/${id}/definition.json`);
+        props = JSON.parse(defJson);
+      }
+
+      setTileId(props.id || id);
+      setTileName(props.name || id);
+      setTileType(props.tileType || 'TILE');
+      setTerrainType(props.terrainType || 'LAND');
+      setPassable(props.passable ?? true);
+      setMovementCost(props.movementCost ?? 1);
+      setPathWidth(props.pathWidth ?? DEFAULT_PATH_WIDTH);
+
+      const varCount = props.variations || 1;
+      setVariationCount(varCount);
+
+      // Load all variation images
+      const newVariations = new Map<number, ImageData>();
+      const maxVars = props.tileType === 'TILE' ? varCount : PATH_VARIATIONS;
+
+      for (let i = 0; i < maxVars; i++) {
+        try {
+          const url = storage.getReadUrl(`tiles/${id}/tile_${i}.png`);
+          const img = await loadImage(url);
+          const data = imageToImageData(img, TILE_SIZE, TILE_SIZE);
+          newVariations.set(i, data);
+        } catch {
+          // Variation doesn't exist
+        }
+      }
+
+      setVariations(newVariations);
+      setCurrentVariation(0);
+
+      // Load first variation to canvas
+      const firstVar = newVariations.get(0);
+      if (firstVar && canvasRef.current) {
+        canvasRef.current.setImageData(firstVar);
+      } else if (canvasRef.current) {
+        canvasRef.current.clear();
       }
     } catch (e) {
       setSaveError(`Failed to load tile: ${e}`);
@@ -97,50 +229,214 @@ export function TileEditor() {
       return;
     }
 
+    saveCurrentVariation();
+
     setIsSaving(true);
     setSaveError(null);
     try {
       const storage = createStorage();
       const now = new Date().toISOString();
 
-      // Save definition
-      const def: TileDefinition = {
+      // Save properties
+      const props: TileProperties = {
         id: tileId,
         name: tileName || tileId,
-        walkable,
-        blocksVision,
-        damagePerTurn,
+        tileType,
+        terrainType,
+        passable,
+        movementCost,
+        variations: tileType === 'TILE' ? variationCount : PATH_VARIATIONS,
+        pathWidth: tileType !== 'TILE' ? pathWidth : undefined,
         createdAt: now,
         updatedAt: now,
       };
       await storage.writeText(
-        `tiles/${tileId}/definition.json`,
-        JSON.stringify(def, null, 2)
+        `tiles/${tileId}/properties.json`,
+        JSON.stringify(props, null, 2)
       );
 
-      // Save sprite
-      const data = canvasRef.current?.getImageData();
-      if (data) {
+      // Save all variations
+      for (const [index, data] of variations.entries()) {
         const blob = await imageDataToPng(data);
         await storage.writeBytes(
-          `tiles/${tileId}/sprite.png`,
+          `tiles/${tileId}/tile_${index}.png`,
           await blob.arrayBuffer(),
           'image/png'
         );
       }
 
-      // Update existing tiles list
       if (!existingTiles.includes(tileId)) {
         setExistingTiles([...existingTiles, tileId]);
       }
 
-      console.log(`Saved tile ${tileId}`);
+      console.log(`Saved tile ${tileId} with ${variations.size} variations`);
     } catch (e) {
       setSaveError(`Failed to save: ${e}`);
     } finally {
       setIsSaving(false);
     }
-  }, [tileId, tileName, walkable, blocksVision, damagePerTurn, existingTiles]);
+  }, [tileId, tileName, tileType, terrainType, passable, movementCost, pathWidth, variationCount, variations, existingTiles, saveCurrentVariation]);
+
+  // Add variation (TILE type only)
+  const addVariation = useCallback(() => {
+    if (tileType !== 'TILE' || variationCount >= MAX_VARIATIONS) return;
+    saveCurrentVariation();
+    setVariationCount(prev => prev + 1);
+    setCurrentVariation(variationCount);
+  }, [tileType, variationCount, saveCurrentVariation]);
+
+  // Duplicate variation (TILE type only)
+  const duplicateVariation = useCallback(() => {
+    if (tileType !== 'TILE' || variationCount >= MAX_VARIATIONS) return;
+    saveCurrentVariation();
+    const currentData = variations.get(currentVariation);
+    if (currentData) {
+      const newIndex = variationCount;
+      setVariations(prev => {
+        const next = new Map(prev);
+        next.set(newIndex, new ImageData(
+          new Uint8ClampedArray(currentData.data),
+          currentData.width,
+          currentData.height
+        ));
+        return next;
+      });
+      setVariationCount(prev => prev + 1);
+      setCurrentVariation(newIndex);
+    }
+  }, [tileType, variationCount, currentVariation, variations, saveCurrentVariation]);
+
+  // Delete variation (TILE type only)
+  const deleteVariation = useCallback(() => {
+    if (tileType !== 'TILE' || variationCount <= 1) return;
+    saveCurrentVariation();
+
+    setVariations(prev => {
+      const next = new Map<number, ImageData>();
+      let newIndex = 0;
+      for (let i = 0; i < variationCount; i++) {
+        if (i !== currentVariation) {
+          const data = prev.get(i);
+          if (data) {
+            next.set(newIndex, data);
+          }
+          newIndex++;
+        }
+      }
+      return next;
+    });
+
+    setVariationCount(prev => prev - 1);
+    setCurrentVariation(prev => Math.max(0, prev - 1));
+  }, [tileType, variationCount, currentVariation, saveCurrentVariation]);
+
+  // Generate random fill for current variation
+  const generateRandomFill = useCallback(() => {
+    if (!canvasRef.current) return;
+
+    const colors = terrainType === 'WATER' ? DEFAULT_WATER_COLORS : terrainColors;
+    const parsedColors = colors.map(parseHexColor);
+
+    const data = new ImageData(TILE_SIZE, TILE_SIZE);
+    for (let i = 0; i < data.data.length; i += 4) {
+      const c = parsedColors[Math.floor(Math.random() * parsedColors.length)];
+      data.data[i] = c.r;
+      data.data[i + 1] = c.g;
+      data.data[i + 2] = c.b;
+      data.data[i + 3] = 255;
+    }
+
+    canvasRef.current.setImageData(data);
+    saveCurrentVariation();
+  }, [terrainType, terrainColors, saveCurrentVariation]);
+
+  // Generate all 15 path variations
+  const generateAllPaths = useCallback(() => {
+    if (tileType === 'TILE') return;
+
+    saveCurrentVariation();
+    const bgColors = terrainType === 'WATER' ? DEFAULT_WATER_COLORS : terrainColors;
+    const parsedBgColors = bgColors.map(parseHexColor);
+    const parsedPathColors = pathColors.map(parseHexColor);
+
+    const newVariations = new Map<number, ImageData>();
+
+    for (let i = 0; i < PATH_VARIATIONS; i++) {
+      const dir = PATH_DIRECTIONS[i];
+      const data = new ImageData(TILE_SIZE, TILE_SIZE);
+
+      // Fill background
+      for (let j = 0; j < data.data.length; j += 4) {
+        const c = parsedBgColors[Math.floor(Math.random() * parsedBgColors.length)];
+        data.data[j] = c.r;
+        data.data[j + 1] = c.g;
+        data.data[j + 2] = c.b;
+        data.data[j + 3] = 255;
+      }
+
+      // Draw path
+      const center = TILE_SIZE / 2;
+      const halfWidth = pathWidth / 2;
+
+      for (let y = 0; y < TILE_SIZE; y++) {
+        for (let x = 0; x < TILE_SIZE; x++) {
+          let inPath = false;
+          let distToEdge = Infinity;
+
+          // Check if in horizontal path
+          if (Math.abs(y - center) <= halfWidth) {
+            if ((dir.left && x <= center) || (dir.right && x >= center)) {
+              inPath = true;
+              distToEdge = Math.min(distToEdge, halfWidth - Math.abs(y - center));
+            }
+          }
+
+          // Check if in vertical path
+          if (Math.abs(x - center) <= halfWidth) {
+            if ((dir.up && y <= center) || (dir.down && y >= center)) {
+              inPath = true;
+              distToEdge = Math.min(distToEdge, halfWidth - Math.abs(x - center));
+            }
+          }
+
+          // Check center junction
+          if (Math.abs(x - center) <= halfWidth && Math.abs(y - center) <= halfWidth) {
+            inPath = true;
+            distToEdge = Math.min(
+              halfWidth - Math.abs(x - center),
+              halfWidth - Math.abs(y - center)
+            );
+          }
+
+          if (inPath) {
+            const idx = (y * TILE_SIZE + x) * 4;
+            const pathColor = parsedPathColors[Math.floor(Math.random() * parsedPathColors.length)];
+
+            // Apply fade at interior edges (not at tile edges)
+            const atTileEdge = x < PATH_FADE_PIXELS || x >= TILE_SIZE - PATH_FADE_PIXELS ||
+                               y < PATH_FADE_PIXELS || y >= TILE_SIZE - PATH_FADE_PIXELS;
+
+            if (!atTileEdge && distToEdge < PATH_FADE_PIXELS) {
+              const fade = distToEdge / PATH_FADE_PIXELS;
+              data.data[idx] = Math.round(data.data[idx] * (1 - fade) + pathColor.r * fade);
+              data.data[idx + 1] = Math.round(data.data[idx + 1] * (1 - fade) + pathColor.g * fade);
+              data.data[idx + 2] = Math.round(data.data[idx + 2] * (1 - fade) + pathColor.b * fade);
+            } else {
+              data.data[idx] = pathColor.r;
+              data.data[idx + 1] = pathColor.g;
+              data.data[idx + 2] = pathColor.b;
+            }
+          }
+        }
+      }
+
+      newVariations.set(i, data);
+    }
+
+    setVariations(newVariations);
+    setCurrentVariation(0);
+    loadVariation(0);
+  }, [tileType, terrainType, terrainColors, pathColors, pathWidth, saveCurrentVariation, loadVariation]);
 
   // Add color to recent
   const addRecentColor = useCallback((c: Color) => {
@@ -153,32 +449,32 @@ export function TileEditor() {
     });
   }, []);
 
+  // New tile
+  const newTile = useCallback(() => {
+    setTileId('');
+    setTileName('');
+    setTileType('TILE');
+    setTerrainType('LAND');
+    setPassable(true);
+    setMovementCost(1);
+    setPathWidth(DEFAULT_PATH_WIDTH);
+    setVariations(new Map());
+    setVariationCount(1);
+    setCurrentVariation(0);
+    canvasRef.current?.clear();
+  }, []);
+
   // Keyboard shortcuts
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
-        return;
-      }
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
 
       if (e.ctrlKey || e.metaKey) {
         switch (e.key.toLowerCase()) {
           case 'z':
             e.preventDefault();
-            if (e.shiftKey) {
-              canvasRef.current?.redo();
-            } else {
-              canvasRef.current?.undo();
-            }
-            break;
-          case 'c':
-            e.preventDefault();
-            clipboardRef.current = canvasRef.current?.copySelection() || null;
-            break;
-          case 'v':
-            e.preventDefault();
-            if (clipboardRef.current) {
-              canvasRef.current?.pasteSelection(clipboardRef.current);
-            }
+            if (e.shiftKey) canvasRef.current?.redo();
+            else canvasRef.current?.undo();
             break;
           case 's':
             e.preventDefault();
@@ -189,166 +485,119 @@ export function TileEditor() {
       }
 
       switch (e.key.toLowerCase()) {
-        case 'p':
-          setTool('pencil');
-          break;
-        case 'e':
-          setTool('eraser');
-          break;
-        case 'g':
-          setTool('fill');
-          break;
-        case 'l':
-          setTool('line');
-          break;
-        case 'm':
-          setTool('select');
-          break;
-        case 'i':
-          setTool('eyedropper');
-          break;
+        case 'p': setTool('pencil'); break;
+        case 'e': setTool('eraser'); break;
+        case 'g': setTool('fill'); break;
+        case 'l': setTool('line'); break;
+        case '[': changeVariation(Math.max(0, currentVariation - 1)); break;
+        case ']': changeVariation(Math.min(effectiveVariationCount - 1, currentVariation + 1)); break;
       }
     }
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [saveTile]);
+  }, [saveTile, currentVariation, effectiveVariationCount, changeVariation]);
 
   return (
     <div style={{ display: 'flex', height: '100%', minHeight: 'calc(100vh - 60px)' }}>
       {/* Left sidebar - Tile list */}
-      <div
-        style={{
-          width: 200,
-          background: '#16213e',
-          padding: '1rem',
-          overflowY: 'auto',
-        }}
-      >
-        <h3 style={{ color: '#4ecca3', margin: '0 0 1rem 0', fontSize: '1rem' }}>
-          Tiles
-        </h3>
+      <div style={{ width: 200, background: '#16213e', padding: '1rem', overflowY: 'auto' }}>
+        <h3 style={{ color: '#4ecca3', margin: '0 0 1rem 0', fontSize: '1rem' }}>Tiles</h3>
 
         <button
-          onClick={() => {
-            setTileId('');
-            setTileName('');
-            setWalkable(true);
-            setBlocksVision(false);
-            setDamagePerTurn(0);
-            canvasRef.current?.clear();
-          }}
+          onClick={newTile}
           style={{
-            width: '100%',
-            padding: '0.5rem',
-            background: '#4ecca3',
-            color: '#1a1a2e',
-            border: 'none',
-            borderRadius: '4px',
-            cursor: 'pointer',
-            fontWeight: 'bold',
-            marginBottom: '0.5rem',
+            width: '100%', padding: '0.5rem', background: '#4ecca3', color: '#1a1a2e',
+            border: 'none', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold', marginBottom: '0.5rem',
           }}
         >
           + New Tile
         </button>
 
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
           {existingTiles.map((id) => (
-            <TilePreview
+            <div
               key={id}
-              id={id}
-              selected={id === tileId}
               onClick={() => loadTile(id)}
-            />
+              style={{
+                padding: '0.5rem', background: id === tileId ? '#4ecca3' : '#0f0f23',
+                color: id === tileId ? '#1a1a2e' : '#ccc', borderRadius: '4px', cursor: 'pointer',
+                fontSize: '0.875rem',
+              }}
+            >
+              {id}
+            </div>
           ))}
         </div>
       </div>
 
       {/* Main editor area */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-        {/* Top bar - Tile info */}
-        <div
-          style={{
-            padding: '0.5rem 1rem',
-            background: '#16213e',
-            display: 'flex',
-            gap: '1rem',
-            alignItems: 'center',
-            flexWrap: 'wrap',
-          }}
-        >
+        {/* Top bar */}
+        <div style={{ padding: '0.5rem 1rem', background: '#16213e', display: 'flex', gap: '1rem', alignItems: 'center', flexWrap: 'wrap' }}>
           <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
             <span style={{ color: '#888', fontSize: '0.875rem' }}>ID:</span>
             <input
-              type="text"
-              value={tileId}
+              type="text" value={tileId}
               onChange={(e) => setTileId(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, ''))}
-              placeholder="tile_id"
-              style={{
-                background: '#0f0f23',
-                border: '1px solid #333',
-                borderRadius: '4px',
-                padding: '0.25rem 0.5rem',
-                color: '#ccc',
-                width: 100,
-              }}
+              style={{ background: '#0f0f23', border: '1px solid #333', borderRadius: '4px', padding: '0.25rem 0.5rem', color: '#ccc', width: 100 }}
             />
           </label>
 
           <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
             <span style={{ color: '#888', fontSize: '0.875rem' }}>Name:</span>
             <input
-              type="text"
-              value={tileName}
+              type="text" value={tileName}
               onChange={(e) => setTileName(e.target.value)}
-              placeholder="Display Name"
-              style={{
-                background: '#0f0f23',
-                border: '1px solid #333',
-                borderRadius: '4px',
-                padding: '0.25rem 0.5rem',
-                color: '#ccc',
-                width: 120,
-              }}
+              style={{ background: '#0f0f23', border: '1px solid #333', borderRadius: '4px', padding: '0.25rem 0.5rem', color: '#ccc', width: 120 }}
             />
           </label>
 
-          <div style={{ width: 1, height: 24, background: '#333' }} />
+          {/* Tile Type */}
+          <div style={{ display: 'flex', gap: '2px' }}>
+            {(['TILE', 'PATH', 'BRIDGE'] as TileType[]).map(t => (
+              <button
+                key={t}
+                onClick={() => setTileType(t)}
+                style={{
+                  padding: '0.25rem 0.5rem', border: 'none', borderRadius: '4px',
+                  background: tileType === t ? '#4ecca3' : '#0f0f23',
+                  color: tileType === t ? '#1a1a2e' : '#ccc', cursor: 'pointer', fontSize: '0.75rem',
+                }}
+              >
+                {t}
+              </button>
+            ))}
+          </div>
 
-          <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
-            <input
-              type="checkbox"
-              checked={walkable}
-              onChange={(e) => setWalkable(e.target.checked)}
-            />
-            <span style={{ color: '#888', fontSize: '0.875rem' }}>Walkable</span>
+          {/* Terrain Type */}
+          <div style={{ display: 'flex', gap: '2px' }}>
+            {(['LAND', 'WATER'] as TerrainType[]).map(t => (
+              <button
+                key={t}
+                onClick={() => setTerrainType(t)}
+                style={{
+                  padding: '0.25rem 0.5rem', border: 'none', borderRadius: '4px',
+                  background: terrainType === t ? (t === 'WATER' ? '#4169e1' : '#4ecca3') : '#0f0f23',
+                  color: terrainType === t ? '#fff' : '#ccc', cursor: 'pointer', fontSize: '0.75rem',
+                }}
+              >
+                {t}
+              </button>
+            ))}
+          </div>
+
+          <label style={{ display: 'flex', alignItems: 'center', gap: '0.25rem', cursor: 'pointer' }}>
+            <input type="checkbox" checked={passable} onChange={(e) => setPassable(e.target.checked)} />
+            <span style={{ color: '#888', fontSize: '0.75rem' }}>Passable</span>
           </label>
 
-          <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
+            <span style={{ color: '#888', fontSize: '0.75rem' }}>Cost:</span>
             <input
-              type="checkbox"
-              checked={blocksVision}
-              onChange={(e) => setBlocksVision(e.target.checked)}
-            />
-            <span style={{ color: '#888', fontSize: '0.875rem' }}>Blocks Vision</span>
-          </label>
-
-          <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-            <span style={{ color: '#888', fontSize: '0.875rem' }}>Damage:</span>
-            <input
-              type="number"
-              value={damagePerTurn}
-              onChange={(e) => setDamagePerTurn(Math.max(0, parseInt(e.target.value, 10) || 0))}
-              min={0}
-              style={{
-                background: '#0f0f23',
-                border: '1px solid #333',
-                borderRadius: '4px',
-                padding: '0.25rem 0.5rem',
-                color: '#ccc',
-                width: 60,
-              }}
+              type="number" value={movementCost} min={0} max={10}
+              onChange={(e) => setMovementCost(parseInt(e.target.value) || 0)}
+              style={{ background: '#0f0f23', border: '1px solid #333', borderRadius: '4px', padding: '0.25rem', color: '#ccc', width: 40 }}
             />
           </label>
 
@@ -358,108 +607,173 @@ export function TileEditor() {
             onClick={saveTile}
             disabled={isSaving || !tileId}
             style={{
-              padding: '0.5rem 1rem',
-              background: isSaving ? '#555' : '#4ecca3',
-              color: isSaving ? '#999' : '#1a1a2e',
-              border: 'none',
-              borderRadius: '4px',
-              cursor: isSaving || !tileId ? 'not-allowed' : 'pointer',
-              fontWeight: 'bold',
+              padding: '0.5rem 1rem', background: isSaving ? '#555' : '#4ecca3',
+              color: isSaving ? '#999' : '#1a1a2e', border: 'none', borderRadius: '4px',
+              cursor: isSaving || !tileId ? 'not-allowed' : 'pointer', fontWeight: 'bold',
             }}
           >
-            {isSaving ? 'Saving...' : 'Save (Ctrl+S)'}
+            {isSaving ? 'Saving...' : 'Save'}
           </button>
 
-          {saveError && (
-            <span style={{ color: '#ff6b6b', fontSize: '0.875rem' }}>{saveError}</span>
-          )}
+          {saveError && <span style={{ color: '#ff6b6b', fontSize: '0.75rem' }}>{saveError}</span>}
         </div>
 
-        {/* Toolbar */}
         <Toolbar
-          tool={tool}
-          onToolChange={setTool}
-          zoom={zoom}
-          onZoomChange={setZoom}
-          showGrid={showGrid}
-          onShowGridChange={setShowGrid}
+          tool={tool} onToolChange={setTool}
+          zoom={zoom} onZoomChange={setZoom}
+          brushSize={brushSize} onBrushSizeChange={setBrushSize}
+          showGrid={showGrid} onShowGridChange={setShowGrid}
           onUndo={() => canvasRef.current?.undo()}
           onRedo={() => canvasRef.current?.redo()}
           canUndo={canvasRef.current?.canUndo() ?? false}
           canRedo={canvasRef.current?.canRedo() ?? false}
           onClear={() => canvasRef.current?.clear()}
-          onRotateCW={() => canvasRef.current?.rotateClockwise()}
-          onRotateCCW={() => canvasRef.current?.rotateCounterClockwise()}
-          onFlipH={() => canvasRef.current?.flipHorizontal()}
-          onFlipV={() => canvasRef.current?.flipVertical()}
-          onCopy={() => {
-            clipboardRef.current = canvasRef.current?.copySelection() || canvasRef.current?.getImageData() || null;
-          }}
-          onPaste={() => {
-            if (clipboardRef.current) {
-              canvasRef.current?.pasteSelection(clipboardRef.current);
-            }
-          }}
-          onDelete={() => canvasRef.current?.deleteSelection()}
+          onCopy={() => { clipboardRef.current = canvasRef.current?.getImageData() || null; }}
+          onPaste={() => { if (clipboardRef.current) canvasRef.current?.setImageData(clipboardRef.current); }}
         />
 
-        {/* Main content area */}
+        {/* Main content */}
         <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
           {/* Canvas area */}
-          <div
-            style={{
-              flex: 1,
-              display: 'flex',
-              flexDirection: 'column',
-              alignItems: 'center',
-              justifyContent: 'center',
-              padding: '1rem',
-              background: '#0f0f23',
-            }}
-          >
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', padding: '1rem', background: '#0f0f23', overflow: 'auto' }}>
+            {/* Variation selector */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '1rem' }}>
+              <span style={{ color: '#666', fontSize: '0.75rem' }}>
+                Variation {currentVariation + 1} / {effectiveVariationCount}
+                {tileType !== 'TILE' && ` (${PATH_DIRECTIONS[currentVariation]?.label})`}
+              </span>
+
+              <button onClick={() => changeVariation(Math.max(0, currentVariation - 1))}
+                disabled={currentVariation === 0}
+                style={{ width: 28, height: 28, border: 'none', borderRadius: '4px', background: '#16213e', color: currentVariation === 0 ? '#555' : '#ccc', cursor: currentVariation === 0 ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <ChevronLeft size={16} />
+              </button>
+
+              <button onClick={() => changeVariation(Math.min(effectiveVariationCount - 1, currentVariation + 1))}
+                disabled={currentVariation >= effectiveVariationCount - 1}
+                style={{ width: 28, height: 28, border: 'none', borderRadius: '4px', background: '#16213e', color: currentVariation >= effectiveVariationCount - 1 ? '#555' : '#ccc', cursor: currentVariation >= effectiveVariationCount - 1 ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <ChevronRight size={16} />
+              </button>
+
+              {tileType === 'TILE' && (
+                <>
+                  <button onClick={addVariation} disabled={variationCount >= MAX_VARIATIONS}
+                    title="Add Variation"
+                    style={{ width: 28, height: 28, border: 'none', borderRadius: '4px', background: '#16213e', color: variationCount >= MAX_VARIATIONS ? '#555' : '#4ecca3', cursor: variationCount >= MAX_VARIATIONS ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <Plus size={16} />
+                  </button>
+                  <button onClick={duplicateVariation} disabled={variationCount >= MAX_VARIATIONS}
+                    title="Duplicate Variation"
+                    style={{ width: 28, height: 28, border: 'none', borderRadius: '4px', background: '#16213e', color: variationCount >= MAX_VARIATIONS ? '#555' : '#ffd93d', cursor: variationCount >= MAX_VARIATIONS ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <Copy size={16} />
+                  </button>
+                  <button onClick={deleteVariation} disabled={variationCount <= 1}
+                    title="Delete Variation"
+                    style={{ width: 28, height: 28, border: 'none', borderRadius: '4px', background: '#16213e', color: variationCount <= 1 ? '#555' : '#ff6b6b', cursor: variationCount <= 1 ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <Trash2 size={16} />
+                  </button>
+                </>
+              )}
+            </div>
+
+            {/* Canvas */}
             <PixelCanvas
               ref={canvasRef}
               width={TILE_SIZE}
               height={TILE_SIZE}
               zoom={zoom}
+              onZoomChange={setZoom}
               tool={tool}
               color={color}
+              brushSize={brushSize}
               showGrid={showGrid}
               onColorPick={(c) => setColor(c)}
+              onChange={() => saveCurrentVariation()}
             />
 
-            {/* Preview at different scales */}
-            <div style={{ marginTop: '2rem', display: 'flex', gap: '2rem' }}>
-              <div style={{ textAlign: 'center' }}>
-                <div style={{ color: '#666', fontSize: '0.75rem', marginBottom: '0.25rem' }}>1x</div>
-                <TilePreviewFromCanvas canvasRef={canvasRef} size={TILE_SIZE} scale={1} />
-              </div>
-              <div style={{ textAlign: 'center' }}>
-                <div style={{ color: '#666', fontSize: '0.75rem', marginBottom: '0.25rem' }}>2x</div>
-                <TilePreviewFromCanvas canvasRef={canvasRef} size={TILE_SIZE} scale={2} />
-              </div>
-              <div style={{ textAlign: 'center' }}>
-                <div style={{ color: '#666', fontSize: '0.75rem', marginBottom: '0.25rem' }}>4x</div>
-                <TilePreviewFromCanvas canvasRef={canvasRef} size={TILE_SIZE} scale={4} />
-              </div>
-
-              {/* Tiled preview */}
-              <div style={{ textAlign: 'center' }}>
-                <div style={{ color: '#666', fontSize: '0.75rem', marginBottom: '0.25rem' }}>Tiled</div>
-                <TiledPreview canvasRef={canvasRef} tileSize={TILE_SIZE} gridSize={4} scale={2} />
-              </div>
+            {/* Variation thumbnails */}
+            <div style={{ marginTop: '1rem', display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
+              {Array.from({ length: effectiveVariationCount }, (_, i) => (
+                <VariationThumbnail
+                  key={i}
+                  index={i}
+                  data={variations.get(i)}
+                  selected={i === currentVariation}
+                  label={tileType !== 'TILE' ? PATH_DIRECTIONS[i]?.label : undefined}
+                  onClick={() => changeVariation(i)}
+                />
+              ))}
             </div>
           </div>
 
-          {/* Right sidebar - Color picker */}
-          <div
-            style={{
-              width: 220,
-              background: '#16213e',
-              padding: '0.5rem',
-              overflowY: 'auto',
-            }}
-          >
+          {/* Right sidebar */}
+          <div style={{ width: 250, background: '#16213e', padding: '0.5rem', overflowY: 'auto' }}>
+            {/* Generation tools */}
+            <div style={{ marginBottom: '1rem', padding: '0.5rem', background: '#0f0f23', borderRadius: '4px' }}>
+              <div style={{ color: '#4ecca3', fontWeight: 'bold', fontSize: '0.875rem', marginBottom: '0.5rem' }}>
+                Generation
+              </div>
+
+              {/* Terrain colors */}
+              <div style={{ marginBottom: '0.5rem' }}>
+                <div style={{ color: '#888', fontSize: '0.75rem', marginBottom: '0.25rem' }}>Terrain Colors</div>
+                <div style={{ display: 'flex', gap: '4px' }}>
+                  {terrainColors.map((c, i) => (
+                    <input key={i} type="color" value={c}
+                      onChange={(e) => {
+                        const newColors = [...terrainColors];
+                        newColors[i] = e.target.value;
+                        setTerrainColors(newColors);
+                      }}
+                      style={{ width: 32, height: 24, border: 'none', cursor: 'pointer' }}
+                    />
+                  ))}
+                </div>
+              </div>
+
+              <button onClick={generateRandomFill}
+                style={{ width: '100%', padding: '0.5rem', border: 'none', borderRadius: '4px', background: '#4ecca3', color: '#1a1a2e', cursor: 'pointer', fontSize: '0.75rem', marginBottom: '0.5rem' }}>
+                Random Fill Current
+              </button>
+
+              {tileType !== 'TILE' && (
+                <>
+                  {/* Path colors */}
+                  <div style={{ marginBottom: '0.5rem' }}>
+                    <div style={{ color: '#888', fontSize: '0.75rem', marginBottom: '0.25rem' }}>Path Colors</div>
+                    <div style={{ display: 'flex', gap: '4px' }}>
+                      {pathColors.map((c, i) => (
+                        <input key={i} type="color" value={c}
+                          onChange={(e) => {
+                            const newColors = [...pathColors];
+                            newColors[i] = e.target.value;
+                            setPathColors(newColors);
+                          }}
+                          style={{ width: 32, height: 24, border: 'none', cursor: 'pointer' }}
+                        />
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Path width */}
+                  <div style={{ marginBottom: '0.5rem' }}>
+                    <div style={{ color: '#888', fontSize: '0.75rem', marginBottom: '0.25rem' }}>
+                      Path Width: {pathWidth}px
+                    </div>
+                    <input type="range" min={16} max={112} value={pathWidth}
+                      onChange={(e) => setPathWidth(parseInt(e.target.value))}
+                      style={{ width: '100%' }}
+                    />
+                  </div>
+
+                  <button onClick={generateAllPaths}
+                    style={{ width: '100%', padding: '0.5rem', border: 'none', borderRadius: '4px', background: '#ffd93d', color: '#1a1a2e', cursor: 'pointer', fontSize: '0.75rem', fontWeight: 'bold' }}>
+                    Generate All 15 Paths
+                  </button>
+                </>
+              )}
+            </div>
+
             <ColorPicker
               color={color}
               onChange={setColor}
@@ -470,22 +784,8 @@ export function TileEditor() {
         </div>
       </div>
 
-      {/* Loading overlay */}
       {isLoading && (
-        <div
-          style={{
-            position: 'fixed',
-            top: 0,
-            left: 0,
-            right: 0,
-            bottom: 0,
-            background: 'rgba(0, 0, 0, 0.7)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            zIndex: 1000,
-          }}
-        >
+        <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
           <div style={{ color: '#4ecca3', fontSize: '1.5rem' }}>Loading...</div>
         </div>
       )}
@@ -493,181 +793,59 @@ export function TileEditor() {
   );
 }
 
-/** Tile preview in list */
-function TilePreview({
-  id,
-  selected,
-  onClick,
-}: {
-  id: string;
+/** Variation thumbnail */
+function VariationThumbnail({ index, data, selected, label, onClick }: {
+  index: number;
+  data?: ImageData;
   selected: boolean;
+  label?: string;
   onClick: () => void;
 }) {
-  const [imgSrc, setImgSrc] = useState<string | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
-    async function loadPreview() {
-      try {
-        const storage = createStorage();
-        const url = storage.getReadUrl(`tiles/${id}/sprite.png`);
-        setImgSrc(url);
-      } catch {
-        setImgSrc(null);
-      }
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    ctx.clearRect(0, 0, 32, 32);
+    if (data) {
+      const temp = document.createElement('canvas');
+      temp.width = data.width;
+      temp.height = data.height;
+      temp.getContext('2d')!.putImageData(data, 0, 0);
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(temp, 0, 0, 32, 32);
+    } else {
+      ctx.fillStyle = '#333';
+      ctx.fillRect(0, 0, 32, 32);
+      ctx.fillStyle = '#666';
+      ctx.font = '10px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('?', 16, 20);
     }
-    loadPreview();
-  }, [id]);
+  }, [data]);
 
   return (
-    <div
-      onClick={onClick}
-      title={id}
-      style={{
-        width: 40,
-        height: 40,
-        background: selected ? '#4ecca3' : '#0f0f23',
-        borderRadius: '4px',
-        cursor: 'pointer',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        border: selected ? '2px solid #4ecca3' : '1px solid #333',
-      }}
-    >
-      {imgSrc ? (
-        <img
-          src={imgSrc}
-          alt={id}
-          style={{
-            width: 32,
-            height: 32,
-            imageRendering: 'pixelated',
-          }}
-        />
-      ) : (
-        <span style={{ color: '#666', fontSize: '0.625rem' }}>{id.slice(0, 3)}</span>
+    <div onClick={onClick} title={label || `Variation ${index + 1}`}
+      style={{ position: 'relative', border: selected ? '2px solid #4ecca3' : '1px solid #333', borderRadius: '4px', cursor: 'pointer' }}>
+      <canvas ref={canvasRef} width={32} height={32} style={{ display: 'block', imageRendering: 'pixelated' }} />
+      {label && (
+        <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, background: 'rgba(0,0,0,0.7)', color: '#fff', fontSize: '8px', textAlign: 'center', padding: '1px' }}>
+          {label}
+        </div>
       )}
     </div>
   );
 }
 
-/** Preview from canvas data at given scale */
-function TilePreviewFromCanvas({
-  canvasRef,
-  size,
-  scale,
-}: {
-  canvasRef: React.RefObject<PixelCanvasRef | null>;
-  size: number;
-  scale: number;
-}) {
-  const previewCanvasRef = useRef<HTMLCanvasElement>(null);
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      const canvas = previewCanvasRef.current;
-      if (!canvas || !canvasRef.current) return;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-
-      const data = canvasRef.current.getImageData();
-      if (!data) return;
-
-      const tempCanvas = document.createElement('canvas');
-      tempCanvas.width = size;
-      tempCanvas.height = size;
-      const tempCtx = tempCanvas.getContext('2d');
-      if (!tempCtx) return;
-      tempCtx.putImageData(data, 0, 0);
-
-      ctx.imageSmoothingEnabled = false;
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(tempCanvas, 0, 0, size * scale, size * scale);
-    }, 100);
-
-    return () => clearInterval(interval);
-  }, [canvasRef, size, scale]);
-
-  return (
-    <canvas
-      ref={previewCanvasRef}
-      width={size * scale}
-      height={size * scale}
-      style={{
-        background: '#111',
-        borderRadius: '4px',
-        imageRendering: 'pixelated',
-      }}
-    />
-  );
+// Helpers
+function parseHexColor(hex: string): { r: number; g: number; b: number } {
+  const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+  return result ? { r: parseInt(result[1], 16), g: parseInt(result[2], 16), b: parseInt(result[3], 16) } : { r: 0, g: 0, b: 0 };
 }
 
-/** Tiled preview showing tile repeated in a grid */
-function TiledPreview({
-  canvasRef,
-  tileSize,
-  gridSize,
-  scale,
-}: {
-  canvasRef: React.RefObject<PixelCanvasRef | null>;
-  tileSize: number;
-  gridSize: number;
-  scale: number;
-}) {
-  const previewCanvasRef = useRef<HTMLCanvasElement>(null);
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      const canvas = previewCanvasRef.current;
-      if (!canvas || !canvasRef.current) return;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-
-      const data = canvasRef.current.getImageData();
-      if (!data) return;
-
-      const tempCanvas = document.createElement('canvas');
-      tempCanvas.width = tileSize;
-      tempCanvas.height = tileSize;
-      const tempCtx = tempCanvas.getContext('2d');
-      if (!tempCtx) return;
-      tempCtx.putImageData(data, 0, 0);
-
-      ctx.imageSmoothingEnabled = false;
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-      const scaledTile = tileSize * scale;
-      for (let y = 0; y < gridSize; y++) {
-        for (let x = 0; x < gridSize; x++) {
-          ctx.drawImage(
-            tempCanvas,
-            x * scaledTile,
-            y * scaledTile,
-            scaledTile,
-            scaledTile
-          );
-        }
-      }
-    }, 100);
-
-    return () => clearInterval(interval);
-  }, [canvasRef, tileSize, gridSize, scale]);
-
-  return (
-    <canvas
-      ref={previewCanvasRef}
-      width={tileSize * scale * gridSize}
-      height={tileSize * scale * gridSize}
-      style={{
-        background: '#111',
-        borderRadius: '4px',
-        imageRendering: 'pixelated',
-      }}
-    />
-  );
-}
-
-/** Load image from URL */
 function loadImage(url: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -678,12 +856,7 @@ function loadImage(url: string): Promise<HTMLImageElement> {
   });
 }
 
-/** Convert image to ImageData */
-function imageToImageData(
-  img: HTMLImageElement,
-  width: number,
-  height: number
-): ImageData {
+function imageToImageData(img: HTMLImageElement, width: number, height: number): ImageData {
   const canvas = document.createElement('canvas');
   canvas.width = width;
   canvas.height = height;
@@ -692,25 +865,15 @@ function imageToImageData(
   return ctx.getImageData(0, 0, width, height);
 }
 
-/** Convert ImageData to PNG blob */
 function imageDataToPng(data: ImageData): Promise<Blob> {
   return new Promise((resolve, reject) => {
     const canvas = document.createElement('canvas');
     canvas.width = data.width;
     canvas.height = data.height;
     const ctx = canvas.getContext('2d');
-    if (!ctx) {
-      reject(new Error('Failed to get canvas context'));
-      return;
-    }
+    if (!ctx) { reject(new Error('No context')); return; }
     ctx.putImageData(data, 0, 0);
-    canvas.toBlob((blob) => {
-      if (blob) {
-        resolve(blob);
-      } else {
-        reject(new Error('Failed to create blob'));
-      }
-    }, 'image/png');
+    canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error('No blob')), 'image/png');
   });
 }
 

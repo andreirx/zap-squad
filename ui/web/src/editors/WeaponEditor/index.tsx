@@ -18,8 +18,8 @@ import {
 } from '../types';
 
 /** Canvas size for weapon sprites */
-const SPRITE_WIDTH = 32;
-const SPRITE_HEIGHT = 32;
+const SPRITE_WIDTH = 128;
+const SPRITE_HEIGHT = 128;
 
 const WEAPON_TYPES = ['melee', 'ranged', 'throwable'] as const;
 type WeaponType = typeof WEAPON_TYPES[number];

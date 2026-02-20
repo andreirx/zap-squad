@@ -38,8 +38,8 @@ export interface ZapManifest {
 // Constants
 // ============================================================================
 
-const SPRITE_SIZE = 32;
-const TILE_SIZE = 16;
+const SPRITE_SIZE = 128;
+const TILE_SIZE = 128;
 
 const VISUAL_STATES = ['full', 'hurt_1', 'hurt_2', 'critical'] as const;
 const ANIMATION_STATES = ['idle', 'walk', 'melee_attack', 'throw_attack'] as const;

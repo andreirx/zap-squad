@@ -1,6 +1,6 @@
 import { BrowserRouter, Routes, Route, Link, useLocation } from 'react-router-dom';
 import { GamePage } from './pages/GamePage';
-import { CharacterEditor, TileEditor, WeaponEditor, MapEditor } from './editors';
+import { CharacterEditor, ObjectEditor, TileEditor, WeaponEditor, MapEditor } from './editors';
 
 export default function App() {
   return (
@@ -11,6 +11,7 @@ export default function App() {
           <Routes>
             <Route path="/" element={<GamePage />} />
             <Route path="/editor/character" element={<CharacterEditor />} />
+            <Route path="/editor/object" element={<ObjectEditor />} />
             <Route path="/editor/weapon" element={<WeaponEditor />} />
             <Route path="/editor/tile" element={<TileEditor />} />
             <Route path="/editor/map" element={<MapEditor />} />
@@ -44,11 +45,14 @@ function Navigation() {
       alignItems: 'center',
     }}>
       <Link to="/" style={{ ...linkStyle('/'), fontWeight: 'bold' }}>
-        Zap Architect
+        ZAP-SQUAD
       </Link>
       <span style={{ color: '#333' }}>|</span>
       <Link to="/editor/character" style={linkStyle('/editor/character')}>
         Characters
+      </Link>
+      <Link to="/editor/object" style={linkStyle('/editor/object')}>
+        Objects
       </Link>
       <Link to="/editor/weapon" style={linkStyle('/editor/weapon')}>
         Weapons

@@ -1,4 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
+import { Plus, Copy, Trash2, ChevronLeft, ChevronRight, Play, Pause } from 'lucide-react';
 import { PixelCanvas, type PixelCanvasRef } from '../PixelCanvas';
 import { ColorPicker } from '../ColorPicker';
 import { Toolbar } from '../Toolbar';
@@ -7,36 +8,24 @@ import type {
   Color,
   Tool,
   AnimationState,
-  VisualState,
   Direction,
-  CharacterDefinition,
 } from '../types';
 import {
   ANIMATION_STATES,
-  VISUAL_STATES,
   DIRECTIONS,
-  DEFAULT_FRAMES,
+  MAX_FRAMES,
   DEFAULT_FRAME_DURATION,
-  buildSpriteName,
 } from '../types';
 
 /** Canvas size for character sprites */
-const SPRITE_WIDTH = 32;
-const SPRITE_HEIGHT = 32;
-
-/** State tab labels */
-const VISUAL_STATE_LABELS: Record<VisualState, string> = {
-  full: 'Full Health',
-  hurt_1: 'Hurt 1 (75%)',
-  hurt_2: 'Hurt 2 (50%)',
-  critical: 'Critical (25%)',
-};
+const SPRITE_WIDTH = 128;
+const SPRITE_HEIGHT = 128;
 
 const ANIMATION_STATE_LABELS: Record<AnimationState, string> = {
   idle: 'Idle',
   walk: 'Walk',
-  melee_attack: 'Melee Attack',
-  throw_attack: 'Throw Attack',
+  melee_attack: 'Melee',
+  throw_attack: 'Throw',
 };
 
 const DIRECTION_LABELS: Record<Direction, string> = {
@@ -46,16 +35,31 @@ const DIRECTION_LABELS: Record<Direction, string> = {
   west: 'W',
 };
 
-/** Character sprite editor with visual states, animations, and directions */
+/** Character definition - frame count discovered from files, not stored */
+interface CharacterDefinition {
+  id: string;
+  name: string;
+  frameDuration: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Character sprite editor - frame count discovered, not configured */
 export function CharacterEditor() {
   // Character metadata
   const [characterId, setCharacterId] = useState('');
   const [characterName, setCharacterName] = useState('');
-  const [frameCount, setFrameCount] = useState(DEFAULT_FRAMES);
   const [frameDuration, setFrameDuration] = useState(DEFAULT_FRAME_DURATION);
 
+  // Discovered frame counts per animation (from existing sprites)
+  const [frameCounts, setFrameCounts] = useState<Record<AnimationState, number>>({
+    idle: 1,
+    walk: 1,
+    melee_attack: 1,
+    throw_attack: 1,
+  });
+
   // Current editing state
-  const [visualState, setVisualState] = useState<VisualState>('full');
   const [animationState, setAnimationState] = useState<AnimationState>('idle');
   const [direction, setDirection] = useState<Direction>('south');
   const [frame, setFrame] = useState(0);
@@ -63,11 +67,12 @@ export function CharacterEditor() {
   // Drawing state
   const [tool, setTool] = useState<Tool>('pencil');
   const [color, setColor] = useState<Color>({ r: 0, g: 0, b: 0, a: 255 });
-  const [zoom, setZoom] = useState(16);
+  const [zoom, setZoom] = useState(4);
+  const [brushSize, setBrushSize] = useState(1);
   const [showGrid, setShowGrid] = useState(true);
   const [recentColors, setRecentColors] = useState<Color[]>([]);
 
-  // All sprite data: [visualState][animationState][direction][frame] -> ImageData
+  // All sprite data: [animationState][direction][frame] -> ImageData
   const spritesRef = useRef<Map<string, ImageData>>(new Map());
 
   // Canvas ref
@@ -86,15 +91,17 @@ export function CharacterEditor() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [previewFrame, setPreviewFrame] = useState(0);
 
+  // Current frame count for selected animation
+  const currentFrameCount = frameCounts[animationState];
+
   // Build sprite key
   const getSpriteKey = useCallback(
-    (vs: VisualState, as: AnimationState, dir: Direction, f: number) =>
-      `${vs}_${as}_${dir}_${f}`,
+    (as: AnimationState, dir: Direction, f: number) => `${as}_${dir}_${f}`,
     []
   );
 
   // Get current sprite key
-  const currentKey = getSpriteKey(visualState, animationState, direction, frame);
+  const currentKey = getSpriteKey(animationState, direction, frame);
 
   // Save current canvas to sprites map
   const saveCurrentSprite = useCallback(() => {
@@ -105,8 +112,8 @@ export function CharacterEditor() {
 
   // Load sprite from map to canvas
   const loadSprite = useCallback(
-    (vs: VisualState, as: AnimationState, dir: Direction, f: number) => {
-      const key = getSpriteKey(vs, as, dir, f);
+    (as: AnimationState, dir: Direction, f: number) => {
+      const key = getSpriteKey(as, dir, f);
       const data = spritesRef.current.get(key);
       if (data && canvasRef.current) {
         canvasRef.current.setImageData(data);
@@ -117,23 +124,21 @@ export function CharacterEditor() {
     [getSpriteKey]
   );
 
-  // Change state handlers - save current before changing
-  const changeVisualState = useCallback(
-    (vs: VisualState) => {
-      saveCurrentSprite();
-      setVisualState(vs);
-    },
-    [saveCurrentSprite]
-  );
-
+  // Change animation state handler
   const changeAnimationState = useCallback(
     (as: AnimationState) => {
       saveCurrentSprite();
       setAnimationState(as);
+      // Reset frame if exceeds this animation's frame count
+      const newFrameCount = frameCounts[as];
+      if (frame >= newFrameCount) {
+        setFrame(0);
+      }
     },
-    [saveCurrentSprite]
+    [saveCurrentSprite, frame, frameCounts]
   );
 
+  // Change direction handler
   const changeDirection = useCallback(
     (dir: Direction) => {
       saveCurrentSprite();
@@ -142,6 +147,7 @@ export function CharacterEditor() {
     [saveCurrentSprite]
   );
 
+  // Change frame handler
   const changeFrame = useCallback(
     (f: number) => {
       saveCurrentSprite();
@@ -150,19 +156,139 @@ export function CharacterEditor() {
     [saveCurrentSprite]
   );
 
+  // Add a new frame to current animation (up to MAX_FRAMES)
+  const addFrame = useCallback(() => {
+    if (currentFrameCount >= MAX_FRAMES) return;
+
+    saveCurrentSprite();
+    setFrameCounts(prev => ({
+      ...prev,
+      [animationState]: prev[animationState] + 1,
+    }));
+    // Switch to the new frame
+    setFrame(currentFrameCount);
+  }, [currentFrameCount, animationState, saveCurrentSprite]);
+
+  // Duplicate current frame as a new frame
+  const duplicateFrame = useCallback(() => {
+    if (currentFrameCount >= MAX_FRAMES) return;
+
+    saveCurrentSprite();
+    const sourceData = spritesRef.current.get(currentKey);
+
+    // Add new frame
+    const newFrameIndex = currentFrameCount;
+    setFrameCounts(prev => ({
+      ...prev,
+      [animationState]: prev[animationState] + 1,
+    }));
+
+    // Copy current frame to new frame for all directions
+    if (sourceData) {
+      for (const dir of DIRECTIONS) {
+        const sourceKey = getSpriteKey(animationState, dir, frame);
+        const destKey = getSpriteKey(animationState, dir, newFrameIndex);
+        const srcData = spritesRef.current.get(sourceKey);
+        if (srcData) {
+          const copy = new ImageData(
+            new Uint8ClampedArray(srcData.data),
+            srcData.width,
+            srcData.height
+          );
+          spritesRef.current.set(destKey, copy);
+        }
+      }
+    }
+
+    // Switch to the new frame
+    setFrame(newFrameIndex);
+  }, [currentFrameCount, animationState, currentKey, frame, getSpriteKey, saveCurrentSprite]);
+
+  // Delete current frame
+  const deleteFrame = useCallback(() => {
+    if (currentFrameCount <= 1) return;
+    saveCurrentSprite();
+
+    // Shift all frames after current one down
+    for (const dir of DIRECTIONS) {
+      for (let f = frame; f < currentFrameCount - 1; f++) {
+        const srcKey = getSpriteKey(animationState, dir, f + 1);
+        const destKey = getSpriteKey(animationState, dir, f);
+        const srcData = spritesRef.current.get(srcKey);
+        if (srcData) {
+          spritesRef.current.set(destKey, srcData);
+        } else {
+          spritesRef.current.delete(destKey);
+        }
+      }
+      // Delete the last frame slot
+      spritesRef.current.delete(getSpriteKey(animationState, dir, currentFrameCount - 1));
+    }
+
+    setFrameCounts(prev => ({
+      ...prev,
+      [animationState]: prev[animationState] - 1,
+    }));
+    setFrame(prev => Math.max(0, prev - 1));
+  }, [currentFrameCount, animationState, frame, getSpriteKey, saveCurrentSprite]);
+
+  // Move current frame left
+  const moveFrameLeft = useCallback(() => {
+    if (frame <= 0) return;
+    saveCurrentSprite();
+
+    // Swap frame and frame-1 for all directions
+    for (const dir of DIRECTIONS) {
+      const currentKey = getSpriteKey(animationState, dir, frame);
+      const prevKey = getSpriteKey(animationState, dir, frame - 1);
+      const currentData = spritesRef.current.get(currentKey);
+      const prevData = spritesRef.current.get(prevKey);
+
+      if (currentData) spritesRef.current.set(prevKey, currentData);
+      else spritesRef.current.delete(prevKey);
+
+      if (prevData) spritesRef.current.set(currentKey, prevData);
+      else spritesRef.current.delete(currentKey);
+    }
+
+    setFrame(frame - 1);
+  }, [frame, animationState, getSpriteKey, saveCurrentSprite]);
+
+  // Move current frame right
+  const moveFrameRight = useCallback(() => {
+    if (frame >= currentFrameCount - 1) return;
+    saveCurrentSprite();
+
+    // Swap frame and frame+1 for all directions
+    for (const dir of DIRECTIONS) {
+      const currentKey = getSpriteKey(animationState, dir, frame);
+      const nextKey = getSpriteKey(animationState, dir, frame + 1);
+      const currentData = spritesRef.current.get(currentKey);
+      const nextData = spritesRef.current.get(nextKey);
+
+      if (currentData) spritesRef.current.set(nextKey, currentData);
+      else spritesRef.current.delete(nextKey);
+
+      if (nextData) spritesRef.current.set(currentKey, nextData);
+      else spritesRef.current.delete(currentKey);
+    }
+
+    setFrame(frame + 1);
+  }, [frame, currentFrameCount, animationState, getSpriteKey, saveCurrentSprite]);
+
   // Load sprite when state changes
   useEffect(() => {
-    loadSprite(visualState, animationState, direction, frame);
-  }, [visualState, animationState, direction, frame, loadSprite]);
+    loadSprite(animationState, direction, frame);
+  }, [animationState, direction, frame, loadSprite]);
 
   // Animation preview effect
   useEffect(() => {
     if (!isPlaying) return;
     const interval = setInterval(() => {
-      setPreviewFrame((f) => (f + 1) % frameCount);
+      setPreviewFrame((f) => (f + 1) % currentFrameCount);
     }, frameDuration * 1000);
     return () => clearInterval(interval);
-  }, [isPlaying, frameCount, frameDuration]);
+  }, [isPlaying, currentFrameCount, frameDuration]);
 
   // Load existing characters on mount
   useEffect(() => {
@@ -185,61 +311,95 @@ export function CharacterEditor() {
     loadCharacters();
   }, []);
 
-  // Load character from storage
-  const loadCharacter = useCallback(async (id: string) => {
-    setIsLoading(true);
-    setSaveError(null);
-    try {
-      const storage = createStorage();
+  // Load character from storage - discover frame counts from files
+  // Supports both old format (with visual states) and new format (without)
+  const loadCharacter = useCallback(
+    async (id: string) => {
+      setIsLoading(true);
+      setSaveError(null);
+      try {
+        const storage = createStorage();
 
-      // Load definition
-      const defJson = await storage.readText(`characters/${id}/definition.json`);
-      const def: CharacterDefinition = JSON.parse(defJson);
-      setCharacterId(def.id);
-      setCharacterName(def.name);
-      setFrameCount(def.frames);
-      setFrameDuration(def.frameDuration);
+        // Load definition
+        const defJson = await storage.readText(`characters/${id}/definition.json`);
+        const def: CharacterDefinition = JSON.parse(defJson);
+        setCharacterId(def.id);
+        setCharacterName(def.name);
+        setFrameDuration(def.frameDuration || DEFAULT_FRAME_DURATION);
 
-      // Clear existing sprites
-      spritesRef.current.clear();
+        // Clear existing sprites
+        spritesRef.current.clear();
 
-      // Load all sprite images
-      for (const vs of VISUAL_STATES) {
+        // Discover frame counts by checking which files exist
+        const discoveredFrameCounts: Record<AnimationState, number> = {
+          idle: 1,
+          walk: 1,
+          melee_attack: 1,
+          throw_attack: 1,
+        };
+
+        // Load all sprite images and discover frame counts
+        // Try both new format (no visual state) and old format (with _full_)
         for (const as of ANIMATION_STATES) {
+          let maxFrame = 0;
           for (const dir of DIRECTIONS) {
-            for (let f = 0; f < def.frames; f++) {
-              const filename = buildSpriteName({
-                bodyId: id,
-                visualState: vs,
-                animationState: as,
-                direction: dir,
-                frame: f,
-              });
+            for (let f = 0; f < MAX_FRAMES; f++) {
+              // Try new format first: {id}_{anim}_{dir}_{frame}.png
+              const newFilename = `${id}_${as}_${dir}_${f}.png`;
+              // Try old format with visual state: {id}_full_{anim}_{dir}_{frame}.png
+              const oldFilename = `${id}_full_${as}_${dir}_${f}.png`;
+
+              let loaded = false;
+
+              // Try new format
               try {
-                const url = storage.getReadUrl(`characters/${id}/${filename}`);
+                const url = storage.getReadUrl(`characters/${id}/${newFilename}`);
                 const img = await loadImage(url);
                 const data = imageToImageData(img, SPRITE_WIDTH, SPRITE_HEIGHT);
-                spritesRef.current.set(getSpriteKey(vs, as, dir, f), data);
+                spritesRef.current.set(getSpriteKey(as, dir, f), data);
+                maxFrame = Math.max(maxFrame, f + 1);
+                loaded = true;
               } catch {
-                // Sprite doesn't exist yet
+                // New format doesn't exist, try old format
+              }
+
+              // Try old format if new didn't work
+              if (!loaded) {
+                try {
+                  const url = storage.getReadUrl(`characters/${id}/${oldFilename}`);
+                  const img = await loadImage(url);
+                  const data = imageToImageData(img, SPRITE_WIDTH, SPRITE_HEIGHT);
+                  spritesRef.current.set(getSpriteKey(as, dir, f), data);
+                  maxFrame = Math.max(maxFrame, f + 1);
+                  loaded = true;
+                } catch {
+                  // Neither format exists - stop looking for more frames
+                }
+              }
+
+              if (!loaded) {
+                break; // No more frames in this direction
               }
             }
           }
+          discoveredFrameCounts[as] = Math.max(1, maxFrame);
         }
-      }
 
-      // Reset to initial state and load sprite
-      setVisualState('full');
-      setAnimationState('idle');
-      setDirection('south');
-      setFrame(0);
-      loadSprite('full', 'idle', 'south', 0);
-    } catch (e) {
-      setSaveError(`Failed to load character: ${e}`);
-    } finally {
-      setIsLoading(false);
-    }
-  }, [getSpriteKey, loadSprite]);
+        setFrameCounts(discoveredFrameCounts);
+
+        // Reset to initial state and load sprite
+        setAnimationState('idle');
+        setDirection('south');
+        setFrame(0);
+        loadSprite('idle', 'south', 0);
+      } catch (e) {
+        setSaveError(`Failed to load character: ${e}`);
+      } finally {
+        setIsLoading(false);
+      }
+    },
+    [getSpriteKey, loadSprite]
+  );
 
   // Save character to storage
   const saveCharacter = useCallback(async () => {
@@ -257,11 +417,10 @@ export function CharacterEditor() {
       const storage = createStorage();
       const now = new Date().toISOString();
 
-      // Save definition
+      // Save definition (frame counts are discovered, not stored)
       const def: CharacterDefinition = {
         id: characterId,
         name: characterName || characterId,
-        frames: frameCount,
         frameDuration,
         createdAt: now,
         updatedAt: now,
@@ -273,14 +432,8 @@ export function CharacterEditor() {
 
       // Save all sprites
       for (const [key, data] of spritesRef.current.entries()) {
-        const [vs, as, dir, f] = key.split('_');
-        const filename = buildSpriteName({
-          bodyId: characterId,
-          visualState: vs as VisualState,
-          animationState: as as AnimationState,
-          direction: dir as Direction,
-          frame: parseInt(f, 10),
-        });
+        const [as, dir, f] = key.split('_');
+        const filename = `${characterId}_${as}_${dir}_${f}.png`;
         const blob = await imageDataToPng(data);
         await storage.writeBytes(
           `characters/${characterId}/${filename}`,
@@ -300,7 +453,7 @@ export function CharacterEditor() {
     } finally {
       setIsSaving(false);
     }
-  }, [characterId, characterName, frameCount, frameDuration, saveCurrentSprite, existingCharacters]);
+  }, [characterId, characterName, frameDuration, saveCurrentSprite, existingCharacters]);
 
   // Copy current frame to all directions
   const copyToAllDirections = useCallback(() => {
@@ -310,8 +463,7 @@ export function CharacterEditor() {
 
     for (const dir of DIRECTIONS) {
       if (dir !== direction) {
-        const key = getSpriteKey(visualState, animationState, dir, frame);
-        // Clone the image data
+        const key = getSpriteKey(animationState, dir, frame);
         const copy = new ImageData(
           new Uint8ClampedArray(sourceData.data),
           sourceData.width,
@@ -320,7 +472,7 @@ export function CharacterEditor() {
         spritesRef.current.set(key, copy);
       }
     }
-  }, [currentKey, direction, visualState, animationState, frame, getSpriteKey, saveCurrentSprite]);
+  }, [currentKey, direction, animationState, frame, getSpriteKey, saveCurrentSprite]);
 
   // Copy current frame to all frames in animation
   const copyToAllFrames = useCallback(() => {
@@ -328,9 +480,9 @@ export function CharacterEditor() {
     const sourceData = spritesRef.current.get(currentKey);
     if (!sourceData) return;
 
-    for (let f = 0; f < frameCount; f++) {
+    for (let f = 0; f < currentFrameCount; f++) {
       if (f !== frame) {
-        const key = getSpriteKey(visualState, animationState, direction, f);
+        const key = getSpriteKey(animationState, direction, f);
         const copy = new ImageData(
           new Uint8ClampedArray(sourceData.data),
           sourceData.width,
@@ -339,33 +491,7 @@ export function CharacterEditor() {
         spritesRef.current.set(key, copy);
       }
     }
-  }, [currentKey, frame, frameCount, visualState, animationState, direction, getSpriteKey, saveCurrentSprite]);
-
-  // Copy visual state to other visual states
-  const copyToAllVisualStates = useCallback(() => {
-    saveCurrentSprite();
-
-    for (const vs of VISUAL_STATES) {
-      if (vs === visualState) continue;
-      for (const as of ANIMATION_STATES) {
-        for (const dir of DIRECTIONS) {
-          for (let f = 0; f < frameCount; f++) {
-            const sourceKey = getSpriteKey(visualState, as, dir, f);
-            const sourceData = spritesRef.current.get(sourceKey);
-            if (sourceData) {
-              const destKey = getSpriteKey(vs, as, dir, f);
-              const copy = new ImageData(
-                new Uint8ClampedArray(sourceData.data),
-                sourceData.width,
-                sourceData.height
-              );
-              spritesRef.current.set(destKey, copy);
-            }
-          }
-        }
-      }
-    }
-  }, [visualState, frameCount, getSpriteKey, saveCurrentSprite]);
+  }, [currentKey, frame, currentFrameCount, animationState, direction, getSpriteKey, saveCurrentSprite]);
 
   // Add color to recent
   const addRecentColor = useCallback((c: Color) => {
@@ -398,6 +524,11 @@ export function CharacterEditor() {
           case 'c':
             e.preventDefault();
             clipboardRef.current = canvasRef.current?.copySelection() || null;
+            break;
+          case 'x':
+            e.preventDefault();
+            clipboardRef.current = canvasRef.current?.copySelection() || null;
+            canvasRef.current?.deleteSelection();
             break;
           case 'v':
             e.preventDefault();
@@ -436,7 +567,7 @@ export function CharacterEditor() {
           setFrame((f) => Math.max(0, f - 1));
           break;
         case ']':
-          setFrame((f) => Math.min(frameCount - 1, f + 1));
+          setFrame((f) => Math.min(currentFrameCount - 1, f + 1));
           break;
         case ' ':
           e.preventDefault();
@@ -447,7 +578,25 @@ export function CharacterEditor() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [frameCount, saveCharacter]);
+  }, [currentFrameCount, saveCharacter]);
+
+  // New character - reset everything
+  const newCharacter = useCallback(() => {
+    setCharacterId('');
+    setCharacterName('');
+    setFrameCounts({
+      idle: 1,
+      walk: 1,
+      melee_attack: 1,
+      throw_attack: 1,
+    });
+    setFrameDuration(DEFAULT_FRAME_DURATION);
+    spritesRef.current.clear();
+    canvasRef.current?.clear();
+    setAnimationState('idle');
+    setDirection('south');
+    setFrame(0);
+  }, []);
 
   return (
     <div style={{ display: 'flex', height: '100%', minHeight: 'calc(100vh - 60px)' }}>
@@ -465,14 +614,7 @@ export function CharacterEditor() {
         </h3>
 
         <button
-          onClick={() => {
-            setCharacterId('');
-            setCharacterName('');
-            setFrameCount(DEFAULT_FRAMES);
-            setFrameDuration(DEFAULT_FRAME_DURATION);
-            spritesRef.current.clear();
-            canvasRef.current?.clear();
-          }}
+          onClick={newCharacter}
           style={{
             width: '100%',
             padding: '0.5rem',
@@ -555,26 +697,7 @@ export function CharacterEditor() {
           </label>
 
           <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-            <span style={{ color: '#888', fontSize: '0.875rem' }}>Frames:</span>
-            <input
-              type="number"
-              value={frameCount}
-              onChange={(e) => setFrameCount(Math.max(1, Math.min(16, parseInt(e.target.value, 10) || 1)))}
-              min={1}
-              max={16}
-              style={{
-                background: '#0f0f23',
-                border: '1px solid #333',
-                borderRadius: '4px',
-                padding: '0.25rem 0.5rem',
-                color: '#ccc',
-                width: 60,
-              }}
-            />
-          </label>
-
-          <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-            <span style={{ color: '#888', fontSize: '0.875rem' }}>Duration:</span>
+            <span style={{ color: '#888', fontSize: '0.875rem' }}>Frame Duration:</span>
             <input
               type="number"
               value={frameDuration}
@@ -622,6 +745,8 @@ export function CharacterEditor() {
           onToolChange={setTool}
           zoom={zoom}
           onZoomChange={setZoom}
+          brushSize={brushSize}
+          onBrushSizeChange={setBrushSize}
           showGrid={showGrid}
           onShowGridChange={setShowGrid}
           onUndo={() => canvasRef.current?.undo()}
@@ -633,6 +758,10 @@ export function CharacterEditor() {
           onRotateCCW={() => canvasRef.current?.rotateCounterClockwise()}
           onFlipH={() => canvasRef.current?.flipHorizontal()}
           onFlipV={() => canvasRef.current?.flipVertical()}
+          onCut={() => {
+            clipboardRef.current = canvasRef.current?.copySelection() || canvasRef.current?.getImageData() || null;
+            canvasRef.current?.deleteSelection();
+          }}
           onCopy={() => {
             clipboardRef.current = canvasRef.current?.copySelection() || canvasRef.current?.getImageData() || null;
           }}
@@ -657,92 +786,63 @@ export function CharacterEditor() {
               background: '#0f0f23',
             }}
           >
-            {/* State tabs */}
-            <div style={{ display: 'flex', gap: '1rem', marginBottom: '1rem' }}>
-              {/* Visual state tabs */}
-              <div>
-                <div style={{ color: '#666', fontSize: '0.75rem', marginBottom: '0.25rem' }}>
-                  Visual State
-                </div>
-                <div style={{ display: 'flex', gap: '2px' }}>
-                  {VISUAL_STATES.map((vs) => (
-                    <button
-                      key={vs}
-                      onClick={() => changeVisualState(vs)}
-                      style={{
-                        padding: '0.25rem 0.5rem',
-                        border: 'none',
-                        borderRadius: '4px',
-                        background: vs === visualState ? '#4ecca3' : '#16213e',
-                        color: vs === visualState ? '#1a1a2e' : '#ccc',
-                        cursor: 'pointer',
-                        fontSize: '0.75rem',
-                      }}
-                    >
-                      {VISUAL_STATE_LABELS[vs]}
-                    </button>
-                  ))}
-                </div>
+            {/* Animation tabs */}
+            <div style={{ marginBottom: '1rem' }}>
+              <div style={{ color: '#666', fontSize: '0.75rem', marginBottom: '0.25rem' }}>
+                Animation
               </div>
-
-              {/* Animation state tabs */}
-              <div>
-                <div style={{ color: '#666', fontSize: '0.75rem', marginBottom: '0.25rem' }}>
-                  Animation
-                </div>
-                <div style={{ display: 'flex', gap: '2px' }}>
-                  {ANIMATION_STATES.map((as) => (
-                    <button
-                      key={as}
-                      onClick={() => changeAnimationState(as)}
-                      style={{
-                        padding: '0.25rem 0.5rem',
-                        border: 'none',
-                        borderRadius: '4px',
-                        background: as === animationState ? '#4ecca3' : '#16213e',
-                        color: as === animationState ? '#1a1a2e' : '#ccc',
-                        cursor: 'pointer',
-                        fontSize: '0.75rem',
-                      }}
-                    >
-                      {ANIMATION_STATE_LABELS[as]}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              {/* Direction tabs */}
-              <div>
-                <div style={{ color: '#666', fontSize: '0.75rem', marginBottom: '0.25rem' }}>
-                  Direction
-                </div>
-                <div style={{ display: 'flex', gap: '2px' }}>
-                  {DIRECTIONS.map((dir) => (
-                    <button
-                      key={dir}
-                      onClick={() => changeDirection(dir)}
-                      style={{
-                        width: 32,
-                        height: 32,
-                        border: 'none',
-                        borderRadius: '4px',
-                        background: dir === direction ? '#4ecca3' : '#16213e',
-                        color: dir === direction ? '#1a1a2e' : '#ccc',
-                        cursor: 'pointer',
-                        fontWeight: 'bold',
-                      }}
-                    >
-                      {DIRECTION_LABELS[dir]}
-                    </button>
-                  ))}
-                </div>
+              <div style={{ display: 'flex', gap: '2px' }}>
+                {ANIMATION_STATES.map((as) => (
+                  <button
+                    key={as}
+                    onClick={() => changeAnimationState(as)}
+                    style={{
+                      padding: '0.25rem 0.5rem',
+                      border: 'none',
+                      borderRadius: '4px',
+                      background: as === animationState ? '#4ecca3' : '#16213e',
+                      color: as === animationState ? '#1a1a2e' : '#ccc',
+                      cursor: 'pointer',
+                      fontSize: '0.75rem',
+                    }}
+                  >
+                    {ANIMATION_STATE_LABELS[as]} ({frameCounts[as]})
+                  </button>
+                ))}
               </div>
             </div>
 
-            {/* Frame selector */}
+            {/* Direction tabs */}
+            <div style={{ marginBottom: '1rem' }}>
+              <div style={{ color: '#666', fontSize: '0.75rem', marginBottom: '0.25rem' }}>
+                Direction
+              </div>
+              <div style={{ display: 'flex', gap: '2px' }}>
+                {DIRECTIONS.map((dir) => (
+                  <button
+                    key={dir}
+                    onClick={() => changeDirection(dir)}
+                    style={{
+                      width: 32,
+                      height: 32,
+                      border: 'none',
+                      borderRadius: '4px',
+                      background: dir === direction ? '#4ecca3' : '#16213e',
+                      color: dir === direction ? '#1a1a2e' : '#ccc',
+                      cursor: 'pointer',
+                      fontWeight: 'bold',
+                    }}
+                  >
+                    {DIRECTION_LABELS[dir]}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Frame selector with Add/Duplicate buttons */}
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '1rem' }}>
               <span style={{ color: '#666', fontSize: '0.75rem' }}>Frame:</span>
-              {Array.from({ length: frameCount }, (_, i) => (
+              {Array.from({ length: currentFrameCount }, (_, i) => (
                 <button
                   key={i}
                   onClick={() => changeFrame(i)}
@@ -761,21 +861,132 @@ export function CharacterEditor() {
                 </button>
               ))}
 
+              {/* Add Frame button */}
+              <button
+                onClick={addFrame}
+                disabled={currentFrameCount >= MAX_FRAMES}
+                title="Add Frame"
+                style={{
+                  width: 32,
+                  height: 32,
+                  border: 'none',
+                  borderRadius: '4px',
+                  background: currentFrameCount >= MAX_FRAMES ? '#333' : '#16213e',
+                  color: currentFrameCount >= MAX_FRAMES ? '#555' : '#4ecca3',
+                  cursor: currentFrameCount >= MAX_FRAMES ? 'not-allowed' : 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}
+              >
+                <Plus size={16} />
+              </button>
+
+              {/* Duplicate Frame button */}
+              <button
+                onClick={duplicateFrame}
+                disabled={currentFrameCount >= MAX_FRAMES}
+                title="Duplicate Frame"
+                style={{
+                  width: 32,
+                  height: 32,
+                  border: 'none',
+                  borderRadius: '4px',
+                  background: currentFrameCount >= MAX_FRAMES ? '#333' : '#16213e',
+                  color: currentFrameCount >= MAX_FRAMES ? '#555' : '#ffd93d',
+                  cursor: currentFrameCount >= MAX_FRAMES ? 'not-allowed' : 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}
+              >
+                <Copy size={16} />
+              </button>
+
+              {/* Delete Frame button */}
+              <button
+                onClick={deleteFrame}
+                disabled={currentFrameCount <= 1}
+                title="Delete Frame"
+                style={{
+                  width: 32,
+                  height: 32,
+                  border: 'none',
+                  borderRadius: '4px',
+                  background: currentFrameCount <= 1 ? '#333' : '#16213e',
+                  color: currentFrameCount <= 1 ? '#555' : '#ff6b6b',
+                  cursor: currentFrameCount <= 1 ? 'not-allowed' : 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}
+              >
+                <Trash2 size={16} />
+              </button>
+
+              <div style={{ width: 1, height: 24, background: '#333', margin: '0 0.25rem' }} />
+
+              {/* Move Frame Left button */}
+              <button
+                onClick={moveFrameLeft}
+                disabled={frame <= 0}
+                title="Move Frame Left"
+                style={{
+                  width: 32,
+                  height: 32,
+                  border: 'none',
+                  borderRadius: '4px',
+                  background: frame <= 0 ? '#333' : '#16213e',
+                  color: frame <= 0 ? '#555' : '#ccc',
+                  cursor: frame <= 0 ? 'not-allowed' : 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}
+              >
+                <ChevronLeft size={16} />
+              </button>
+
+              {/* Move Frame Right button */}
+              <button
+                onClick={moveFrameRight}
+                disabled={frame >= currentFrameCount - 1}
+                title="Move Frame Right"
+                style={{
+                  width: 32,
+                  height: 32,
+                  border: 'none',
+                  borderRadius: '4px',
+                  background: frame >= currentFrameCount - 1 ? '#333' : '#16213e',
+                  color: frame >= currentFrameCount - 1 ? '#555' : '#ccc',
+                  cursor: frame >= currentFrameCount - 1 ? 'not-allowed' : 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}
+              >
+                <ChevronRight size={16} />
+              </button>
+
               <div style={{ width: 1, height: 24, background: '#333', margin: '0 0.5rem' }} />
 
               <button
                 onClick={() => setIsPlaying(!isPlaying)}
+                title={isPlaying ? 'Pause (Space)' : 'Play (Space)'}
                 style={{
-                  padding: '0.25rem 0.5rem',
+                  width: 32,
+                  height: 32,
                   border: 'none',
                   borderRadius: '4px',
-                  background: isPlaying ? '#ff6b6b' : '#16213e',
-                  color: '#ccc',
+                  background: '#16213e',
+                  color: isPlaying ? '#ff6b6b' : '#4ecca3',
                   cursor: 'pointer',
-                  fontSize: '0.75rem',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
                 }}
               >
-                {isPlaying ? 'Stop' : 'Play'}
+                {isPlaying ? <Pause size={16} /> : <Play size={16} />}
               </button>
             </div>
 
@@ -787,8 +998,10 @@ export function CharacterEditor() {
                   width={SPRITE_WIDTH}
                   height={SPRITE_HEIGHT}
                   zoom={zoom}
+                  onZoomChange={setZoom}
                   tool={tool}
                   color={color}
+                  brushSize={brushSize}
                   showGrid={showGrid}
                   onColorPick={(c) => setColor(c)}
                   onChange={() => saveCurrentSprite()}
@@ -800,8 +1013,8 @@ export function CharacterEditor() {
                 <div style={{ color: '#666', fontSize: '0.75rem' }}>Preview</div>
                 <div
                   style={{
-                    width: SPRITE_WIDTH * 4,
-                    height: SPRITE_HEIGHT * 4,
+                    width: SPRITE_WIDTH * 2,
+                    height: SPRITE_HEIGHT * 2,
                     background: '#111',
                     borderRadius: '4px',
                     display: 'flex',
@@ -813,14 +1026,13 @@ export function CharacterEditor() {
                   <PreviewSprite
                     sprites={spritesRef.current}
                     spriteKey={getSpriteKey(
-                      visualState,
                       animationState,
                       direction,
                       isPlaying ? previewFrame : frame
                     )}
                     width={SPRITE_WIDTH}
                     height={SPRITE_HEIGHT}
-                    scale={4}
+                    scale={2}
                   />
                 </div>
               </div>
@@ -855,20 +1067,6 @@ export function CharacterEditor() {
                 }}
               >
                 Copy to all frames
-              </button>
-              <button
-                onClick={copyToAllVisualStates}
-                style={{
-                  padding: '0.25rem 0.5rem',
-                  border: '1px solid #333',
-                  borderRadius: '4px',
-                  background: '#16213e',
-                  color: '#ccc',
-                  cursor: 'pointer',
-                  fontSize: '0.75rem',
-                }}
-              >
-                Copy to all visual states
               </button>
             </div>
           </div>

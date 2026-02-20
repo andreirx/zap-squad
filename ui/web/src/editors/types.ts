@@ -30,18 +30,21 @@ export type Tool = 'pencil' | 'eraser' | 'fill' | 'select' | 'line' | 'eyedroppe
 /** Animation state for characters */
 export type AnimationState = 'idle' | 'walk' | 'melee_attack' | 'throw_attack';
 
-/** Visual state for damage levels */
-export type VisualState = 'full' | 'hurt_1' | 'hurt_2' | 'critical';
-
 /** Direction for sprite variants */
 export type Direction = 'north' | 'east' | 'south' | 'west';
+
+/** Per-animation frame configuration */
+export interface AnimationConfig {
+  frames: number;  // 1-8 frames
+  loop: boolean;
+}
 
 /** Character definition saved to storage */
 export interface CharacterDefinition {
   id: string;
   name: string;
-  frames: number;
   frameDuration: number;
+  animations: Record<AnimationState, AnimationConfig>;
   createdAt: string;
   updatedAt: string;
 }
@@ -88,7 +91,6 @@ export interface HistoryEntry {
 /** Sprite key for naming convention */
 export interface SpriteKey {
   bodyId: string;
-  visualState: VisualState;
   animationState: AnimationState;
   direction: Direction;
   frame: number;
@@ -96,33 +98,40 @@ export interface SpriteKey {
 
 /** Build sprite filename from key */
 export function buildSpriteName(key: SpriteKey): string {
-  return `${key.bodyId}_${key.visualState}_${key.animationState}_${key.direction}_${key.frame}.png`;
+  return `${key.bodyId}_${key.animationState}_${key.direction}_${key.frame}.png`;
 }
 
 /** Parse sprite filename to key */
 export function parseSpriteName(filename: string): SpriteKey | null {
-  const match = filename.match(/^(.+)_(full|hurt_1|hurt_2|critical)_(idle|walk|melee_attack|throw_attack)_(north|east|south|west)_(\d+)\.png$/);
+  const match = filename.match(/^(.+)_(idle|walk|melee_attack|throw_attack)_(north|east|south|west)_(\d+)\.png$/);
   if (!match) return null;
   return {
     bodyId: match[1],
-    visualState: match[2] as VisualState,
-    animationState: match[3] as AnimationState,
-    direction: match[4] as Direction,
-    frame: parseInt(match[5], 10),
+    animationState: match[2] as AnimationState,
+    direction: match[3] as Direction,
+    frame: parseInt(match[4], 10),
   };
 }
 
 /** All animation states */
 export const ANIMATION_STATES: AnimationState[] = ['idle', 'walk', 'melee_attack', 'throw_attack'];
 
-/** All visual states */
-export const VISUAL_STATES: VisualState[] = ['full', 'hurt_1', 'hurt_2', 'critical'];
-
 /** All directions */
 export const DIRECTIONS: Direction[] = ['north', 'east', 'south', 'west'];
 
-/** Default frame count per animation */
+/** Maximum frames per animation */
+export const MAX_FRAMES = 8;
+
+/** Default frame count (for simple editors like weapons) */
 export const DEFAULT_FRAMES = 4;
+
+/** Default animation configurations */
+export const DEFAULT_ANIMATIONS: Record<AnimationState, AnimationConfig> = {
+  idle: { frames: 1, loop: true },
+  walk: { frames: 4, loop: true },
+  melee_attack: { frames: 4, loop: false },
+  throw_attack: { frames: 4, loop: false },
+};
 
 /** Default frame duration in seconds */
 export const DEFAULT_FRAME_DURATION = 0.1;

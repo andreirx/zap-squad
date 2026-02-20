@@ -31,13 +31,17 @@ export interface PixelCanvasProps {
   width: number;
   height: number;
   zoom?: number;
+  onZoomChange?: (zoom: number) => void;
   tool?: Tool;
   color?: Color;
   backgroundColor?: Color;
+  brushSize?: number;
   showGrid?: boolean;
   onColorPick?: (color: Color) => void;
   onChange?: (data: ImageData) => void;
 }
+
+const ZOOM_LEVELS = [1, 2, 4, 8, 16, 24, 32];
 
 const CHECKERBOARD_SIZE = 8;
 const MAX_HISTORY = 50;
@@ -49,9 +53,11 @@ export const PixelCanvas = forwardRef<PixelCanvasRef, PixelCanvasProps>(
       width,
       height,
       zoom = 16,
+      onZoomChange,
       tool = 'pencil',
       color = { r: 0, g: 0, b: 0, a: 255 },
       backgroundColor = { r: 0, g: 0, b: 0, a: 0 },
+      brushSize = 1,
       showGrid = true,
       onColorPick,
       onChange,
@@ -69,6 +75,13 @@ export const PixelCanvas = forwardRef<PixelCanvasRef, PixelCanvasProps>(
     // Drawing state
     const [isDrawing, setIsDrawing] = useState(false);
     const lastPointRef = useRef<Point | null>(null);
+
+    // Pan state
+    const [panOffset, setPanOffset] = useState<Point>({ x: 0, y: 0 });
+    const [isPanning, setIsPanning] = useState(false);
+    const panStartRef = useRef<Point | null>(null);
+    const panOffsetStartRef = useRef<Point | null>(null);
+    const [isSpacePressed, setIsSpacePressed] = useState(false);
 
     // Selection state
     const [selection, setSelection] = useState<Selection | null>(null);
@@ -257,14 +270,22 @@ export const PixelCanvas = forwardRef<PixelCanvasRef, PixelCanvasProps>(
       setHistoryIndex((prev) => Math.min(prev + 1, MAX_HISTORY - 1));
     }
 
-    // Get pixel coordinates from mouse event
+    // Get pixel coordinates from mouse event (accounting for pan offset)
     function getPixelCoords(e: React.MouseEvent): Point {
       const canvas = canvasRef.current;
       if (!canvas) return { x: 0, y: 0 };
       const rect = canvas.getBoundingClientRect();
-      const x = Math.floor((e.clientX - rect.left) / zoom);
-      const y = Math.floor((e.clientY - rect.top) / zoom);
+      const x = Math.floor((e.clientX - rect.left - panOffset.x) / zoom);
+      const y = Math.floor((e.clientY - rect.top - panOffset.y) / zoom);
       return { x: Math.max(0, Math.min(width - 1, x)), y: Math.max(0, Math.min(height - 1, y)) };
+    }
+
+    // Get raw mouse position (for panning)
+    function getMousePos(e: React.MouseEvent): Point {
+      const canvas = canvasRef.current;
+      if (!canvas) return { x: 0, y: 0 };
+      const rect = canvas.getBoundingClientRect();
+      return { x: e.clientX - rect.left, y: e.clientY - rect.top };
     }
 
     // Get resize handle at point
@@ -313,6 +334,16 @@ export const PixelCanvas = forwardRef<PixelCanvasRef, PixelCanvasProps>(
       imageDataRef.current.data[i + 3] = c.a;
     }
 
+    // Draw brush-sized square centered on pixel
+    function drawBrush(centerX: number, centerY: number, c: Color) {
+      const halfSize = Math.floor(brushSize / 2);
+      for (let dy = 0; dy < brushSize; dy++) {
+        for (let dx = 0; dx < brushSize; dx++) {
+          setPixel(centerX - halfSize + dx, centerY - halfSize + dy, c);
+        }
+      }
+    }
+
     // Get pixel color
     function getPixel(x: number, y: number): Color {
       if (!imageDataRef.current) return { r: 0, g: 0, b: 0, a: 0 };
@@ -326,8 +357,8 @@ export const PixelCanvas = forwardRef<PixelCanvasRef, PixelCanvasProps>(
       };
     }
 
-    // Draw line between two points (Bresenham)
-    function drawLine(p1: Point, p2: Point, c: Color) {
+    // Draw line between two points (Bresenham) with brush size
+    function drawLine(p1: Point, p2: Point, c: Color, useBrush = true) {
       const dx = Math.abs(p2.x - p1.x);
       const dy = Math.abs(p2.y - p1.y);
       const sx = p1.x < p2.x ? 1 : -1;
@@ -338,7 +369,11 @@ export const PixelCanvas = forwardRef<PixelCanvasRef, PixelCanvasProps>(
       let y = p1.y;
 
       while (true) {
-        setPixel(x, y, c);
+        if (useBrush) {
+          drawBrush(x, y, c);
+        } else {
+          setPixel(x, y, c);
+        }
         if (x === p2.x && y === p2.y) break;
         const e2 = 2 * err;
         if (e2 > -dy) {
@@ -388,6 +423,15 @@ export const PixelCanvas = forwardRef<PixelCanvasRef, PixelCanvasProps>(
 
     // Mouse event handlers
     function handleMouseDown(e: React.MouseEvent) {
+      // Handle panning with middle mouse or space+click
+      if (e.button === 1 || (isSpacePressed && e.button === 0)) {
+        e.preventDefault();
+        setIsPanning(true);
+        panStartRef.current = getMousePos(e);
+        panOffsetStartRef.current = { ...panOffset };
+        return;
+      }
+
       const p = getPixelCoords(e);
 
       if (tool === 'select') {
@@ -433,9 +477,9 @@ export const PixelCanvas = forwardRef<PixelCanvasRef, PixelCanvasProps>(
       lastPointRef.current = p;
 
       if (tool === 'pencil') {
-        setPixel(p.x, p.y, color);
+        drawBrush(p.x, p.y, color);
       } else if (tool === 'eraser') {
-        setPixel(p.x, p.y, backgroundColor);
+        drawBrush(p.x, p.y, backgroundColor);
       } else if (tool === 'fill') {
         floodFill(p.x, p.y, color);
         pushHistory(imageDataRef.current!);
@@ -448,6 +492,18 @@ export const PixelCanvas = forwardRef<PixelCanvasRef, PixelCanvasProps>(
     }
 
     function handleMouseMove(e: React.MouseEvent) {
+      // Handle panning
+      if (isPanning && panStartRef.current && panOffsetStartRef.current) {
+        const current = getMousePos(e);
+        const dx = current.x - panStartRef.current.x;
+        const dy = current.y - panStartRef.current.y;
+        setPanOffset({
+          x: panOffsetStartRef.current.x + dx,
+          y: panOffsetStartRef.current.y + dy,
+        });
+        return;
+      }
+
       const p = getPixelCoords(e);
 
       // Update cursor based on context
@@ -565,6 +621,14 @@ export const PixelCanvas = forwardRef<PixelCanvasRef, PixelCanvasProps>(
     }
 
     function handleMouseUp(e: React.MouseEvent) {
+      // Stop panning
+      if (isPanning) {
+        setIsPanning(false);
+        panStartRef.current = null;
+        panOffsetStartRef.current = null;
+        return;
+      }
+
       const p = getPixelCoords(e);
 
       if (isResizingSelection) {
@@ -611,7 +675,63 @@ export const PixelCanvas = forwardRef<PixelCanvasRef, PixelCanvasProps>(
       }
       setIsDrawing(false);
       lastPointRef.current = null;
+      setIsPanning(false);
     }
+
+    // Handle wheel zoom to cursor
+    function handleWheel(e: React.WheelEvent) {
+      if (!onZoomChange) return;
+      e.preventDefault();
+
+      const rect = canvasRef.current?.getBoundingClientRect();
+      if (!rect) return;
+
+      // Mouse position relative to canvas
+      const mouseX = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
+
+      // Current pixel position under cursor
+      const pixelX = (mouseX - panOffset.x) / zoom;
+      const pixelY = (mouseY - panOffset.y) / zoom;
+
+      // Determine new zoom level
+      const currentIndex = ZOOM_LEVELS.indexOf(zoom);
+      const zoomIn = e.deltaY < 0;
+      const newIndex = zoomIn
+        ? Math.min(currentIndex + 1, ZOOM_LEVELS.length - 1)
+        : Math.max(currentIndex - 1, 0);
+      const newZoom = ZOOM_LEVELS[newIndex];
+
+      if (newZoom === zoom) return;
+
+      // Calculate new pan offset to keep the pixel under cursor in the same screen position
+      const newPanX = mouseX - pixelX * newZoom;
+      const newPanY = mouseY - pixelY * newZoom;
+
+      setPanOffset({ x: newPanX, y: newPanY });
+      onZoomChange(newZoom);
+    }
+
+    // Handle space key for pan mode
+    useEffect(() => {
+      function handleKeyDown(e: KeyboardEvent) {
+        if (e.code === 'Space' && !e.repeat) {
+          setIsSpacePressed(true);
+        }
+      }
+      function handleKeyUp(e: KeyboardEvent) {
+        if (e.code === 'Space') {
+          setIsSpacePressed(false);
+          setIsPanning(false);
+        }
+      }
+      window.addEventListener('keydown', handleKeyDown);
+      window.addEventListener('keyup', handleKeyUp);
+      return () => {
+        window.removeEventListener('keydown', handleKeyDown);
+        window.removeEventListener('keyup', handleKeyUp);
+      };
+    }, []);
 
     // Extract selection data from image
     function extractSelectionData(sel: Selection): ImageData {
@@ -871,6 +991,13 @@ export const PixelCanvas = forwardRef<PixelCanvasRef, PixelCanvasProps>(
       return () => window.removeEventListener('keydown', handleKeyDown);
     }, [selection, ref]);
 
+    // Determine cursor style
+    const getCursor = () => {
+      if (isPanning || isSpacePressed) return 'grab';
+      if (tool === 'eyedropper') return 'crosshair';
+      return 'default';
+    };
+
     return (
       <div
         ref={containerRef}
@@ -880,30 +1007,39 @@ export const PixelCanvas = forwardRef<PixelCanvasRef, PixelCanvasProps>(
           width: width * zoom,
           height: height * zoom,
           outline: 'none',
+          overflow: 'hidden',
         }}
+        onWheel={handleWheel}
       >
-        <canvas
-          ref={canvasRef}
-          width={width * zoom}
-          height={height * zoom}
+        <div
           style={{
             position: 'absolute',
-            top: 0,
-            left: 0,
-            imageRendering: 'pixelated',
+            transform: `translate(${panOffset.x}px, ${panOffset.y}px)`,
           }}
-        />
-        <canvas
-          ref={overlayRef}
-          width={width * zoom}
-          height={height * zoom}
-          style={{
-            position: 'absolute',
-            top: 0,
-            left: 0,
-            pointerEvents: 'none',
-          }}
-        />
+        >
+          <canvas
+            ref={canvasRef}
+            width={width * zoom}
+            height={height * zoom}
+            style={{
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              imageRendering: 'pixelated',
+            }}
+          />
+          <canvas
+            ref={overlayRef}
+            width={width * zoom}
+            height={height * zoom}
+            style={{
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              pointerEvents: 'none',
+            }}
+          />
+        </div>
         <div
           style={{
             position: 'absolute',
@@ -911,7 +1047,7 @@ export const PixelCanvas = forwardRef<PixelCanvasRef, PixelCanvasProps>(
             left: 0,
             width: width * zoom,
             height: height * zoom,
-            cursor: tool === 'eyedropper' ? 'crosshair' : 'default',
+            cursor: getCursor(),
           }}
           onMouseDown={handleMouseDown}
           onMouseMove={handleMouseMove}

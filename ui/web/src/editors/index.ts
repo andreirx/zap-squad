@@ -1,5 +1,6 @@
 // Legacy editors (work with individual frames)
 export { CharacterEditor } from './CharacterEditor';
+export { ObjectEditor } from './ObjectEditor';
 export { TileEditor } from './TileEditor';
 export { WeaponEditor } from './WeaponEditor';
 export { MapEditor } from './MapEditor';

@@ -1,3 +1,25 @@
+import {
+  Pencil,
+  Eraser,
+  PaintBucket,
+  Minus,
+  SquareDashed,
+  Pipette,
+  Undo2,
+  Redo2,
+  RotateCcw,
+  RotateCw,
+  FlipHorizontal2,
+  FlipVertical2,
+  Copy,
+  Clipboard,
+  Scissors,
+  Trash2,
+  Grid3X3,
+  ZoomIn,
+  ZoomOut,
+  Circle,
+} from 'lucide-react';
 import type { Tool } from './types';
 
 export interface ToolbarProps {
@@ -5,6 +27,8 @@ export interface ToolbarProps {
   onToolChange: (tool: Tool) => void;
   zoom: number;
   onZoomChange: (zoom: number) => void;
+  brushSize?: number;
+  onBrushSizeChange?: (size: number) => void;
   showGrid: boolean;
   onShowGridChange: (show: boolean) => void;
   onUndo?: () => void;
@@ -18,19 +42,36 @@ export interface ToolbarProps {
   onFlipV?: () => void;
   onCopy?: () => void;
   onPaste?: () => void;
+  onCut?: () => void;
   onDelete?: () => void;
 }
 
-const TOOLS: { id: Tool; label: string; icon: string; shortcut: string }[] = [
-  { id: 'pencil', label: 'Pencil', icon: 'P', shortcut: 'P' },
-  { id: 'eraser', label: 'Eraser', icon: 'E', shortcut: 'E' },
-  { id: 'fill', label: 'Fill', icon: 'F', shortcut: 'G' },
-  { id: 'line', label: 'Line', icon: 'L', shortcut: 'L' },
-  { id: 'select', label: 'Select', icon: 'S', shortcut: 'M' },
-  { id: 'eyedropper', label: 'Eyedropper', icon: 'I', shortcut: 'I' },
+const TOOLS: { id: Tool; label: string; icon: typeof Pencil; shortcut: string }[] = [
+  { id: 'pencil', label: 'Pencil', icon: Pencil, shortcut: 'P' },
+  { id: 'eraser', label: 'Eraser', icon: Eraser, shortcut: 'E' },
+  { id: 'fill', label: 'Fill', icon: PaintBucket, shortcut: 'G' },
+  { id: 'line', label: 'Line', icon: Minus, shortcut: 'L' },
+  { id: 'select', label: 'Select', icon: SquareDashed, shortcut: 'M' },
+  { id: 'eyedropper', label: 'Eyedropper', icon: Pipette, shortcut: 'I' },
 ];
 
 const ZOOM_LEVELS = [1, 2, 4, 8, 16, 24, 32];
+const BRUSH_SIZES = [1, 2, 4, 8, 16];
+
+const iconSize = 16;
+
+const btnStyle = (active = false, disabled = false): React.CSSProperties => ({
+  width: 32,
+  height: 32,
+  border: 'none',
+  borderRadius: '4px',
+  background: active ? '#4ecca3' : '#0f0f23',
+  color: disabled ? '#555' : active ? '#1a1a2e' : '#ccc',
+  cursor: disabled ? 'not-allowed' : 'pointer',
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+});
 
 /** Drawing toolbar with tools, zoom, and transform actions */
 export function Toolbar({
@@ -38,6 +79,8 @@ export function Toolbar({
   onToolChange,
   zoom,
   onZoomChange,
+  brushSize = 1,
+  onBrushSizeChange,
   showGrid,
   onShowGridChange,
   onUndo,
@@ -51,6 +94,7 @@ export function Toolbar({
   onFlipV,
   onCopy,
   onPaste,
+  onCut,
   onDelete,
 }: ToolbarProps) {
   return (
@@ -67,29 +111,47 @@ export function Toolbar({
     >
       {/* Tools */}
       <div style={{ display: 'flex', gap: '2px' }}>
-        {TOOLS.map((t) => (
-          <button
-            key={t.id}
-            onClick={() => onToolChange(t.id)}
-            title={`${t.label} (${t.shortcut})`}
-            style={{
-              width: 32,
-              height: 32,
-              border: 'none',
-              borderRadius: '4px',
-              background: tool === t.id ? '#4ecca3' : '#0f0f23',
-              color: tool === t.id ? '#1a1a2e' : '#ccc',
-              cursor: 'pointer',
-              fontWeight: 'bold',
-              fontSize: '0.875rem',
-            }}
-          >
-            {t.icon}
-          </button>
-        ))}
+        {TOOLS.map((t) => {
+          const Icon = t.icon;
+          return (
+            <button
+              key={t.id}
+              onClick={() => onToolChange(t.id)}
+              title={`${t.label} (${t.shortcut})`}
+              style={btnStyle(tool === t.id)}
+            >
+              <Icon size={iconSize} />
+            </button>
+          );
+        })}
       </div>
 
       <div style={{ width: 1, height: 24, background: '#333' }} />
+
+      {/* Brush Size */}
+      {onBrushSizeChange && (
+        <>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '2px' }}>
+            <Circle size={12} style={{ color: '#888', marginRight: 4 }} />
+            {BRUSH_SIZES.map((size) => (
+              <button
+                key={size}
+                onClick={() => onBrushSizeChange(size)}
+                title={`Brush Size ${size}px`}
+                style={{
+                  ...btnStyle(brushSize === size),
+                  width: 28,
+                  height: 28,
+                  fontSize: '0.7rem',
+                }}
+              >
+                {size}
+              </button>
+            ))}
+          </div>
+          <div style={{ width: 1, height: 24, background: '#333' }} />
+        </>
+      )}
 
       {/* Undo/Redo */}
       <div style={{ display: 'flex', gap: '2px' }}>
@@ -97,35 +159,17 @@ export function Toolbar({
           onClick={onUndo}
           disabled={!canUndo}
           title="Undo (Ctrl+Z)"
-          style={{
-            width: 32,
-            height: 32,
-            border: 'none',
-            borderRadius: '4px',
-            background: '#0f0f23',
-            color: canUndo ? '#ccc' : '#555',
-            cursor: canUndo ? 'pointer' : 'not-allowed',
-            fontSize: '1rem',
-          }}
+          style={btnStyle(false, !canUndo)}
         >
-          ↶
+          <Undo2 size={iconSize} />
         </button>
         <button
           onClick={onRedo}
           disabled={!canRedo}
           title="Redo (Ctrl+Shift+Z)"
-          style={{
-            width: 32,
-            height: 32,
-            border: 'none',
-            borderRadius: '4px',
-            background: '#0f0f23',
-            color: canRedo ? '#ccc' : '#555',
-            cursor: canRedo ? 'pointer' : 'not-allowed',
-            fontSize: '1rem',
-          }}
+          style={btnStyle(false, !canRedo)}
         >
-          ↷
+          <Redo2 size={iconSize} />
         </button>
       </div>
 
@@ -136,66 +180,30 @@ export function Toolbar({
         <button
           onClick={onRotateCCW}
           title="Rotate Counter-clockwise"
-          style={{
-            width: 32,
-            height: 32,
-            border: 'none',
-            borderRadius: '4px',
-            background: '#0f0f23',
-            color: '#ccc',
-            cursor: 'pointer',
-            fontSize: '0.875rem',
-          }}
+          style={btnStyle()}
         >
-          ⟲
+          <RotateCcw size={iconSize} />
         </button>
         <button
           onClick={onRotateCW}
           title="Rotate Clockwise"
-          style={{
-            width: 32,
-            height: 32,
-            border: 'none',
-            borderRadius: '4px',
-            background: '#0f0f23',
-            color: '#ccc',
-            cursor: 'pointer',
-            fontSize: '0.875rem',
-          }}
+          style={btnStyle()}
         >
-          ⟳
+          <RotateCw size={iconSize} />
         </button>
         <button
           onClick={onFlipH}
           title="Flip Horizontal"
-          style={{
-            width: 32,
-            height: 32,
-            border: 'none',
-            borderRadius: '4px',
-            background: '#0f0f23',
-            color: '#ccc',
-            cursor: 'pointer',
-            fontSize: '0.875rem',
-          }}
+          style={btnStyle()}
         >
-          ⇆
+          <FlipHorizontal2 size={iconSize} />
         </button>
         <button
           onClick={onFlipV}
           title="Flip Vertical"
-          style={{
-            width: 32,
-            height: 32,
-            border: 'none',
-            borderRadius: '4px',
-            background: '#0f0f23',
-            color: '#ccc',
-            cursor: 'pointer',
-            fontSize: '0.875rem',
-          }}
+          style={btnStyle()}
         >
-          ⇅
+          <FlipVertical2 size={iconSize} />
         </button>
       </div>
 
@@ -204,52 +212,32 @@ export function Toolbar({
       {/* Clipboard */}
       <div style={{ display: 'flex', gap: '2px' }}>
         <button
-          onClick={onCopy}
-          title="Copy Selection (Ctrl+C)"
-          style={{
-            width: 32,
-            height: 32,
-            border: 'none',
-            borderRadius: '4px',
-            background: '#0f0f23',
-            color: '#ccc',
-            cursor: 'pointer',
-            fontSize: '0.75rem',
-          }}
+          onClick={onCut}
+          title="Cut (Ctrl+X)"
+          style={btnStyle()}
         >
-          ⎘
+          <Scissors size={iconSize} />
+        </button>
+        <button
+          onClick={onCopy}
+          title="Copy (Ctrl+C)"
+          style={btnStyle()}
+        >
+          <Copy size={iconSize} />
         </button>
         <button
           onClick={onPaste}
           title="Paste (Ctrl+V)"
-          style={{
-            width: 32,
-            height: 32,
-            border: 'none',
-            borderRadius: '4px',
-            background: '#0f0f23',
-            color: '#ccc',
-            cursor: 'pointer',
-            fontSize: '0.75rem',
-          }}
+          style={btnStyle()}
         >
-          ⎗
+          <Clipboard size={iconSize} />
         </button>
         <button
           onClick={onDelete}
-          title="Delete Selection (Del)"
-          style={{
-            width: 32,
-            height: 32,
-            border: 'none',
-            borderRadius: '4px',
-            background: '#0f0f23',
-            color: '#ccc',
-            cursor: 'pointer',
-            fontSize: '0.75rem',
-          }}
+          title="Delete (Del)"
+          style={btnStyle()}
         >
-          ✕
+          <Trash2 size={iconSize} />
         </button>
       </div>
 
@@ -275,36 +263,41 @@ export function Toolbar({
       <div style={{ flex: 1 }} />
 
       {/* Grid toggle */}
-      <label style={{ display: 'flex', alignItems: 'center', gap: '0.25rem', cursor: 'pointer' }}>
-        <input
-          type="checkbox"
-          checked={showGrid}
-          onChange={(e) => onShowGridChange(e.target.checked)}
-        />
-        <span style={{ color: '#888', fontSize: '0.75rem' }}>Grid</span>
-      </label>
+      <button
+        onClick={() => onShowGridChange(!showGrid)}
+        title="Toggle Grid"
+        style={btnStyle(showGrid)}
+      >
+        <Grid3X3 size={iconSize} />
+      </button>
 
-      {/* Zoom */}
+      {/* Zoom controls */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
-        <span style={{ color: '#888', fontSize: '0.75rem' }}>Zoom:</span>
-        <select
-          value={zoom}
-          onChange={(e) => onZoomChange(parseInt(e.target.value, 10))}
-          style={{
-            background: '#0f0f23',
-            border: '1px solid #333',
-            borderRadius: '4px',
-            padding: '0.25rem',
-            color: '#ccc',
-            fontSize: '0.75rem',
+        <button
+          onClick={() => {
+            const idx = ZOOM_LEVELS.indexOf(zoom);
+            if (idx > 0) onZoomChange(ZOOM_LEVELS[idx - 1]);
           }}
+          disabled={zoom === ZOOM_LEVELS[0]}
+          title="Zoom Out"
+          style={btnStyle(false, zoom === ZOOM_LEVELS[0])}
         >
-          {ZOOM_LEVELS.map((z) => (
-            <option key={z} value={z}>
-              {z}x
-            </option>
-          ))}
-        </select>
+          <ZoomOut size={iconSize} />
+        </button>
+        <span style={{ color: '#888', fontSize: '0.75rem', minWidth: 32, textAlign: 'center' }}>
+          {zoom}x
+        </span>
+        <button
+          onClick={() => {
+            const idx = ZOOM_LEVELS.indexOf(zoom);
+            if (idx < ZOOM_LEVELS.length - 1) onZoomChange(ZOOM_LEVELS[idx + 1]);
+          }}
+          disabled={zoom === ZOOM_LEVELS[ZOOM_LEVELS.length - 1]}
+          title="Zoom In"
+          style={btnStyle(false, zoom === ZOOM_LEVELS[ZOOM_LEVELS.length - 1])}
+        >
+          <ZoomIn size={iconSize} />
+        </button>
       </div>
     </div>
   );
