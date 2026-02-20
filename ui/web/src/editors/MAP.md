@@ -26,7 +26,11 @@ Creates tile definitions with pixel art variations.
   - `BRIDGE` - Bridge tiles rendered under paths crossing water
 - **Terrain Types:** LAND, WATER
 - **Bridge Association:** PATH tiles can reference a BRIDGE tile via `bridgeAssetId`
-- **Generation Tools:** Random fill, auto-generate all 15 path variations
+- **Two-Step Path Generation:**
+  1. **Fill All Backgrounds** - Fills all 15 variations with terrain colors (no paths)
+  2. **Draw Paths on All 15** - Draws paths ON TOP of existing pixels with edge fading
+  - Paths are transparent overlays, so any terrain can show through
+  - This separation allows custom terrains or hand-drawn backgrounds under paths
 - **Output:** `tiles/{id}/properties.json` + `tile_{0-14}.png`
 
 ### MapEditor

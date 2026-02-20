@@ -376,22 +376,20 @@ export function TileEditor() {
     saveCurrentVariation();
   }, [terrainType, terrainColors, saveCurrentVariation]);
 
-  // Generate all 15 path variations
-  const generateAllPaths = useCallback(() => {
+  // Fill all 15 variations with random background (no paths)
+  const fillAllBackgrounds = useCallback(() => {
     if (tileType === 'TILE') return;
 
     saveCurrentVariation();
     const bgColors = terrainType === 'WATER' ? DEFAULT_WATER_COLORS : terrainColors;
     const parsedBgColors = bgColors.map(parseHexColor);
-    const parsedPathColors = pathColors.map(parseHexColor);
 
     const newVariations = new Map<number, ImageData>();
 
     for (let i = 0; i < PATH_VARIATIONS; i++) {
-      const dir = PATH_DIRECTIONS[i];
       const data = new ImageData(TILE_SIZE, TILE_SIZE);
 
-      // Fill background
+      // Fill with random background colors
       for (let j = 0; j < data.data.length; j += 4) {
         const c = parsedBgColors[Math.floor(Math.random() * parsedBgColors.length)];
         data.data[j] = c.r;
@@ -400,69 +398,132 @@ export function TileEditor() {
         data.data[j + 3] = 255;
       }
 
-      // Draw path
-      const center = TILE_SIZE / 2;
-      const halfWidth = pathWidth / 2;
-
-      for (let y = 0; y < TILE_SIZE; y++) {
-        for (let x = 0; x < TILE_SIZE; x++) {
-          let inPath = false;
-          let distToEdge = Infinity;
-
-          // Check if in horizontal path
-          if (Math.abs(y - center) <= halfWidth) {
-            if ((dir.left && x <= center) || (dir.right && x >= center)) {
-              inPath = true;
-              distToEdge = Math.min(distToEdge, halfWidth - Math.abs(y - center));
-            }
-          }
-
-          // Check if in vertical path
-          if (Math.abs(x - center) <= halfWidth) {
-            if ((dir.up && y <= center) || (dir.down && y >= center)) {
-              inPath = true;
-              distToEdge = Math.min(distToEdge, halfWidth - Math.abs(x - center));
-            }
-          }
-
-          // Check center junction
-          if (Math.abs(x - center) <= halfWidth && Math.abs(y - center) <= halfWidth) {
-            inPath = true;
-            distToEdge = Math.min(
-              halfWidth - Math.abs(x - center),
-              halfWidth - Math.abs(y - center)
-            );
-          }
-
-          if (inPath) {
-            const idx = (y * TILE_SIZE + x) * 4;
-            const pathColor = parsedPathColors[Math.floor(Math.random() * parsedPathColors.length)];
-
-            // Apply fade at interior edges (not at tile edges)
-            const atTileEdge = x < PATH_FADE_PIXELS || x >= TILE_SIZE - PATH_FADE_PIXELS ||
-                               y < PATH_FADE_PIXELS || y >= TILE_SIZE - PATH_FADE_PIXELS;
-
-            if (!atTileEdge && distToEdge < PATH_FADE_PIXELS) {
-              const fade = distToEdge / PATH_FADE_PIXELS;
-              data.data[idx] = Math.round(data.data[idx] * (1 - fade) + pathColor.r * fade);
-              data.data[idx + 1] = Math.round(data.data[idx + 1] * (1 - fade) + pathColor.g * fade);
-              data.data[idx + 2] = Math.round(data.data[idx + 2] * (1 - fade) + pathColor.b * fade);
-            } else {
-              data.data[idx] = pathColor.r;
-              data.data[idx + 1] = pathColor.g;
-              data.data[idx + 2] = pathColor.b;
-            }
-          }
-        }
-      }
-
       newVariations.set(i, data);
     }
 
     setVariations(newVariations);
     setCurrentVariation(0);
-    loadVariation(0);
-  }, [tileType, terrainType, terrainColors, pathColors, pathWidth, saveCurrentVariation, loadVariation]);
+    // Load first variation directly (can't use loadVariation as state hasn't updated yet)
+    const firstVar = newVariations.get(0);
+    if (firstVar && canvasRef.current) {
+      canvasRef.current.setImageData(firstVar);
+    }
+  }, [tileType, terrainType, terrainColors, saveCurrentVariation]);
+
+  // Draw path on existing pixels with fading edges
+  const drawPathOnPixels = (
+    existingData: Uint8ClampedArray,
+    dir: { up: boolean; down: boolean; left: boolean; right: boolean },
+    parsedPathColors: { r: number; g: number; b: number }[]
+  ): ImageData => {
+    const data = new ImageData(TILE_SIZE, TILE_SIZE);
+    // Copy existing pixels
+    data.data.set(existingData);
+
+    const center = TILE_SIZE / 2;
+    const halfWidth = pathWidth / 2;
+
+    // Calculate path bounds for each direction
+    const cStart = Math.round((TILE_SIZE - pathWidth) / 2);
+    const cEnd = Math.round((TILE_SIZE + pathWidth) / 2);
+
+    // Helper to draw a path segment
+    const drawSegment = (
+      xStart: number, xEnd: number,
+      yStart: number, yEnd: number,
+      fadeLeft: boolean, fadeRight: boolean,
+      fadeTop: boolean, fadeBottom: boolean
+    ) => {
+      for (let y = yStart; y < yEnd; y++) {
+        for (let x = xStart; x < xEnd; x++) {
+          const idx = (y * TILE_SIZE + x) * 4;
+          const pathColor = parsedPathColors[Math.floor(Math.random() * parsedPathColors.length)];
+
+          // Calculate fade factor for each edge
+          let fadeFactor = 0;
+
+          if (fadeLeft && x >= xStart && x < xStart + PATH_FADE_PIXELS) {
+            fadeFactor = Math.max(fadeFactor, 1 - (x - xStart + 1) / PATH_FADE_PIXELS);
+          }
+          if (fadeRight && x >= xEnd - PATH_FADE_PIXELS && x < xEnd) {
+            fadeFactor = Math.max(fadeFactor, 1 - (xEnd - 1 - x + 1) / PATH_FADE_PIXELS);
+          }
+          if (fadeTop && y >= yStart && y < yStart + PATH_FADE_PIXELS) {
+            fadeFactor = Math.max(fadeFactor, 1 - (y - yStart + 1) / PATH_FADE_PIXELS);
+          }
+          if (fadeBottom && y >= yEnd - PATH_FADE_PIXELS && y < yEnd) {
+            fadeFactor = Math.max(fadeFactor, 1 - (yEnd - 1 - y + 1) / PATH_FADE_PIXELS);
+          }
+
+          if (fadeFactor > 0) {
+            // Blend with existing pixel
+            const bgR = data.data[idx];
+            const bgG = data.data[idx + 1];
+            const bgB = data.data[idx + 2];
+            const bgA = data.data[idx + 3];
+
+            data.data[idx] = Math.round(pathColor.r * (1 - fadeFactor) + bgR * fadeFactor);
+            data.data[idx + 1] = Math.round(pathColor.g * (1 - fadeFactor) + bgG * fadeFactor);
+            data.data[idx + 2] = Math.round(pathColor.b * (1 - fadeFactor) + bgB * fadeFactor);
+            data.data[idx + 3] = Math.max(255, bgA);
+          } else {
+            // Full path color
+            data.data[idx] = pathColor.r;
+            data.data[idx + 1] = pathColor.g;
+            data.data[idx + 2] = pathColor.b;
+            data.data[idx + 3] = 255;
+          }
+        }
+      }
+    };
+
+    // Draw each direction segment
+    if (dir.up) {
+      drawSegment(cStart, cEnd, 0, cEnd, true, true, false, true);
+    }
+    if (dir.down) {
+      drawSegment(cStart, cEnd, cStart, TILE_SIZE, true, true, true, false);
+    }
+    if (dir.left) {
+      drawSegment(0, cEnd, cStart, cEnd, false, true, true, true);
+    }
+    if (dir.right) {
+      drawSegment(cStart, TILE_SIZE, cStart, cEnd, true, false, true, true);
+    }
+
+    return data;
+  };
+
+  // Generate paths on all 15 variations (draws ON TOP of existing pixels)
+  const generateAllPaths = useCallback(() => {
+    if (tileType === 'TILE') return;
+
+    saveCurrentVariation();
+    const parsedPathColors = pathColors.map(parseHexColor);
+
+    const newVariations = new Map<number, ImageData>();
+
+    for (let i = 0; i < PATH_VARIATIONS; i++) {
+      const dir = PATH_DIRECTIONS[i];
+      const existing = variations.get(i);
+
+      // Get existing pixels or create transparent canvas
+      const existingData = existing
+        ? new Uint8ClampedArray(existing.data)
+        : new Uint8ClampedArray(TILE_SIZE * TILE_SIZE * 4);
+
+      const data = drawPathOnPixels(existingData, dir, parsedPathColors);
+      newVariations.set(i, data);
+    }
+
+    setVariations(newVariations);
+    setCurrentVariation(0);
+    // Load first variation directly (can't use loadVariation as state hasn't updated yet)
+    const firstVar = newVariations.get(0);
+    if (firstVar && canvasRef.current) {
+      canvasRef.current.setImageData(firstVar);
+    }
+  }, [tileType, pathColors, pathWidth, variations, saveCurrentVariation]);
 
   // Add color to recent
   const addRecentColor = useCallback((c: Color) => {
@@ -793,9 +854,18 @@ export function TileEditor() {
                     />
                   </div>
 
+                  <div style={{ color: '#666', fontSize: '0.65rem', marginBottom: '0.25rem' }}>
+                    Step 1: Fill backgrounds, Step 2: Draw paths on top
+                  </div>
+
+                  <button onClick={fillAllBackgrounds}
+                    style={{ width: '100%', padding: '0.5rem', border: 'none', borderRadius: '4px', background: '#4ecca3', color: '#1a1a2e', cursor: 'pointer', fontSize: '0.75rem', marginBottom: '0.25rem' }}>
+                    1. Fill All Backgrounds
+                  </button>
+
                   <button onClick={generateAllPaths}
                     style={{ width: '100%', padding: '0.5rem', border: 'none', borderRadius: '4px', background: '#ffd93d', color: '#1a1a2e', cursor: 'pointer', fontSize: '0.75rem', fontWeight: 'bold' }}>
-                    Generate All 15 Paths
+                    2. Draw Paths on All 15
                   </button>
 
                   {/* Bridge selector - only for PATH + LAND tiles */}

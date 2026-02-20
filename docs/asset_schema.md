@@ -293,9 +293,11 @@ mods/levels/{name}.json
 - [x] **Tile Type switching** - TILE, PATH, BRIDGE
 - [x] **Terrain Type** - LAND, WATER
 - [x] **Random Fill** - fill with random picks from 3 colors
-- [x] **Fill All Backgrounds** - apply random fill to all 15 path variations
-- [x] **Path Drawing** with configurable width and fade
-- [x] **Generate All 15 Paths** - auto-generate all direction combinations
+- [x] **Two-Step Path Generation** - separate background and path drawing:
+  - **Step 1: Fill All Backgrounds** - fills all 15 variations with terrain colors (no paths)
+  - **Step 2: Draw Paths on All 15** - draws paths ON TOP of existing pixels with edge fading
+  - Paths are transparent overlays, allowing any terrain underneath
+- [x] **Path Width** - configurable center width with edge fading
 - [x] **Bridge Association** - select which BRIDGE tile to use for water crossings
 - [ ] **Path Guidelines** - show direction indicators on path variations
 - [x] **Movement Cost** slider (0=impassable, 1=easy, 3+=difficult)
