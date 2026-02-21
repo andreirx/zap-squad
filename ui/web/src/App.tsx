@@ -1,22 +1,33 @@
 import { BrowserRouter, Routes, Route, Link, useLocation } from 'react-router-dom';
 import { GamePage } from './pages/GamePage';
+import { WasmGamePage } from './pages/WasmGamePage';
 import { CharacterEditor, ObjectEditor, TileEditor, WeaponEditor, MapEditor } from './editors';
 
 export default function App() {
   return (
     <BrowserRouter>
       <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
-        <Navigation />
-        <main style={{ flex: 1 }}>
-          <Routes>
-            <Route path="/" element={<GamePage />} />
-            <Route path="/editor/character" element={<CharacterEditor />} />
-            <Route path="/editor/object" element={<ObjectEditor />} />
-            <Route path="/editor/weapon" element={<WeaponEditor />} />
-            <Route path="/editor/tile" element={<TileEditor />} />
-            <Route path="/editor/map" element={<MapEditor />} />
-          </Routes>
-        </main>
+        <Routes>
+          {/* WASM game has its own full-screen layout */}
+          <Route path="/game/wasm" element={<WasmGamePage />} />
+
+          {/* Regular pages with navigation */}
+          <Route path="*" element={
+            <>
+              <Navigation />
+              <main style={{ flex: 1 }}>
+                <Routes>
+                  <Route path="/" element={<GamePage />} />
+                  <Route path="/editor/character" element={<CharacterEditor />} />
+                  <Route path="/editor/object" element={<ObjectEditor />} />
+                  <Route path="/editor/weapon" element={<WeaponEditor />} />
+                  <Route path="/editor/tile" element={<TileEditor />} />
+                  <Route path="/editor/map" element={<MapEditor />} />
+                </Routes>
+              </main>
+            </>
+          } />
+        </Routes>
       </div>
     </BrowserRouter>
   );
@@ -46,6 +57,14 @@ function Navigation() {
     }}>
       <Link to="/" style={{ ...linkStyle('/'), fontWeight: 'bold' }}>
         ZAP-SQUAD
+      </Link>
+      <Link to="/game/wasm" style={{
+        ...linkStyle('/game/wasm'),
+        background: '#4ecca3',
+        color: '#1a1a2e',
+        fontWeight: 'bold',
+      }}>
+        Play (WebGPU)
       </Link>
       <span style={{ color: '#333' }}>|</span>
       <Link to="/editor/character" style={linkStyle('/editor/character')}>

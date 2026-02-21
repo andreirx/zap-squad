@@ -24,18 +24,19 @@ pub struct BodyDefinition {
 
 impl BodyDefinition {
     /// Resolve sprite name for given state
-    /// Format: "{body_id}_{visual}_{anim}_{direction}_{frame}"
+    /// Format: "{body_id}/{anim}_{direction}/{frame}"
+    /// Matches assets.json format from convert-manifest.ts
     pub fn sprite_name(
         &self,
         direction: Direction,
         animation: AnimationState,
-        visual: VisualState,
+        _visual: VisualState, // Currently unused in sprite names
         frame: u32,
     ) -> String {
         format!(
-            "{}_{}_{}",
+            "{}/{}/{}",
             self.id,
-            sprite_key(direction, animation, visual),
+            animation_direction_key(animation, direction),
             frame
         )
     }
@@ -64,12 +65,13 @@ pub struct WeaponDefinition {
 
 impl WeaponDefinition {
     /// Resolve sprite name for given state
-    /// Format: "{weapon_id}_{anim}_{direction}_{frame}"
+    /// Format: "{weapon_id}/{anim}_{direction}/{frame}"
+    /// Matches assets.json format from convert-manifest.ts
     pub fn sprite_name(&self, direction: Direction, animation: AnimationState, frame: u32) -> String {
         format!(
-            "{}_{}_{}",
+            "{}/{}/{}",
             self.id,
-            weapon_sprite_key(direction, animation),
+            animation_direction_key(animation, direction),
             frame
         )
     }
@@ -120,14 +122,102 @@ pub struct AssetManifest {
     pub levels: Vec<String>,
 }
 
+/// Raw game manifest format (as stored in manifest.json)
+#[derive(Debug, Deserialize)]
+struct RawGameManifest {
+    #[serde(default)]
+    characters: HashMap<String, RawCharacterDef>,
+    #[serde(default)]
+    weapons: HashMap<String, RawWeaponDef>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCharacterDef {
+    id: String,
+    name: String,
+    #[serde(default)]
+    animations: HashMap<String, RawAnimation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAnimation {
+    frames: u32,
+    #[serde(default = "default_loop")]
+    r#loop: bool,
+}
+
+fn default_loop() -> bool { true }
+
+#[derive(Debug, Deserialize)]
+struct RawWeaponDef {
+    id: String,
+    name: String,
+    #[serde(default)]
+    animations: HashMap<String, RawAnimation>,
+    #[serde(rename = "anchorX", default)]
+    anchor_x: f32,
+    #[serde(rename = "anchorY", default)]
+    anchor_y: f32,
+}
+
 impl AssetManifest {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Load manifest from JSON
+    /// Load manifest from internal JSON format (bodies, weapons, etc.)
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
+    }
+
+    /// Load manifest from game manifest.json format (characters, tiles, weapons)
+    /// This adapts the game format to the internal AssetManifest format
+    pub fn from_game_manifest(json: &str) -> Result<Self, serde_json::Error> {
+        let raw: RawGameManifest = serde_json::from_str(json)?;
+        let mut manifest = AssetManifest::new();
+
+        // Convert characters to bodies
+        for (id, char_def) in raw.characters {
+            // Determine max frames from animations
+            let max_frames = char_def.animations.values()
+                .map(|a| a.frames)
+                .max()
+                .unwrap_or(1);
+
+            manifest.add_body(BodyDefinition {
+                id,
+                name: char_def.name,
+                frames_per_state: max_frames,
+                frame_duration: 0.1, // Default frame duration
+                weapon_anchors: HashMap::new(),
+            });
+        }
+
+        // Convert weapons
+        for (id, weapon_def) in raw.weapons {
+            let max_frames = weapon_def.animations.values()
+                .map(|a| a.frames)
+                .max()
+                .unwrap_or(1);
+
+            let mut offsets = HashMap::new();
+            // Apply anchor as default offset for all directions
+            let anchor = Vec2::new(weapon_def.anchor_x, weapon_def.anchor_y);
+            for dir in ["up", "down", "left", "right"] {
+                offsets.insert(dir.to_string(), anchor);
+            }
+
+            manifest.add_weapon(WeaponDefinition {
+                id,
+                name: weapon_def.name,
+                weapon_type: WeaponType::Melee, // Default, could be determined from name
+                frames_per_state: max_frames,
+                frame_duration: 0.1,
+                offsets,
+            });
+        }
+
+        Ok(manifest)
     }
 
     /// Serialize to JSON
@@ -166,22 +256,33 @@ impl AssetManifest {
     }
 }
 
-/// Generate sprite key for body: "{visual}_{anim}_{direction}"
-fn sprite_key(direction: Direction, animation: AnimationState, visual: VisualState) -> String {
-    format!(
-        "{}_{}_{}",
-        visual.as_str(),
-        animation.as_str(),
-        direction_key(direction)
-    )
+/// Generate animation_direction key matching manifest.json format
+/// Examples: "idle_south", "walk_east", "melee_attack_north"
+fn animation_direction_key(animation: AnimationState, direction: Direction) -> String {
+    format!("{}_{}", animation_key(animation), compass_direction_key(direction))
 }
 
-/// Generate sprite key for weapon: "{anim}_{direction}"
-fn weapon_sprite_key(direction: Direction, animation: AnimationState) -> String {
-    format!("{}_{}", animation.as_str(), direction_key(direction))
+/// AnimationState to manifest.json animation name
+fn animation_key(animation: AnimationState) -> &'static str {
+    match animation {
+        AnimationState::Idle => "idle",
+        AnimationState::Walk => "walk",
+        AnimationState::MeleeAttack => "melee_attack",
+        AnimationState::ThrowAttack => "throw_attack",
+    }
 }
 
-/// Direction to string key
+/// Direction to compass direction (matches manifest.json)
+fn compass_direction_key(direction: Direction) -> &'static str {
+    match direction {
+        Direction::North => "north",
+        Direction::East => "east",
+        Direction::South => "south",
+        Direction::West => "west",
+    }
+}
+
+/// Direction to screen direction (for anchor lookups)
 fn direction_key(direction: Direction) -> &'static str {
     match direction {
         Direction::North => "up",
@@ -211,7 +312,8 @@ mod tests {
             VisualState::Full,
             2,
         );
-        assert_eq!(name, "soldier_full_walk_down_2");
+        // Format: "{id}/{animation}_{direction}/{frame}"
+        assert_eq!(name, "soldier/walk_south/2");
     }
 
     #[test]
@@ -226,7 +328,8 @@ mod tests {
         };
 
         let name = weapon.sprite_name(Direction::East, AnimationState::MeleeAttack, 1);
-        assert_eq!(name, "sword_melee_attack_right_1");
+        // Format: "{id}/{animation}_{direction}/{frame}"
+        assert_eq!(name, "sword/melee_attack_east/1");
     }
 
     #[test]

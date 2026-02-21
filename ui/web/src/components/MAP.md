@@ -45,6 +45,28 @@ Game rendering component that displays the current level.
   - Animation tick for animated sprites
   - Auto-bridge rendering when ground paths cross water/rivers
 
+### WasmGame
+WebGPU game renderer using zap-engine WASM.
+- **Features:**
+  - Loads and initializes WASM module (`zapsquad_wasm`)
+  - WebGPU rendering with GPU-instanced quads
+  - Reads instance data directly from WASM memory
+  - ~10,000 instances at 60fps
+  - Hot-reload buttons for scripts and assets
+  - Keyboard input forwarding (WASD/Arrows)
+  - Pointer input forwarding
+  - Scroll to pan, Ctrl+Scroll to zoom
+- **Sprite Loading:**
+  - Loads pre-baked atlases from `public/assets/manifest.json`
+  - Converts manifest format to zap-engine sprite manifest
+  - Uploads atlas textures to WebGPU
+  - Atlas format: characters (rows=animations), tiles (row0=variations, rows1-8=transitions), weapons
+- **Props:**
+  - `levelId` - Level to load
+  - `width`, `height` - Canvas dimensions
+  - `onError` - Error callback
+- **Route:** `/game/wasm`
+
 ### NavBar
 Application navigation bar with links to Game, Map Editor, Tile Editor, Character Editor, and Object Editor.
 

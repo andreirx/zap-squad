@@ -10,13 +10,17 @@ Creates character sprites with visual states and animations.
 - **Visual States:** full, hurt1, hurt2, critical (health-based appearance)
 - **Animations:** idle, walk, melee_attack, throw_attack
 - **Directions:** north, east, south, west
-- **Output:** `characters/{id}/{id}_{visualState}_{animation}_{direction}_{frame}.png`
+- **Output (mods):** `mods/characters/{id}/{id}_{visualState}_{animation}_{direction}_{frame}.png`
+- **Output (atlas):** `assets/characters/{id}.png` + updates `assets/manifest.json`
+- **TODO:** Integrate with atlas baking system (Task #25)
 
 ### ObjectEditor
 Creates object sprites with visual states.
 - **Visual States:** new, worn, damaged, broken
 - **Animations:** idle, landed (for throwables)
-- **Output:** `objects/{id}/{id}_{visualState}_{animation}_{frame}.png`
+- **Output (mods):** `mods/objects/{id}/{id}_{visualState}_{animation}_{frame}.png`
+- **Output (atlas):** `assets/weapons/{id}.png` + updates `assets/manifest.json`
+- **TODO:** Integrate with atlas baking system (Task #25)
 
 ### TileEditor
 Creates tile definitions with pixel art variations.
@@ -26,7 +30,12 @@ Creates tile definitions with pixel art variations.
   - `BRIDGE` - Bridge tiles rendered under paths crossing water
 - **Terrain Types:** LAND, WATER
 - **Bridge Association:** PATH tiles can reference a BRIDGE tile via `bridgeAssetId`
-- **Two-Step Path Generation:**
+- **Transition Auto-Generation (TILE type only):**
+  - On save, generates 8 transition tiles from tile_0: N, NE, E, SE, S, SW, W, NW
+  - Each transition has 32px solid edge + 32px fade toward transparent
+  - Used by MapEditor/GameCanvas for terrain blending
+  - Output: `tile_0_transition_{dir}.png`
+- **Two-Step Path Generation (PATH/BRIDGE):**
   1. **Fill All Backgrounds** - Fills all 15 variations with terrain colors (no paths)
   2. **Draw Paths on All 15** - Draws paths ON TOP of existing pixels with edge fading
   - Paths are transparent overlays, so any terrain can show through

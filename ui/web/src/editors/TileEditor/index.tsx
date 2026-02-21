@@ -13,6 +13,12 @@ const PATH_VARIATIONS = 15;
 const DEFAULT_PATH_WIDTH = 56;
 const PATH_FADE_PIXELS = 4;
 
+// Transition tile constants (for terrain edge blending)
+const TRANSITION_SOLID_PIXELS = 32;
+const TRANSITION_FADE_PIXELS = 32;
+const TRANSITION_DIRECTIONS = ['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw'] as const;
+type TransitionDirection = typeof TRANSITION_DIRECTIONS[number];
+
 type TileType = 'TILE' | 'PATH' | 'BRIDGE';
 type TerrainType = 'LAND' | 'WATER';
 
@@ -291,11 +297,28 @@ export function TileEditor() {
         );
       }
 
+      // Auto-generate transitions for TILE type (only for tile_0)
+      if (tileType === 'TILE') {
+        const tile0Data = variations.get(0);
+        if (tile0Data) {
+          for (const direction of TRANSITION_DIRECTIONS) {
+            const transitionData = generateTransitionImage(tile0Data, direction);
+            const transitionBlob = await imageDataToPng(transitionData);
+            await storage.writeBytes(
+              `tiles/${tileId}/tile_0_transition_${direction}.png`,
+              await transitionBlob.arrayBuffer(),
+              'image/png'
+            );
+          }
+        }
+      }
+
       if (!existingTiles.includes(tileId)) {
         setExistingTiles([...existingTiles, tileId]);
       }
 
-      console.log(`Saved tile ${tileId} with ${variations.size} variations`);
+      const transitionInfo = tileType === 'TILE' ? ' + 8 transitions' : '';
+      console.log(`Saved tile ${tileId} with ${variations.size} variations${transitionInfo}`);
     } catch (e) {
       setSaveError(`Failed to save: ${e}`);
     } finally {
@@ -419,9 +442,6 @@ export function TileEditor() {
     const data = new ImageData(TILE_SIZE, TILE_SIZE);
     // Copy existing pixels
     data.data.set(existingData);
-
-    const center = TILE_SIZE / 2;
-    const halfWidth = pathWidth / 2;
 
     // Calculate path bounds for each direction
     const cStart = Math.round((TILE_SIZE - pathWidth) / 2);
@@ -1005,6 +1025,108 @@ function imageDataToPng(data: ImageData): Promise<Blob> {
     ctx.putImageData(data, 0, 0);
     canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error('No blob')), 'image/png');
   });
+}
+
+/**
+ * Generate a transition tile for terrain edge blending.
+ *
+ * Direction indicates WHERE the transition will be PLACED (the neighbor cell).
+ * So transition_n.png is placed in the cell NORTH of the source - it needs solid at BOTTOM
+ * to connect to the source tile below it.
+ */
+function generateTransitionImage(source: ImageData, direction: TransitionDirection): ImageData {
+  const width = source.width;
+  const height = source.height;
+  const result = new ImageData(width, height);
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = (y * width + x) * 4;
+      const alpha = calculateTransitionAlpha(direction, x, y, width, height);
+
+      // Copy RGB from source, apply calculated alpha
+      result.data[idx] = source.data[idx];
+      result.data[idx + 1] = source.data[idx + 1];
+      result.data[idx + 2] = source.data[idx + 2];
+      result.data[idx + 3] = Math.round((source.data[idx + 3] / 255) * alpha);
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Calculate alpha value for a pixel based on transition direction.
+ * Returns 0-255 alpha value.
+ */
+function calculateTransitionAlpha(
+  direction: TransitionDirection,
+  x: number, y: number,
+  width: number, height: number
+): number {
+  switch (direction) {
+    case 'n': return calcSouthAlpha(y, height);    // Solid at bottom (placed north)
+    case 's': return calcNorthAlpha(y);             // Solid at top (placed south)
+    case 'e': return calcWestAlpha(x);              // Solid at left (placed east)
+    case 'w': return calcEastAlpha(x, width);       // Solid at right (placed west)
+    case 'ne': return calcCornerAlpha(x, height - 1 - y);              // Solid at bottom-left
+    case 'nw': return calcCornerAlpha(width - 1 - x, height - 1 - y);  // Solid at bottom-right
+    case 'se': return calcCornerAlpha(x, y);                            // Solid at top-left
+    case 'sw': return calcCornerAlpha(width - 1 - x, y);               // Solid at top-right
+  }
+}
+
+function calcNorthAlpha(y: number): number {
+  if (y < TRANSITION_SOLID_PIXELS) return 255;
+  if (y < TRANSITION_SOLID_PIXELS + TRANSITION_FADE_PIXELS) {
+    const fadeProgress = y - TRANSITION_SOLID_PIXELS;
+    return 255 - Math.round(fadeProgress * 255 / TRANSITION_FADE_PIXELS);
+  }
+  return 0;
+}
+
+function calcSouthAlpha(y: number, height: number): number {
+  const distFromBottom = height - 1 - y;
+  if (distFromBottom < TRANSITION_SOLID_PIXELS) return 255;
+  if (distFromBottom < TRANSITION_SOLID_PIXELS + TRANSITION_FADE_PIXELS) {
+    const fadeProgress = distFromBottom - TRANSITION_SOLID_PIXELS;
+    return 255 - Math.round(fadeProgress * 255 / TRANSITION_FADE_PIXELS);
+  }
+  return 0;
+}
+
+function calcEastAlpha(x: number, width: number): number {
+  const distFromRight = width - 1 - x;
+  if (distFromRight < TRANSITION_SOLID_PIXELS) return 255;
+  if (distFromRight < TRANSITION_SOLID_PIXELS + TRANSITION_FADE_PIXELS) {
+    const fadeProgress = distFromRight - TRANSITION_SOLID_PIXELS;
+    return 255 - Math.round(fadeProgress * 255 / TRANSITION_FADE_PIXELS);
+  }
+  return 0;
+}
+
+function calcWestAlpha(x: number): number {
+  if (x < TRANSITION_SOLID_PIXELS) return 255;
+  if (x < TRANSITION_SOLID_PIXELS + TRANSITION_FADE_PIXELS) {
+    const fadeProgress = x - TRANSITION_SOLID_PIXELS;
+    return 255 - Math.round(fadeProgress * 255 / TRANSITION_FADE_PIXELS);
+  }
+  return 0;
+}
+
+function calcCornerAlpha(cornerDistX: number, cornerDistY: number): number {
+  // Solid square corner
+  if (cornerDistX < TRANSITION_SOLID_PIXELS && cornerDistY < TRANSITION_SOLID_PIXELS) {
+    return 255;
+  }
+  // Circular fade from corner
+  const distance = Math.sqrt(cornerDistX * cornerDistX + cornerDistY * cornerDistY);
+  if (distance < TRANSITION_SOLID_PIXELS) return 255;
+  if (distance < TRANSITION_SOLID_PIXELS + TRANSITION_FADE_PIXELS) {
+    const fadeProgress = distance - TRANSITION_SOLID_PIXELS;
+    return 255 - Math.round(fadeProgress * 255 / TRANSITION_FADE_PIXELS);
+  }
+  return 0;
 }
 
 export default TileEditor;

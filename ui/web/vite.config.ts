@@ -1,7 +1,31 @@
 import { defineConfig, Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
+import wasm from 'vite-plugin-wasm';
+import topLevelAwait from 'vite-plugin-top-level-await';
 import * as fs from 'fs';
 import * as path from 'path';
+
+/**
+ * Vite plugin to add COOP/COEP headers to ALL responses (required for SharedArrayBuffer)
+ */
+function crossOriginIsolationPlugin(): Plugin {
+  return {
+    name: 'vite-plugin-cross-origin-isolation',
+    configureServer(server) {
+      server.middlewares.use((req, res, next) => {
+        res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+        res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+        // Prevent caching of WASM files during development
+        if (req.url?.includes('.wasm') || req.url?.includes('wasm')) {
+          res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+          res.setHeader('Pragma', 'no-cache');
+          res.setHeader('Expires', '0');
+        }
+        next();
+      });
+    },
+  };
+}
 
 /**
  * Vite plugin for local file writing (dev only)
@@ -107,13 +131,21 @@ function listFilesRecursive(dir: string): string[] {
 }
 
 export default defineConfig({
-  plugins: [react(), fileWritePlugin()],
+  plugins: [react(), crossOriginIsolationPlugin(), fileWritePlugin(), wasm(), topLevelAwait()],
   server: {
-    port: 5173,
+    port: 5178,
+    strictPort: true,
     headers: {
       // Required for SharedArrayBuffer (zap-engine)
       'Cross-Origin-Opener-Policy': 'same-origin',
       'Cross-Origin-Embedder-Policy': 'require-corp',
+    },
+    fs: {
+      // Allow serving files from the linked zap-engine package
+      allow: [
+        '.',
+        '/Users/apple/Documents/APLICATII BIJUTERIE/zap-engine',
+      ],
     },
   },
   build: {
@@ -124,5 +156,12 @@ export default defineConfig({
     alias: {
       '@': '/src',
     },
+  },
+  optimizeDeps: {
+    // Exclude @zap/web from pre-bundling - it has .wgsl files esbuild can't handle
+    exclude: ['@zap/web', '@zap/web/react'],
+  },
+  worker: {
+    format: 'es',
   },
 });

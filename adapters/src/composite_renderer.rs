@@ -34,7 +34,7 @@ impl CompositeRenderer {
         Self {
             entities: HashMap::new(),
             manifest,
-            default_scale: 32.0,
+            default_scale: 128.0, // Match tile size for consistent rendering
         }
     }
 
@@ -130,6 +130,7 @@ impl CompositeRenderer {
         // Update body
         if let Some(body) = ctx.scene.get_mut(composite.body) {
             body.pos = actor.position;
+            body.scale = Vec2::splat(self.default_scale); // Apply zoom
             if let Some(sprite) = body_sprite {
                 body.sprite = Some(sprite);
             }
@@ -141,6 +142,7 @@ impl CompositeRenderer {
                 // Update existing weapon
                 if let Some(weapon) = ctx.scene.get_mut(weapon_id) {
                     weapon.pos = weapon_pos;
+                    weapon.scale = Vec2::splat(self.default_scale); // Apply zoom
                     if let Some(sprite) = weapon_sprite {
                         weapon.sprite = Some(sprite);
                     }
@@ -184,7 +186,7 @@ impl CompositeRenderer {
         Entity::new(id)
             .with_pos(actor.position)
             .with_scale(Vec2::splat(self.default_scale))
-            .with_layer(RenderLayer::Objects)
+            .with_layer(RenderLayer::UI) // Layer 5: above all tiles including paths
     }
 
     /// Create weapon entity
@@ -192,7 +194,7 @@ impl CompositeRenderer {
         Entity::new(id)
             .with_pos(pos)
             .with_scale(Vec2::splat(self.default_scale))
-            .with_layer(RenderLayer::Objects) // Same layer, draws after body due to spawn order
+            .with_layer(RenderLayer::UI) // Same layer as body
     }
 
     /// Calculate weapon position from body anchor + weapon offset

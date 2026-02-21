@@ -14,9 +14,9 @@ check:
 lint:
 	cargo clippy --workspace -- -D warnings
 
-# Build WASM
+# Build WASM (outputs to src/wasm where the app imports from)
 wasm:
-	wasm-pack build infrastructure/wasm --target web --out-dir ../../ui/web/pkg
+	wasm-pack build infrastructure/wasm --target web --out-dir ../../ui/web/src/wasm
 
 # Install tools dependencies
 tools-install:
@@ -49,6 +49,7 @@ bake-atlases:
 clean:
 	cargo clean
 	rm -rf ui/web/pkg
+	rm -rf ui/web/src/wasm
 	rm -rf ui/web/dist
 	rm -rf ui/web/public/assets/*.png
 	rm -rf tools/node_modules

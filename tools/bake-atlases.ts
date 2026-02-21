@@ -67,6 +67,9 @@ interface TileDefinition {
   walkable: boolean;
   blocksVision: boolean;
   damagePerTurn: number;
+  tileType?: string;
+  terrainType?: string;
+  bridgeAssetId?: string;
 }
 
 interface WeaponDefinition {
@@ -104,6 +107,9 @@ interface TileAtlasInfo {
   spriteSize: number;
   variations: number;
   hasTransitions: boolean;
+  tileType?: string;
+  terrainType?: string;
+  bridgeAssetId?: string;
 }
 
 interface WeaponAtlasInfo {
@@ -345,6 +351,9 @@ async function bakeTileAtlas(id: string, tileDir: string): Promise<TileAtlasInfo
     spriteSize,
     variations,
     hasTransitions,
+    tileType: def.tileType,
+    terrainType: def.terrainType,
+    bridgeAssetId: def.bridgeAssetId,
   };
 }
 

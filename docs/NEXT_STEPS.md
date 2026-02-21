@@ -39,54 +39,36 @@ import init, {
 
 ---
 
-## Phase 1: Connect WASM to Existing UI (Quickest Win)
+## Phase 1: Connect WASM to Existing UI (Quickest Win) - DONE
 
-### Task 1.1: Create WasmGame Component
-Create a new component that hosts the zap-engine WASM game.
+### Task 1.1: Create WasmGame Component - DONE
+Created `ui/web/src/components/WasmGame.tsx`:
+- Loads and initializes WASM module
+- Sets up WebGPU context
+- Runs game loop with `requestAnimationFrame`
+- Forwards keyboard/pointer input to WASM
+- Includes reload buttons for scripts and assets
 
-**File**: `ui/web/src/components/WasmGame.tsx`
+### Task 1.2: Set Up WebGPU Renderer - DONE
+Created `ui/web/src/lib/webgpu-renderer.ts`:
+- GPU-instanced quad rendering
+- Reads instance data directly from WASM memory
+- Orthographic camera with pan/zoom
+- Sprite atlas support (placeholder for now)
+- ~10,000 instances at 60fps
 
-```typescript
-import { useEffect, useRef, useState } from 'react';
-import init, * as wasm from '../../pkg/zapsquad_wasm';
+### Task 1.3: Add WASM Game Tab - DONE
+- Route: `/game/wasm`
+- Full-screen WebGPU canvas
+- Level selector dropdown
+- FPS counter + instance count
+- "Play (WebGPU)" button in navigation
 
-export function WasmGame({ levelJson }: { levelJson?: string }) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [ready, setReady] = useState(false);
-
-  useEffect(() => {
-    async function initWasm() {
-      await init();
-      wasm.game_init();
-      setReady(true);
-    }
-    initWasm();
-  }, []);
-
-  useEffect(() => {
-    if (ready && levelJson) {
-      wasm.load_level(levelJson);
-    }
-  }, [ready, levelJson]);
-
-  // TODO: Set up WebGPU rendering loop
-  // TODO: Forward input events to WASM
-
-  return <canvas ref={canvasRef} />;
-}
-```
-
-### Task 1.2: Set Up WebGPU Renderer
-The WASM module provides instance buffers via shared memory. Need to:
-1. Get WebGPU device and context
-2. Create render pipeline with zap-engine shaders
-3. Read instance data from WASM memory each frame
-4. Draw instanced quads
-
-**Reference**: Check zap-engine examples for WebGPU setup.
-
-### Task 1.3: Add WASM Game Tab
-Add a "Game (WASM)" tab alongside the current "Game" tab for comparison.
+### Next: Sprite Atlas Integration
+For sprites to appear, need to:
+1. Run `make bake-atlases` to generate sprite atlases
+2. Load atlas into WebGPU renderer
+3. Call `reload_sprite_manifest()` with atlas metadata
 
 ---
 

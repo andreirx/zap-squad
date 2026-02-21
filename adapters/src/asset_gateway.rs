@@ -37,6 +37,20 @@ pub struct LdtkLayer {
     pub int_grid: Vec<i32>,
     #[serde(rename = "entityInstances", default)]
     pub entities: Vec<LdtkEntity>,
+    #[serde(rename = "gridTiles", default)]
+    pub grid_tiles: Vec<LdtkGridTile>,
+}
+
+/// Grid tile from LDtk Tiles layer
+#[derive(Debug, Deserialize, Clone)]
+pub struct LdtkGridTile {
+    /// Position in pixels [x, y]
+    pub px: [i32; 2],
+    /// Tile asset source ID
+    pub src: String,
+    /// Tile variation/connectivity index (nullable - defaults to 0)
+    #[serde(default)]
+    pub t: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,6 +180,8 @@ impl AssetGateway {
 
         for layer in &ldtk_level.layers {
             if layer.layer_type == "Entities" {
+                // LDtk entity positions are already center-based (default pivot is 0.5, 0.5)
+                // so use px values directly without offset
                 for entity in &layer.entities {
                     let mut info = EntitySpawnInfo {
                         identifier: entity.identifier.clone(),
@@ -282,6 +298,237 @@ impl AssetGateway {
 
         Ok(project.levels.iter().map(|l| l.identifier.clone()).collect())
     }
+
+    /// Extract grid tiles from level (terrain, paths, etc.)
+    ///
+    /// DEPRECATED: Use get_tiles_with_manifest for proper sprite index calculation.
+    /// This version passes the raw seed as variation, which is incorrect.
+    pub fn get_tiles(json: &str, level_name: &str) -> Result<Vec<TileInstance>, String> {
+        // Default tile definitions - fallback when no manifest provided
+        let empty_defs: HashMap<String, TileDefinition> = HashMap::new();
+        Self::get_tiles_with_manifest(json, level_name, &empty_defs)
+    }
+
+    /// Extract grid tiles from level with proper sprite index calculation.
+    ///
+    /// This method replicates the MapEditor's rendering logic:
+    /// - Terrain tiles: sprite_index = getVariationFromSeed(seed, variations)
+    /// - Path tiles (connectivity-based): sprite_index = bitmask - 1 (0-14)
+    ///
+    /// The tile_defs map should contain TileDefinition for each tile asset.
+    pub fn get_tiles_with_manifest(
+        json: &str,
+        level_name: &str,
+        tile_defs: &HashMap<String, TileDefinition>,
+    ) -> Result<Vec<TileInstance>, String> {
+        let project: LdtkProject = serde_json::from_str(json)
+            .map_err(|e| format!("Failed to parse LDtk: {}", e))?;
+
+        let ldtk_level = project
+            .levels
+            .iter()
+            .find(|l| l.identifier == level_name)
+            .ok_or_else(|| format!("Level '{}' not found", level_name))?;
+
+        // Collect all grid tiles from Tiles layers
+        let mut all_grid_tiles: Vec<&LdtkGridTile> = Vec::new();
+        let mut grid_size = 128u32;
+
+        for layer in &ldtk_level.layers {
+            if layer.layer_type == "Tiles" || layer.identifier == "Tiles" || layer.identifier == "Terrain" {
+                grid_size = layer.grid_size;
+                for grid_tile in &layer.grid_tiles {
+                    all_grid_tiles.push(grid_tile);
+                }
+            }
+        }
+
+        // Helper to check terrain type
+        let get_terrain_type = |asset_id: &str| -> Option<&str> {
+            tile_defs.get(asset_id).and_then(|d| d.terrain_type.as_deref())
+        };
+
+        // Build SEPARATE position grids for water paths vs ground paths
+        // This handles overlapping tiles (e.g., river AND dirt_40px at same position)
+        let mut water_path_grid: HashMap<(i32, i32), &LdtkGridTile> = HashMap::new();
+        let mut ground_path_grid: HashMap<(i32, i32), &LdtkGridTile> = HashMap::new();
+        let mut terrain_grid: HashMap<(i32, i32), &LdtkGridTile> = HashMap::new();
+
+        for grid_tile in &all_grid_tiles {
+            let key = (grid_tile.px[0], grid_tile.px[1]);
+            let tile_def = tile_defs.get(&grid_tile.src);
+            let tile_type = tile_def.and_then(|d| d.tile_type.as_deref());
+            let terrain_type = tile_def.and_then(|d| d.terrain_type.as_deref());
+
+            match tile_type {
+                Some("PATH") | Some("BRIDGE") => {
+                    if terrain_type == Some("WATER") {
+                        water_path_grid.insert(key, *grid_tile);
+                    } else {
+                        ground_path_grid.insert(key, *grid_tile);
+                    }
+                }
+                _ => {
+                    terrain_grid.insert(key, *grid_tile);
+                }
+            }
+        }
+
+        // Determine which tiles are paths (15 variations = connectivity-based)
+        let is_path_tile = |asset_id: &str| -> bool {
+            if let Some(def) = tile_defs.get(asset_id) {
+                def.variations >= 15 || def.tile_type.as_deref() == Some("PATH") || def.tile_type.as_deref() == Some("BRIDGE")
+            } else {
+                false
+            }
+        };
+
+        // Process tiles with proper sprite index calculation
+        let mut tiles = Vec::new();
+
+        for grid_tile in &all_grid_tiles {
+            let asset_id = &grid_tile.src;
+            let seed = grid_tile.t.unwrap_or(0);
+            let x = grid_tile.px[0];
+            let y = grid_tile.px[1];
+
+            let sprite_index = if is_path_tile(asset_id) {
+                // Use the appropriate grid for connectivity calculation
+                let terrain_type = get_terrain_type(asset_id);
+                let path_grid = if terrain_type == Some("WATER") {
+                    &water_path_grid
+                } else {
+                    &ground_path_grid
+                };
+                calculate_path_connectivity(x, y, grid_size as i32, asset_id, path_grid)
+            } else {
+                // Terrain tiles use seeded variation
+                let variations = tile_defs.get(asset_id).map(|d| d.variations).unwrap_or(1);
+                get_variation_from_seed(seed, variations)
+            };
+
+            let tile_def = tile_defs.get(asset_id);
+            let tile_type = tile_def.and_then(|d| d.tile_type.clone());
+            let terrain_type = tile_def.and_then(|d| d.terrain_type.clone());
+            let bridge_asset_id = tile_def.and_then(|d| d.bridge_asset_id.clone());
+
+            tiles.push(TileInstance {
+                position: Vec2::new(x as f32, y as f32),
+                asset_id: asset_id.clone(),
+                sprite_index,
+                size: grid_size as f32,
+                tile_type,
+                terrain_type,
+                bridge_asset_id,
+            });
+        }
+
+        Ok(tiles)
+    }
+
+    /// Parse tile definitions from manifest.json
+    pub fn parse_tile_manifest(json: &str) -> Result<HashMap<String, TileDefinition>, String> {
+        #[derive(Deserialize)]
+        struct Manifest {
+            #[serde(default)]
+            tiles: HashMap<String, TileDefinition>,
+        }
+
+        let manifest: Manifest = serde_json::from_str(json)
+            .map_err(|e| format!("Failed to parse manifest: {}", e))?;
+
+        Ok(manifest.tiles)
+    }
+}
+
+/// A tile instance in the level
+#[derive(Debug, Clone)]
+pub struct TileInstance {
+    /// World position (top-left corner)
+    pub position: Vec2,
+    /// Tile asset ID (e.g., "ocean", "grass")
+    pub asset_id: String,
+    /// Computed sprite index (row * cols + col in the atlas grid)
+    pub sprite_index: u32,
+    /// Tile size in pixels
+    pub size: f32,
+    /// Tile type for layer assignment (e.g., "PATH", "BRIDGE", "TERRAIN")
+    pub tile_type: Option<String>,
+    /// Terrain type (e.g., "LAND", "WATER")
+    pub terrain_type: Option<String>,
+    /// Bridge asset ID for auto-bridge generation when path crosses water
+    pub bridge_asset_id: Option<String>,
+}
+
+/// Tile definition from manifest.json
+#[derive(Debug, Clone, Deserialize)]
+pub struct TileDefinition {
+    pub id: String,
+    #[serde(default)]
+    pub variations: u32,
+    #[serde(rename = "tileType", default)]
+    pub tile_type: Option<String>,
+    #[serde(rename = "terrainType", default)]
+    pub terrain_type: Option<String>,
+    #[serde(rename = "bridgeAssetId", default)]
+    pub bridge_asset_id: Option<String>,
+    #[serde(rename = "atlasWidth", default)]
+    pub atlas_width: u32,
+    #[serde(rename = "spriteSize", default = "default_sprite_size")]
+    pub sprite_size: u32,
+}
+
+fn default_sprite_size() -> u32 { 128 }
+
+/// Replicate the MapEditor's getVariationFromSeed function
+/// Returns deterministic pseudo-random variation based on seed
+fn get_variation_from_seed(seed: u32, variations: u32) -> u32 {
+    if variations <= 1 {
+        return 0;
+    }
+    // Same algorithm as TypeScript: Math.sin(seed * 9999) * 10000 → fractional part → scale
+    let x = (seed as f64 * 9999.0).sin() * 10000.0;
+    let rand = x - x.floor();
+    (rand * variations as f64).floor() as u32
+}
+
+/// Calculate path connectivity variation (0-14) based on neighboring paths
+/// Bitmask: N=8, S=4, W=2, E=1
+fn calculate_path_connectivity(
+    x: i32,
+    y: i32,
+    grid_size: i32,
+    asset_id: &str,
+    path_grid: &HashMap<(i32, i32), &LdtkGridTile>,
+) -> u32 {
+    let mut bits = 0u32;
+
+    // Check North (y - grid_size)
+    if let Some(neighbor) = path_grid.get(&(x, y - grid_size)) {
+        if neighbor.src == asset_id {
+            bits |= 8;
+        }
+    }
+    // Check South (y + grid_size)
+    if let Some(neighbor) = path_grid.get(&(x, y + grid_size)) {
+        if neighbor.src == asset_id {
+            bits |= 4;
+        }
+    }
+    // Check West (x - grid_size)
+    if let Some(neighbor) = path_grid.get(&(x - grid_size, y)) {
+        if neighbor.src == asset_id {
+            bits |= 2;
+        }
+    }
+    // Check East (x + grid_size)
+    if let Some(neighbor) = path_grid.get(&(x + grid_size, y)) {
+        if neighbor.src == asset_id {
+            bits |= 1;
+        }
+    }
+
+    if bits == 0 { 0 } else { bits - 1 }
 }
 
 #[cfg(test)]
@@ -383,6 +630,7 @@ mod tests {
         assert_eq!(spawns.len(), 2);
 
         // Check first entity (Soldier with full custom fields)
+        // LDtk entity positions are center-based, used directly
         let soldier = &spawns[0];
         assert_eq!(soldier.identifier, "Soldier");
         assert_eq!(soldier.position, Vec2::new(64.0, 64.0));
@@ -396,6 +644,7 @@ mod tests {
         );
 
         // Check second entity (Alien with camelCase field names)
+        // LDtk entity positions are center-based, used directly
         let alien = &spawns[1];
         assert_eq!(alien.identifier, "Alien");
         assert_eq!(alien.position, Vec2::new(256.0, 128.0));

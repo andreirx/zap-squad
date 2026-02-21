@@ -15,7 +15,7 @@ pub mod engine_gateway;
 pub mod input_adapter;
 pub mod script_bindings;
 
-pub use asset_gateway::{AssetGateway, EntitySpawnInfo};
+pub use asset_gateway::{AssetGateway, EntitySpawnInfo, TileDefinition, TileInstance};
 pub use asset_manifest::{AssetManifest, BodyDefinition, WeaponDefinition, WeaponType};
 pub use composite_renderer::CompositeRenderer;
 pub use engine_gateway::EngineGateway;

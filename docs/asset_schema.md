@@ -293,6 +293,11 @@ mods/levels/{name}.json
 - [x] **Tile Type switching** - TILE, PATH, BRIDGE
 - [x] **Terrain Type** - LAND, WATER
 - [x] **Random Fill** - fill with random picks from 3 colors
+- [x] **Transition Auto-Generation** - on save, generates 8 transition tiles from tile_0 only (N, NE, E, SE, S, SW, W, NW)
+  - 32px solid edge + 32px fade for cardinal directions
+  - Circular fade for corner directions
+  - Output: `tile_0_transition_{dir}.png`
+  - Used by renderers for terrain blending between different tile types
 - [x] **Two-Step Path Generation** - separate background and path drawing:
   - **Step 1: Fill All Backgrounds** - fills all 15 variations with terrain colors (no paths)
   - **Step 2: Draw Paths on All 15** - draws paths ON TOP of existing pixels with edge fading

@@ -15,7 +15,7 @@ Create a **programmable 2D game engine** that enables kids to learn coding by ma
 - **A* Pathfinding:** NPCs navigate around obstacles
 - **Group Movement:** Party members follow the leader
 - **Physics:** Rapier2D for collisions and dynamics
-- **Rendering:** WebGPU with HDR/EDR support via zap-engine
+- **Rendering:** WebGPU with HDR/EDR support via zap-engine, fallback to js renderer if not supported
 
 ---
 
