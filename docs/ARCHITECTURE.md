@@ -275,6 +275,26 @@ make build          # Full build (wasm + atlases)
 make dev            # Start dev server
 ```
 
+## Freedom Board (Infinite Sparse Canvas)
+
+A second WASM application alongside the main game, providing an infinite sparse tile canvas for world editing and gameplay.
+
+**Core** (`core/src/entities/freedom_board/`, `core/src/use_cases/freedom_board/`):
+- `SparseWorld`: HashMap<ChunkCoord, Chunk> + QuadTreeIndex. Pure Rust, no framework deps.
+- Edit use cases: place, erase, fill, line (Bresenham), flood fill (BFS). All return invertible `EditResult` for undo/redo.
+- Query use cases: viewport query, LOD query, connectivity bitmask.
+
+**WASM** (`infrastructure/wasm-canvas/`):
+- `FreedomBoardGame` implements zap-engine `Game` trait. Translates custom events from React into core mutations, spawns engine entities for rendering.
+
+**UI** (`ui/canvas/`):
+- React app on port 5179. InfiniteCanvas component owns camera, dispatches events to WASM.
+- Loads tile manifest from shared assets (`ui/web/public/assets/`), never copies.
+
+See `docs/freedom-board.md` for full documentation.
+
+---
+
 ## Key Decisions
 
 1. **One atlas per asset** (not one giant atlas) - enables incremental updates
@@ -282,3 +302,4 @@ make dev            # Start dev server
 3. **Manifest-driven** - single source of truth for sprite locations
 4. **StorageGateway abstraction** - same code for dev/prod
 5. **LDtk-compatible format** - can use LDtk for advanced level editing
+6. **Hybrid HashMap+Quadtree for SparseWorld** - O(1) point ops + O(log N) spatial (see ADR-005)

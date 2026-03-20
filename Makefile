@@ -1,4 +1,4 @@
-.PHONY: test lint build clean wasm dev check pack-sprites tools-install import-hexmanos bake-atlases
+.PHONY: test lint build clean wasm wasm-canvas dev dev-canvas check pack-sprites tools-install import-hexmanos bake-atlases
 
 # Run all tests (core must pass without WASM)
 test:
@@ -9,14 +9,19 @@ test:
 check:
 	cargo check --workspace
 	cargo check -p zapsquad-wasm --target wasm32-unknown-unknown
+	cargo check -p freedom-board-wasm --target wasm32-unknown-unknown
 
 # Lint with clippy
 lint:
 	cargo clippy --workspace -- -D warnings
 
-# Build WASM (outputs to src/wasm where the app imports from)
+# Build WASM for zap-squad game (outputs to ui/web/src/wasm)
 wasm:
 	wasm-pack build infrastructure/wasm --target web --out-dir ../../ui/web/src/wasm
+
+# Build WASM for freedom-board canvas (outputs to ui/canvas/src/wasm)
+wasm-canvas:
+	wasm-pack build infrastructure/wasm-canvas --target web --out-dir ../../ui/canvas/src/wasm
 
 # Install tools dependencies
 tools-install:
@@ -32,6 +37,10 @@ build: wasm pack-sprites
 # Development server (hot-reload packs sprites in browser, no need for node tool)
 dev: wasm
 	cd ui/web && npm run dev
+
+# Freedom-board dev server
+dev-canvas: wasm-canvas
+	cd ui/canvas && npm run dev
 
 # Full development setup with initial sprite pack
 dev-full: build
@@ -50,6 +59,8 @@ clean:
 	cargo clean
 	rm -rf ui/web/pkg
 	rm -rf ui/web/src/wasm
+	rm -rf ui/canvas/src/wasm
 	rm -rf ui/web/dist
+	rm -rf ui/canvas/dist
 	rm -rf ui/web/public/assets/*.png
 	rm -rf tools/node_modules

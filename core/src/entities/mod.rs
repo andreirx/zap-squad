@@ -9,6 +9,10 @@ mod game_state;
 mod level;
 mod script;
 
+/// Freedom Board — infinite sparse tile canvas.
+/// Self-contained module, no dependencies on other entities.
+pub mod freedom_board;
+
 pub use actor::{Actor, ActorId};
 pub use composite_actor::{AnimationState, CompositeActor, Direction, VisualState};
 pub use game_state::GameState;

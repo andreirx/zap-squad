@@ -2,6 +2,9 @@
 /target
 Cargo.lock
 
+# Python
+.venv/
+
 # UI & WASM
 node_modules/
 dist/

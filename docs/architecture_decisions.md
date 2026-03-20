@@ -115,3 +115,34 @@ zap-squad/
 - Editor protected by authentication
 - Shared Rust core ensures consistency
 - Slightly more complex build/deploy pipeline
+
+---
+
+## ADR-005: Freedom Board — Hybrid HashMap + Quadtree Spatial Storage
+**Date:** 2026-03-20
+**Status:** Accepted
+
+### Context
+Freedom Board is an infinite sparse tile canvas (editor + runtime). Needs O(1) point access for tile placement/removal and O(log N) range queries for viewport culling. The grid is unbounded (negative and positive coordinates). Millions of tiles may exist.
+
+### Options Considered
+1. **Dense 2D array** — O(1) access but wastes memory on sparse worlds, requires fixed bounds.
+2. **HashMap<TileCoord, TilePlacement>** — O(1) point access, no spatial queries, poor cache locality for neighbor lookups.
+3. **Quadtree only** — Good spatial queries, O(log N) point access (slower than needed for per-frame tile placement).
+4. **Hybrid: HashMap<ChunkCoord, Chunk> + QuadTreeIndex** — O(1) point access via chunk lookup + array index, O(log N) range queries via quadtree over chunk coordinates. Cache-friendly: 32x32 chunk (8KB) fits L1 cache for neighbor lookups.
+
+### Decision
+Option 4: Hybrid HashMap + Quadtree.
+
+- Primary storage: `HashMap<ChunkCoord, Chunk>` where Chunk is a flat `[Option<TilePlacement>; 1024]`.
+- Spatial index: `QuadTreeIndex` over non-empty chunk coordinates with LOD aggregation.
+- Chunk size 32x32 chosen for L1 cache fit (8KB per chunk at 8 bytes per `Option<TilePlacement>`).
+- Quadtree grows dynamically by wrapping the old root as a quadrant of a new doubled root.
+
+### Consequences
+- Point operations (place/erase) are O(1): chunk lookup + array index.
+- Viewport queries are O(k + log N): quadtree prunes, then iterate chunk tiles.
+- Memory proportional to occupied area only (sparse). Empty chunks are never allocated.
+- LOD rendering infrastructure ready (aggregate color/density propagated through quadtree).
+- Negative coordinates work correctly via Euclidean division.
+- Trade-off: two data structures must stay synchronized (chunk insert/remove must update quadtree).
