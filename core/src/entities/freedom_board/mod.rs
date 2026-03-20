@@ -28,6 +28,6 @@ pub mod tile_placement;
 // Re-export the public API
 pub use chunk::{Chunk, ChunkLOD};
 pub use coords::{ChunkCoord, TileCoord, CHUNK_AREA, CHUNK_SIZE};
-pub use quad_index::{ChunkAABB, LODResult, NodeAggregate, QuadTreeIndex};
+pub use quad_index::{ChunkAABB, LODResult, NodeAggregate, QuadDebugNode, QuadTreeIndex};
 pub use sparse_world::{SparseWorld, VisibleTile};
 pub use tile_placement::TilePlacement;

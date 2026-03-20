@@ -19,7 +19,7 @@ It extends the existing zap-squad codebase without modifying existing code. All 
 |    place_tile, erase_tile, flood_fill, query_viewport,            |
 |    connectivity_bitmask, EditResult (undo/redo)                   |
 +-------------------------------------------------------------------+
-|                     INFRASTRUCTURE (Volatile)                      |
+|                     INFRASTRUCTURE (Volatile)                     |
 |  infrastructure/wasm-canvas/  (Rust, WASM)                        |
 |    FreedomBoardGame: Game trait impl, event dispatch,             |
 |    entity spawning, asset registry, camera state mirror           |

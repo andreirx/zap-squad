@@ -22,6 +22,10 @@ const TOOL_IDS: Record<Tool, number> = {
   fill: 3,
 };
 
+/** Engine game world dimensions. Must match GameConfig in lib.rs. */
+const GAME_WIDTH = 1920;
+const GAME_HEIGHT = 1080;
+
 interface InfiniteCanvasProps {
   tool: Tool;
   activeAssetId: number;
@@ -36,14 +40,26 @@ interface InfiniteCanvasProps {
  *
  * Camera model:
  * - cameraX, cameraY: top-left of viewport in tile coordinates (floats).
- * - zoom: pixels per tile on screen. Default 64 = each tile is 64x64 CSS px.
+ * - zoom: game-world-pixels per tile. Default 64.
  *
- * Screen-to-tile conversion:
- *   tileX = screenX / zoom + cameraX
- *   tileY = screenY / zoom + cameraY
+ * Coordinate systems:
+ * - CSS pixels: browser layout coordinates (e.clientX - rect.left).
+ * - Game-world pixels: engine's internal coordinate system (GAME_WIDTH x GAME_HEIGHT
+ *   base, aspect-preserved to fit container).
+ * - Tile coordinates: integer grid positions.
  *
- * Pan: middle-mouse drag, or any drag when tool=pan.
- * Zoom: scroll wheel, centered on cursor position.
+ * The engine uses an aspect-preserving orthographic projection. The uniform
+ * scale factor converts CSS pixels to game-world pixels:
+ *
+ *   scale = GAME_HEIGHT / containerH   (if container is wider than game aspect)
+ *   scale = GAME_WIDTH / containerW    (if container is taller)
+ *
+ * All coordinate math uses this scale factor to stay in the game-world
+ * coordinate system, matching the WASM rendering pipeline exactly.
+ *
+ * Grid, origin crosshair, and debug overlays are rendered by WASM via the
+ * engine's vector system (ctx.vectors). React handles only input dispatch
+ * and UI chrome (toolbar, status bar, FPS, loading).
  */
 export function InfiniteCanvas({
   tool,
@@ -77,16 +93,45 @@ export function InfiniteCanvas({
     wasmUrl: '/src/wasm/freedom_board_wasm.js',
     assetsUrl: `${ASSETS_URL}/assets.json`,
     assetBasePath: `${ASSETS_URL}/`,
-    gameWidth: 1920,
-    gameHeight: 1080,
+    gameWidth: GAME_WIDTH,
+    gameHeight: GAME_HEIGHT,
     force2D: true, // Canvas2D until WebGPU texture size issue is resolved
     onGameEvent: onGameEvent,
   });
 
+  // ── Projection scale factor ─────────────────────────────────────
+  //
+  // The engine maps GAME_WIDTH x GAME_HEIGHT to the canvas via an
+  // aspect-preserving orthographic projection. Because the projection
+  // preserves aspect ratio, scaleX == scaleY. This single factor
+  // converts CSS pixel distances to game-world pixel distances.
+  //
+  // Returns: { scale, projW, projH }
+  //   scale:  CSS pixels → game-world pixels multiplier
+  //   projW:  visible game-world width  (>= GAME_WIDTH)
+  //   projH:  visible game-world height (>= GAME_HEIGHT)
+  const getProjection = useCallback(() => {
+    const el = containerRef.current;
+    if (!el) return { scale: 1, projW: GAME_WIDTH, projH: GAME_HEIGHT };
+    const cw = el.clientWidth;
+    const ch = el.clientHeight;
+    if (cw === 0 || ch === 0) return { scale: 1, projW: GAME_WIDTH, projH: GAME_HEIGHT };
+
+    const containerAspect = cw / ch;
+    const gameAspect = GAME_WIDTH / GAME_HEIGHT;
+
+    if (containerAspect > gameAspect) {
+      // Container wider than game → height-limited
+      const projW = GAME_HEIGHT * containerAspect;
+      return { scale: GAME_HEIGHT / ch, projW, projH: GAME_HEIGHT };
+    } else {
+      // Container taller than game → width-limited
+      const projH = GAME_WIDTH / containerAspect;
+      return { scale: GAME_WIDTH / cw, projW: GAME_WIDTH, projH };
+    }
+  }, []);
+
   // ── Send tile registry to WASM when both engine and manifest are ready ─
-  // Uses 'reload_game_manifest' message type — the engine worker dispatches
-  // this to the wasm reload_game_manifest() export. For freedom-board, the
-  // "game manifest" is the tile registry JSON array.
   useEffect(() => {
     if (!isReady || tileRegistry.length === 0 || registrySentRef.current) return;
     const json = JSON.stringify(tileRegistry);
@@ -102,18 +147,17 @@ export function InfiniteCanvas({
     onCameraChange({ x: cam.x, y: cam.y, zoom: cam.zoom });
   }, [sendEvent, onCameraChange]);
 
-  // ── Send viewport size to WASM ────────────────────────────────────
+  // ── Send viewport size to WASM (in game-world coordinates) ─────────
   const syncViewport = useCallback(() => {
-    const el = containerRef.current;
-    if (!el) return;
+    const { projW, projH } = getProjection();
     sendEvent({
       type: 'custom',
       kind: EVENTS.VIEWPORT_SIZE,
-      a: el.clientWidth,
-      b: el.clientHeight,
+      a: projW,
+      b: projH,
       c: 0,
     });
-  }, [sendEvent]);
+  }, [sendEvent, getProjection]);
 
   // ── Initial sync when engine is ready ─────────────────────────────
   useEffect(() => {
@@ -146,14 +190,21 @@ export function InfiniteCanvas({
     return () => observer.disconnect();
   }, [isReady, syncViewport]);
 
-  // ── Screen-to-tile conversion ─────────────────────────────────────
-  const screenToTile = useCallback((screenX: number, screenY: number) => {
+  // ── Screen-to-tile conversion (CSS pixels → tile coords) ─────────
+  //
+  // Converts CSS pixel position (relative to container) to tile
+  // coordinates by first mapping through the projection scale factor
+  // into game-world space, then dividing by zoom.
+  const screenToTile = useCallback((cssX: number, cssY: number) => {
     const cam = cameraRef.current;
+    const { scale } = getProjection();
+    const gameX = cssX * scale;
+    const gameY = cssY * scale;
     return {
-      x: Math.floor(screenX / cam.zoom + cam.x),
-      y: Math.floor(screenY / cam.zoom + cam.y),
+      x: Math.floor(gameX / cam.zoom + cam.x),
+      y: Math.floor(gameY / cam.zoom + cam.y),
     };
-  }, []);
+  }, [getProjection]);
 
   // ── Mouse handlers ────────────────────────────────────────────────
 
@@ -201,9 +252,11 @@ export function InfiniteCanvas({
     if (!drag?.active) return;
 
     if (drag.isPan) {
+      // Pan: convert CSS pixel delta to tile delta via projection scale
+      const { scale } = getProjection();
       const cam = cameraRef.current;
-      const dx = (e.clientX - drag.startScreenX) / cam.zoom;
-      const dy = (e.clientY - drag.startScreenY) / cam.zoom;
+      const dx = (e.clientX - drag.startScreenX) * scale / cam.zoom;
+      const dy = (e.clientY - drag.startScreenY) * scale / cam.zoom;
       cameraRef.current = {
         ...cam,
         x: drag.startCameraX - dx,
@@ -221,7 +274,7 @@ export function InfiniteCanvas({
         }
       }
     }
-  }, [tool, activeAssetId, isReady, sendEvent, screenToTile, syncCamera, onCursorTileChange]);
+  }, [tool, activeAssetId, isReady, sendEvent, screenToTile, syncCamera, onCursorTileChange, getProjection]);
 
   const handlePointerUp = useCallback((e: React.PointerEvent) => {
     dragRef.current = null;
@@ -239,27 +292,26 @@ export function InfiniteCanvas({
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
 
+    // Convert CSS cursor position to game-world position
+    const { scale } = getProjection();
+    const gameX = sx * scale;
+    const gameY = sy * scale;
+
     const cam = cameraRef.current;
     const oldZoom = cam.zoom;
 
     const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
     const newZoom = Math.min(256, Math.max(4, oldZoom * factor));
 
-    // Zoom centered on cursor position
-    const tileX = sx / oldZoom + cam.x;
-    const tileY = sy / oldZoom + cam.y;
-    const newCamX = tileX - sx / newZoom;
-    const newCamY = tileY - sy / newZoom;
+    // Zoom centered on cursor: keep the tile under cursor stationary
+    const tileX = gameX / oldZoom + cam.x;
+    const tileY = gameY / oldZoom + cam.y;
+    const newCamX = tileX - gameX / newZoom;
+    const newCamY = tileY - gameY / newZoom;
 
     cameraRef.current = { x: newCamX, y: newCamY, zoom: newZoom };
     syncCamera();
-  }, [syncCamera]);
-
-  // ── Grid overlay ──────────────────────────────────────────────────
-  const cam = cameraRef.current;
-  const gridSize = cam.zoom;
-  const gridOffsetX = -(cam.x % 1) * gridSize;
-  const gridOffsetY = -(cam.y % 1) * gridSize;
+  }, [syncCamera, getProjection]);
 
   return (
     <div
@@ -283,34 +335,7 @@ export function InfiniteCanvas({
         }}
       />
 
-      {gridSize >= 16 && (
-        <div
-          style={{
-            position: 'absolute',
-            inset: 0,
-            pointerEvents: 'none',
-            backgroundImage: `
-              linear-gradient(to right, rgba(255,255,255,0.06) 1px, transparent 1px),
-              linear-gradient(to bottom, rgba(255,255,255,0.06) 1px, transparent 1px)
-            `,
-            backgroundSize: `${gridSize}px ${gridSize}px`,
-            backgroundPosition: `${gridOffsetX}px ${gridOffsetY}px`,
-          }}
-        />
-      )}
-
-      {/* Origin crosshair */}
-      <div style={{
-        position: 'absolute', left: -cam.x * gridSize, top: 0,
-        width: 1, height: '100%',
-        background: 'rgba(233, 69, 96, 0.3)', pointerEvents: 'none',
-      }} />
-      <div style={{
-        position: 'absolute', left: 0, top: -cam.y * gridSize,
-        width: '100%', height: 1,
-        background: 'rgba(233, 69, 96, 0.3)', pointerEvents: 'none',
-      }} />
-
+      {/* FPS counter — UI chrome, not coordinate-dependent */}
       <div style={{
         position: 'absolute', top: 4, right: 8,
         fontSize: 10, color: '#556677', fontFamily: 'monospace', pointerEvents: 'none',

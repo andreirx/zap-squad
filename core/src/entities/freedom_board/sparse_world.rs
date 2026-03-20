@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use super::chunk::Chunk;
 use super::coords::{ChunkCoord, TileCoord};
-use super::quad_index::{ChunkAABB, LODResult, QuadTreeIndex};
+use super::quad_index::{ChunkAABB, LODResult, QuadDebugNode, QuadTreeIndex};
 use super::tile_placement::TilePlacement;
 
 /// A tile visible in the current viewport, with its world position.
@@ -225,6 +225,14 @@ impl SparseWorld {
     /// Changes every time a tile is placed or removed.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Debug visualization data for the quadtree spatial index.
+    ///
+    /// Returns all node bounds and metadata. For rendering quadtree
+    /// boundaries during development.
+    pub fn debug_quadtree_nodes(&self) -> Vec<QuadDebugNode> {
+        self.index.debug_nodes()
     }
 
     /// Bounding box of all occupied chunks, or `None` if empty.

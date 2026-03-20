@@ -165,6 +165,18 @@ impl NodeAggregate {
 
 // ── LOD Result ─────────────────────────────────────────────────────────────
 
+/// Debug visualization data for a single quadtree node.
+///
+/// Used by the rendering layer to draw quadtree boundaries during development.
+/// Read-only diagnostic — does not affect tree behavior.
+#[derive(Clone, Debug)]
+pub struct QuadDebugNode {
+    pub bounds: ChunkAABB,
+    pub depth: u32,
+    pub chunk_count: u32,
+    pub is_leaf: bool,
+}
+
 /// Result of an adaptive LOD query.
 pub enum LODResult {
     /// Render individual tiles from this chunk (close zoom).
@@ -307,6 +319,32 @@ impl QuadTreeIndex {
             Self::collect_rect(root, rect, &mut result);
         }
         result
+    }
+
+    /// Collect debug visualization data for all nodes in the tree.
+    ///
+    /// Returns every node's bounds, depth, and occupancy. For rendering
+    /// quadtree boundaries during development.
+    pub fn debug_nodes(&self) -> Vec<QuadDebugNode> {
+        let mut result = Vec::new();
+        if let Some(root) = &self.root {
+            Self::collect_debug_nodes(root, 0, &mut result);
+        }
+        result
+    }
+
+    fn collect_debug_nodes(node: &QuadNode, depth: u32, result: &mut Vec<QuadDebugNode>) {
+        result.push(QuadDebugNode {
+            bounds: node.bounds,
+            depth,
+            chunk_count: node.aggregate.chunk_count,
+            is_leaf: matches!(node.content, NodeContent::Leaf { .. }),
+        });
+        if let NodeContent::Branch { children } = &node.content {
+            for child in children.iter().flatten() {
+                Self::collect_debug_nodes(child, depth + 1, result);
+            }
+        }
     }
 
     /// Adaptive LOD query: returns either individual chunk coords (for close zoom)
