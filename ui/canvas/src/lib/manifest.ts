@@ -23,15 +23,20 @@ interface Manifest {
     hasTransitions?: boolean;
     tileType?: string;
     terrainType?: string;
+    bridgeAssetId?: string;
   }>;
 }
 
 /**
  * Tile entry for the WASM registry. Array index = asset_id (u16).
+ * Includes tile type metadata for path connectivity and bridge auto-placement.
  */
 export interface TileRegistryEntry {
   name: string;
   variations: number;
+  tileType: string;       // "TILE" | "PATH" | "BRIDGE"
+  terrainType: string;    // "LAND" | "WATER"
+  bridgeAssetId?: string; // For LAND PATH: which bridge asset to use
 }
 
 /**
@@ -66,11 +71,20 @@ export async function loadTileManifest(): Promise<{
     };
   });
 
-  // Registry for WASM: same order, minimal data
-  const registry: TileRegistryEntry[] = tiles.map(t => ({
-    name: t.id,
-    variations: t.variations,
-  }));
+  // Registry for WASM: same order, includes type metadata for path/bridge rendering
+  const registry: TileRegistryEntry[] = sortedIds.map(id => {
+    const t = manifest.tiles[id];
+    const entry: TileRegistryEntry = {
+      name: t.id,
+      variations: t.variations ?? 1,
+      tileType: t.tileType ?? 'TILE',
+      terrainType: t.terrainType ?? 'LAND',
+    };
+    if (t.bridgeAssetId) {
+      entry.bridgeAssetId = t.bridgeAssetId;
+    }
+    return entry;
+  });
 
   return { tiles, registry };
 }

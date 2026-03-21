@@ -65,12 +65,12 @@ What occupies a single cell. Deliberately compact:
 struct TilePlacement {    // 6 bytes (with u16 alignment padding)
     asset_id: u16,        // index into tile registry
     variant: u8,          // visual variation or connectivity bitmask
-    layer: u8,            // render layer 0-5
+    layer: u8,            // storage layer 0-7 (also indexes into chunk layer slots)
     flags: u8,            // bitfield: flip_x(7), flip_y(6), rotation(5-4), reserved(3-0)
 }
 ```
 
-`Option<TilePlacement>` = **8 bytes**. A full chunk = `8 * 1024 = 8,192 bytes` = fits in L1 cache (32-64KB typical). This matters for neighbor lookups during transition calculations, which access adjacent cells in rapid succession.
+`Option<TilePlacement>` = **8 bytes**. Each cell has `MAX_LAYERS` (8) slots. A full chunk = `8 * 8 * 1024 = 65,536 bytes` (64 KB). Exceeds 32 KB L1 on x86 but fits Apple Silicon's 64-128 KB L1 data cache.
 
 The `flags` bitfield encodes transformations without separate fields:
 - Bit 7: flip_x
@@ -80,22 +80,34 @@ The `flags` bitfield encodes transformations without separate fields:
 
 ### Chunk (`chunk.rs`)
 
-A 32x32 block of `Option<TilePlacement>`. The fundamental storage unit.
+A 32x32 block of layered `Option<TilePlacement>`. The fundamental storage unit.
 
 ```rust
 struct Chunk {
-    tiles: [Option<TilePlacement>; 1024],  // flat array, row-major
-    tile_count: u16,                        // maintained on set/remove
-    dirty: bool,                            // LOD recomputation flag
-    lod: ChunkLOD,                          // cached level-of-detail summary
+    tiles: [[Option<TilePlacement>; MAX_LAYERS]; 1024],  // [cell_index][layer]
+    tile_count: u16,                                      // total occupied slots
+    dirty: bool,                                          // LOD recomputation flag
+    lod: ChunkLOD,                                        // cached level-of-detail
 }
 ```
 
+Each cell holds up to `MAX_LAYERS` (8) tiles stacked vertically, indexed by `TilePlacement.layer`:
+
+| Layer | Semantic       | Tile Types              | Render Layer   |
+|-------|---------------|-------------------------|----------------|
+| 0     | Ground        | Terrain (grass, dirt)    | Background     |
+| 1     | Water         | Rivers, oceans          | Terrain        |
+| 2     | Bridge        | Auto-placed bridges     | Objects        |
+| 3     | Path          | Roads, land paths       | Foreground     |
+| 4     | Objects       | Decorations             | VFX            |
+| 5-7   | Characters/UI | Characters, HUD overlays| UI             |
+
 Key properties:
-- **O(1) access**: `index = ly * 32 + lx`
-- **Auto-cleanup**: When `tile_count` reaches 0, `SparseWorld` drops the chunk and removes it from the quadtree
+- **O(1) access**: `tiles[ly * 32 + lx][layer]`
+- **Layer stacking**: Multiple tiles at the same (x,y) on different layers render in order
+- **Auto-cleanup**: When `tile_count` reaches 0 (no tiles in any layer of any cell), chunk is dropped
 - **Dirty tracking**: `dirty` flag set on every mutation, cleared after LOD recomputation
-- **LOD cache**: `ChunkLOD` stores `dominant_color`, `density` (tiles/area), `top_layer` for far-zoom aggregate rendering
+- **LOD cache**: `ChunkLOD` stores `dominant_color`, `density`, `top_layer` for far-zoom aggregate rendering
 
 ### QuadTreeIndex (`quad_index.rs`)
 
@@ -241,10 +253,10 @@ The engine renders entities in **screen-pixel coordinates**. WASM converts tile 
 ```
 screen_x = (tile_x + 0.5 - camera_x) * zoom
 screen_y = (tile_y + 0.5 - camera_y) * zoom
-entity_scale = zoom (one tile = zoom pixels)
+entity_scale = zoom * SPRITE_SCALE   (SPRITE_SCALE = 160/128 = 1.25)
 ```
 
-The `+0.5` centers the sprite on the tile cell.
+The `+0.5` centers the sprite on the tile cell. `SPRITE_SCALE` accounts for feathered sprites being 160x160 while the logical tile is 128x128. The 128px content maps to `zoom` screen pixels; the 16px feather extends past the cell boundary on each side.
 
 `rebuild_visible_entities()`:
 1. Despawn all current tile entities
@@ -467,12 +479,16 @@ Total: **61 tests** covering core entities and use cases.
 | **f32 event precision** | Low | Tile coordinates and asset IDs travel as f32 in the custom event protocol. Safe up to 2^24 (~16M). Not a concern for practical use but worth documenting. |
 | **Deterministic registry ordering** | Medium | Alphabetical sort of tile IDs for asset_id assignment means adding a tile can shift all IDs. Serialized maps must store tile names, not IDs. |
 | **Force2D rendering** | Low | Using Canvas2D fallback due to WebGPU texture size limit. Fix: request `maxTextureDimension2D: 16384` in `requestDevice()`. |
-| **No transition auto-computation** | Medium | `connectivity_bitmask()` exists in core but the WASM layer doesn't auto-compute transitions on tile placement. Current behavior: tiles render base variation only. |
+| **Feathered tiles not in production pipeline** | Medium | `feather_atlases.py` is Python; AWS Lambda/production needs a WASM-based equivalent. Currently a local dev tool only. |
+| **Path connectivity not wired** | Medium | `connectivity_bitmask()` exists in core but WASM doesn't use it. Path tiles render as variation 0 (isolated). |
+| **Bridge auto-placement not wired** | Medium | Core use case not written yet. WASM has no bridge detection. |
+| **Extended tile registry not implemented** | Medium | WASM `TileAssetInfo` has `{name, variations}` only. Needs `tile_type`, `terrain_type`, `bridge_asset_id` for path/bridge rendering. |
+| **Old transition atlases not stripped** | Low | Source tile PNGs still have 9 rows (rows 1-8 are transition sprites). Can be reduced to 1 row once MapEditor and GameCanvas are migrated to feathered edges. |
 | **Fill tool incomplete** | Low | UI sends `PLACE_TILE` for fill. Should trigger `flood_fill()` use case instead. Requires adding a new custom event kind or changing fill behavior in WASM. |
 
 ### Assumptions
 
-1. Tile atlas layout follows the existing convention: N columns (variations) x 9 rows (base + 8 directional transitions).
+1. Tile atlases are feathered: 160x160 sprites with 16px padding, edge_alpha=0.8, feather=8px. Entity scale = zoom * 1.25.
 2. Sprite names in `assets.json` follow `{tile_id}_{index}` format.
 3. The zap-engine worker dispatches `reload_game_manifest` messages to the WASM export of the same name.
 4. SharedArrayBuffer is available (COOP/COEP headers configured).
@@ -483,6 +499,7 @@ Total: **61 tests** covering core entities and use cases.
 1. **No adapters layer**: The WASM crate imports core directly. If Rhai scripting or persistence gateways are added, an adapters layer should be introduced.
 2. **Camera owned by React**: Originally considered WASM-owned camera. React-owned was chosen because the infinite canvas pan/zoom is a UI concern, and React already handles pointer events natively.
 3. **Single-layer tiles**: TilePlacement supports multi-layer (0-5) but the current UI only places on layer 0. Multi-layer editing is a future feature.
+4. **Feathered tile edges replace transitions**: ADR-006. Terrain blending uses pre-baked alpha feathering instead of 8-directional transition sprites. See `docs/tile-rendering-system.md` and `docs/architecture_decisions.md`.
 
 ---
 

@@ -5,10 +5,10 @@
 
 use crate::entities::freedom_board::{
     ChunkAABB, ChunkCoord, LODResult, SparseWorld, TileCoord, TilePlacement, VisibleTile,
-    CHUNK_SIZE,
+    CHUNK_SIZE, MAX_LAYERS,
 };
 
-/// All tiles in a tile-coordinate viewport.
+/// All tiles (across all layers) in a tile-coordinate viewport.
 ///
 /// This is the primary query for close-zoom rendering: get every tile
 /// that might be visible, then build GPU instances from them.
@@ -42,7 +42,7 @@ pub fn query_viewport_lod(
     world.query_lod(viewport_min, viewport_max, pixels_per_chunk, detail_threshold)
 }
 
-/// Get all tiles from a specific chunk, with world coordinates.
+/// Get all tiles (all layers) from a specific chunk, with world coordinates.
 ///
 /// Useful for chunk-level operations like serialization or LOD thumbnail generation.
 pub fn get_chunk_tiles(world: &SparseWorld, chunk: ChunkCoord) -> Vec<VisibleTile> {
@@ -61,7 +61,7 @@ pub fn get_chunk_tiles(world: &SparseWorld, chunk: ChunkCoord) -> Vec<VisibleTil
     }
 }
 
-/// Count tiles in a rectangular region without allocating a result vec.
+/// Count tiles (across all layers) in a rectangular region without allocating a result vec.
 pub fn count_tiles_in_rect(
     world: &SparseWorld,
     min: TileCoord,
@@ -110,39 +110,45 @@ pub fn count_tiles_in_rect(
     count
 }
 
-/// Check if a tile at the given position is walkable.
+/// Check if any layer at the given position has a tile.
 ///
-/// Returns `false` if the position is empty or the tile's layer doesn't
-/// indicate walkability. The walkability interpretation depends on the
-/// game's rules — this is a thin query; the caller defines the policy.
+/// Returns `false` if the position is entirely empty (all layers None).
 pub fn is_occupied(world: &SparseWorld, coord: TileCoord) -> bool {
-    world.get(coord).is_some()
+    let stack = world.get_stack(coord);
+    stack.iter().any(|s| s.is_some())
 }
 
-/// Get the 4-connected neighbor tiles for transition/connectivity calculations.
+/// Check if a specific layer at the given position has a tile.
+pub fn is_occupied_on_layer(world: &SparseWorld, coord: TileCoord, layer: u8) -> bool {
+    world.get(coord, layer).is_some()
+}
+
+/// Get the 4-connected neighbor tiles on a specific layer for
+/// transition/connectivity calculations.
 ///
 /// Returns `[N, E, S, W]` — the same order as the existing MapEditor's
 /// connectivity bitmask (N=8, S=4, W=2, E=1).
 pub fn cardinal_neighbors(
     world: &SparseWorld,
     coord: TileCoord,
+    layer: u8,
 ) -> [Option<TilePlacement>; 4] {
-    world.neighbors_4(coord)
+    world.neighbors_4(coord, layer)
 }
 
-/// Compute a 4-bit connectivity bitmask for a tile.
+/// Compute a 4-bit connectivity bitmask for a tile on a specific layer.
 ///
-/// Bits: N=8, S=4, W=2, E=1. A bit is set if the neighbor exists
-/// and has the same asset_id as the tile at `coord`.
+/// Bits: N=8, S=4, W=2, E=1. A bit is set if the neighbor on the same
+/// layer exists and has the same asset_id as the tile at `coord`.
 ///
-/// Returns 0 if the position is empty.
-pub fn connectivity_bitmask(world: &SparseWorld, coord: TileCoord) -> u8 {
-    let Some(center) = world.get(coord) else {
+/// Returns 0 if the position is empty on this layer.
+pub fn connectivity_bitmask(world: &SparseWorld, coord: TileCoord, layer: u8) -> u8 {
+    let Some(center) = world.get(coord, layer) else {
         return 0;
     };
     let aid = center.asset_id;
 
-    let [n, e, s, w] = world.neighbors_4(coord);
+    let [n, e, s, w] = world.neighbors_4(coord, layer);
 
     let mut bits = 0u8;
     if n.map_or(false, |t| t.asset_id == aid) {
@@ -173,6 +179,10 @@ mod tests {
         TilePlacement::new(id, 0, 0)
     }
 
+    fn tile_on(id: u16, layer: u8) -> TilePlacement {
+        TilePlacement::new(id, 0, layer)
+    }
+
     #[test]
     fn connectivity_cross() {
         let mut world = SparseWorld::new();
@@ -183,7 +193,7 @@ mod tests {
         world.set(tc(5, 6), grass); // S
         world.set(tc(4, 5), grass); // W
 
-        assert_eq!(connectivity_bitmask(&world, tc(5, 5)), 0b1111); // all 4
+        assert_eq!(connectivity_bitmask(&world, tc(5, 5), 0), 0b1111); // all 4
     }
 
     #[test]
@@ -193,7 +203,7 @@ mod tests {
         world.set(tc(5, 5), grass);
         world.set(tc(5, 4), grass); // N only
 
-        assert_eq!(connectivity_bitmask(&world, tc(5, 5)), 0b1000); // N=8
+        assert_eq!(connectivity_bitmask(&world, tc(5, 5), 0), 0b1000); // N=8
     }
 
     #[test]
@@ -202,13 +212,40 @@ mod tests {
         world.set(tc(5, 5), tile(1));
         world.set(tc(5, 4), tile(2)); // different asset — not connected
 
-        assert_eq!(connectivity_bitmask(&world, tc(5, 5)), 0);
+        assert_eq!(connectivity_bitmask(&world, tc(5, 5), 0), 0);
     }
 
     #[test]
     fn connectivity_empty_center() {
         let world = SparseWorld::new();
-        assert_eq!(connectivity_bitmask(&world, tc(0, 0)), 0);
+        assert_eq!(connectivity_bitmask(&world, tc(0, 0), 0), 0);
+    }
+
+    #[test]
+    fn connectivity_layer_specific() {
+        let mut world = SparseWorld::new();
+        // Place paths on layer 3
+        world.set(tc(5, 5), tile_on(10, 3));
+        world.set(tc(5, 4), tile_on(10, 3)); // N on layer 3
+        world.set(tc(6, 5), tile_on(10, 3)); // E on layer 3
+        // Place different tile on layer 0 at north
+        world.set(tc(5, 4), tile_on(99, 0));
+
+        // Layer 3: connected N and E
+        assert_eq!(connectivity_bitmask(&world, tc(5, 5), 3), 0b1001); // N=8, E=1
+        // Layer 0: no tile at center on layer 0
+        assert_eq!(connectivity_bitmask(&world, tc(5, 5), 0), 0);
+    }
+
+    #[test]
+    fn is_occupied_any_layer() {
+        let mut world = SparseWorld::new();
+        assert!(!is_occupied(&world, tc(5, 5)));
+
+        world.set(tc(5, 5), tile_on(1, 3)); // only on layer 3
+        assert!(is_occupied(&world, tc(5, 5)));
+        assert!(!is_occupied_on_layer(&world, tc(5, 5), 0));
+        assert!(is_occupied_on_layer(&world, tc(5, 5), 3));
     }
 
     #[test]
@@ -225,6 +262,20 @@ mod tests {
 
         let count = count_tiles_in_rect(&world, tc(10, 10), tc(50, 50));
         assert_eq!(count, 41 * 41);
+    }
+
+    #[test]
+    fn count_tiles_multi_layer() {
+        let mut world = SparseWorld::new();
+        for x in 0..4 {
+            for y in 0..4 {
+                world.set(tc(x, y), tile_on(1, 0));
+                world.set(tc(x, y), tile_on(2, 3));
+            }
+        }
+        // 16 cells × 2 layers = 32 tiles
+        let count = count_tiles_in_rect(&world, tc(0, 0), tc(3, 3));
+        assert_eq!(count, 32);
     }
 
     #[test]

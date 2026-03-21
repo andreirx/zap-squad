@@ -17,6 +17,18 @@ pub const CHUNK_SIZE: i32 = 32;
 /// Total cells in one chunk (CHUNK_SIZE^2).
 pub const CHUNK_AREA: usize = (CHUNK_SIZE * CHUNK_SIZE) as usize;
 
+/// Maximum number of tile layers per cell.
+///
+/// Each cell can hold up to MAX_LAYERS tiles stacked vertically, indexed by
+/// `TilePlacement.layer`. Memory per chunk: 8 bytes × MAX_LAYERS × CHUNK_AREA.
+///
+/// | MAX_LAYERS | Chunk size | L1 fit (32KB x86) | L1 fit (64KB+ Apple Silicon) |
+/// |------------|------------|-------------------|-------------------------------|
+/// | 1          | 8 KB       | yes               | yes                           |
+/// | 4          | 32 KB      | edge              | yes                           |
+/// | 8          | 64 KB      | no                | yes                           |
+pub const MAX_LAYERS: usize = 8;
+
 /// Position of a single tile on the infinite grid.
 ///
 /// World-space mapping: tile (x, y) occupies the rectangle

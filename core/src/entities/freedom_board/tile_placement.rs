@@ -1,9 +1,10 @@
-//! What occupies a single cell in the infinite grid.
+//! What occupies a single layer slot in the infinite grid.
 //!
 //! `TilePlacement` is deliberately compact (6 bytes due to u16 alignment) because
 //! millions of these may exist simultaneously. With `Option<TilePlacement>`, the
-//! total is 8 bytes per cell. A full 32x32 chunk: 8 * 1024 = 8,192 bytes,
-//! fitting comfortably in L1 cache (typically 32-64KB).
+//! total is 8 bytes per slot. Each cell has `MAX_LAYERS` (8) slots.
+//! A full 32x32 chunk: 8 bytes × 8 layers × 1024 cells = 65,536 bytes (64 KB).
+//! Exceeds 32 KB L1 on x86, fits Apple Silicon's 64-128 KB L1.
 
 use serde::{Deserialize, Serialize};
 

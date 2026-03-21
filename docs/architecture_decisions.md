@@ -129,14 +129,14 @@ Freedom Board is an infinite sparse tile canvas (editor + runtime). Needs O(1) p
 1. **Dense 2D array** — O(1) access but wastes memory on sparse worlds, requires fixed bounds.
 2. **HashMap<TileCoord, TilePlacement>** — O(1) point access, no spatial queries, poor cache locality for neighbor lookups.
 3. **Quadtree only** — Good spatial queries, O(log N) point access (slower than needed for per-frame tile placement).
-4. **Hybrid: HashMap<ChunkCoord, Chunk> + QuadTreeIndex** — O(1) point access via chunk lookup + array index, O(log N) range queries via quadtree over chunk coordinates. Cache-friendly: 32x32 chunk (8KB) fits L1 cache for neighbor lookups.
+4. **Hybrid: HashMap<ChunkCoord, Chunk> + QuadTreeIndex** — O(1) point access via chunk lookup + array index, O(log N) range queries via quadtree over chunk coordinates. Cache-friendly: 32x32 chunk with 8 layers (64KB) fits Apple Silicon L1 cache for neighbor lookups.
 
 ### Decision
 Option 4: Hybrid HashMap + Quadtree.
 
 - Primary storage: `HashMap<ChunkCoord, Chunk>` where Chunk is a flat `[Option<TilePlacement>; 1024]`.
 - Spatial index: `QuadTreeIndex` over non-empty chunk coordinates with LOD aggregation.
-- Chunk size 32x32 chosen for L1 cache fit (8KB per chunk at 8 bytes per `Option<TilePlacement>`).
+- Chunk size 32x32 with MAX_LAYERS=8 per cell. Memory: 8 bytes × 8 layers × 1024 cells = 64KB per chunk. Fits Apple Silicon L1 (64-128KB), exceeds x86 L1 (32KB).
 - Quadtree grows dynamically by wrapping the old root as a quadrant of a new doubled root.
 
 ### Consequences
@@ -146,3 +146,125 @@ Option 4: Hybrid HashMap + Quadtree.
 - LOD rendering infrastructure ready (aggregate color/density propagated through quadtree).
 - Negative coordinates work correctly via Euclidean division.
 - Trade-off: two data structures must stay synchronized (chunk insert/remove must update quadtree).
+
+---
+
+## ADR-006: Feathered Tile Edges Replace Transition Sprites
+**Date:** 2026-03-21
+**Status:** Accepted
+
+### Context
+The original tile rendering system used 8-directional transition sprites (atlas rows 1-8) to blend between different terrain types. This required:
+- Pre-generated transition PNGs per tile type (8 extra atlas rows per tile)
+- A dominance rule (higher asset_id wins) to decide which tile's transition to draw
+- Transition entity spawning (up to 8 extra entities per visible tile)
+- Corner-case handling for multi-type junctions and buffer zones
+
+The system worked but was complex, brittle, and expensive in entity count.
+
+### Options Considered
+1. **Keep transition sprites** — Proven, but requires 8x atlas space, dominance logic, corner cases.
+2. **Runtime shader blending** — Per-pixel blend at tile boundaries. Clean but requires WebGPU (not available while force2D) and engine modifications.
+3. **Feathered tile edges** — Pre-bake an alpha gradient into the edges of each sprite at atlas conversion time. Adjacent tiles' feathered edges overlap via standard source-over compositing. No transition logic, no extra entities, no dominance rules.
+
+### Decision
+Option 3: Feathered tile edges, applied at atlas conversion time.
+
+**Sprite geometry:** 128x128 logical tiles → 160x160 feathered sprites (16px padding per side). The original content sits at pixels [16,16] to [143,143]. The 16px padding is filled with mirrored edge pixels and alpha-faded.
+
+**Alpha profile (asymmetric, optimized for source-over compositing):**
+```
+Inside band:   100% → edge_alpha   over feather_width pixels
+Outside band:  edge_alpha → 0%     over feather_width pixels
+```
+
+**Parameters:**
+- `feather_width = 8` (configurable 1-16)
+- `edge_alpha = 0.8` (configurable 0.0-1.0)
+
+**Why asymmetric (not 50% at edge):** Source-over compositing formula `result = a + b*(1-a)` cannot produce 100% from two sub-100% values. At edge_alpha=0.5, same-type seams composite to 75% (visible). At edge_alpha=0.8, they composite to 96% (nearly invisible). The trade-off is that the inside feather band is subtle (100%→80%), but the outside band (80%→0%) still provides visible soft transitions between different tile types.
+
+**Rendering model:** Each tile entity is scaled by `zoom * (160/128)` so the 128px content maps to `zoom` screen pixels and the feather extends past the cell boundary. Entity position stays centered on the tile. No special compositing — standard source-over via Canvas2D `drawImage`.
+
+### Consequences
+**Eliminated:**
+- Atlas rows 1-8 (transition sprites) — atlas files shrink ~89% for terrain tiles
+- Transition generation in `bake-atlases.ts` and TileEditor
+- Dominance rule and 8-directional transition logic in MapEditor and GameCanvas
+- `transition_neighbors()` use case — never needed
+- `has_transitions` flag in tile definitions
+- Up to 8 extra entities per visible tile at terrain boundaries
+
+**Added:**
+- `tools/feather_atlases.py` — converts 128x128 atlases to 160x160 with feathered edges
+- `SPRITE_SCALE = 160/128 = 1.25` constant in WASM renderer
+- `assets_feathered.json` — asset registry pointing to feathered atlas PNGs
+
+**Retained (unchanged):**
+- Path connectivity (4-bit bitmask, 15 variations) — structural, not visual blending
+- Bridge auto-placement — structural overlay, not edge blending
+- Layer ordering — terrain, paths, bridges, entities
+- Core entities (SparseWorld, Chunk, TilePlacement)
+
+**Production pipeline (future):**
+Tile Editor → tile PNGs → `feather_atlases` (Python locally, WASM in AWS) → feathered atlases → Map Editor / Game Renderer / Freedom Board.
+
+**Technical debt:**
+- `feather_atlases.py` is Python; production (AWS) needs a WASM equivalent
+- The existing MapEditor and GameCanvas still use the old transition system; must be migrated
+- Atlas rows 1-8 still exist in the current tile PNGs on disk; can be stripped once all consumers are migrated
+
+---
+
+## ADR-007: Multi-Layer Tile Storage (8 Layers per Cell)
+**Date:** 2026-03-21
+**Status:** Accepted
+
+### Context
+The single-layer SparseWorld stored one `Option<TilePlacement>` per coordinate. Placing a river over grass REPLACED the grass. Multiple visual layers (ground, water, bridges, paths, objects, characters) could not coexist at the same position. This made the rendering system unable to show terrain underneath paths/rivers.
+
+### Options Considered
+1. **Multiple SparseWorlds** — One per layer. No core changes, but N quadtrees, N HashMaps, complex coordination.
+2. **Layer-indexed Chunk** — Change `[Option<TP>; 1024]` to `[[Option<TP>; MAX_LAYERS]; 1024]`. Single quadtree, O(1) access by layer.
+3. **SmallVec per cell** — Variable-size stack per cell. Heap fallback, poor cache locality, no fixed layer ordering.
+
+### Decision
+Option 2: Layer-indexed Chunk with `MAX_LAYERS = 8`.
+
+**Storage layout:** `tiles[cell_index][layer]` — the `TilePlacement.layer` field (which already existed) serves as the array index.
+
+**Memory per chunk:** 8 bytes × 8 layers × 1024 cells = 64 KB.
+- Exceeds 32 KB L1 on x86
+- Fits 64-128 KB L1 on Apple Silicon (primary development target)
+- Fits L2 universally (256 KB+)
+
+**Layer semantics:**
+
+| Layer | Semantic       | Tile Types              |
+|-------|---------------|-------------------------|
+| 0     | Ground        | Terrain (grass, dirt)    |
+| 1     | Water         | Rivers, oceans          |
+| 2     | Bridge        | Auto-placed bridges     |
+| 3     | Path          | Roads, land paths       |
+| 4-7   | Reserved      | Objects, characters, UI  |
+
+**API changes (breaking):**
+- `Chunk::get(lx, ly)` → `Chunk::get(lx, ly, layer)`
+- `Chunk::remove(lx, ly)` → `Chunk::remove(lx, ly, layer)`
+- `SparseWorld::get(coord)` → `SparseWorld::get(coord, layer)`
+- `SparseWorld::remove(coord)` → `SparseWorld::remove(coord, layer)`
+- `SparseWorld::neighbors_4(coord)` → `SparseWorld::neighbors_4(coord, layer)`
+- `erase_tile(world, coord)` → `erase_tile(world, coord, layer)`
+- `connectivity_bitmask(world, coord)` → `connectivity_bitmask(world, coord, layer)`
+- Added: `Chunk::get_stack(lx, ly)`, `SparseWorld::get_stack(coord)`, `is_occupied_on_layer()`
+
+**Rendering:** Single-pass sorted by layer (back-to-front) replaces the 4-pass type-filtered approach. `check_water_underneath()` now does a direct layer lookup (layers 0-1) instead of the neighbor heuristic.
+
+**React UI:** Layer auto-derived from tile type via `tileTypeToLayer()`. No manual layer selector needed yet.
+
+### Consequences
+- Ground is visible underneath rivers, bridges, and paths
+- Tiles on different layers at the same position are independently erasable
+- `tile_count` now counts total occupied layer slots across all cells
+- Connectivity bitmask is layer-specific (paths only connect to same-asset paths on the same layer)
+- 64 KB chunk size may cause cache pressure on x86; monitor if cross-platform performance matters

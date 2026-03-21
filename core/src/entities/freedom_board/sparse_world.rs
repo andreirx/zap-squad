@@ -10,6 +10,8 @@
 //!   cache-friendly for neighbor lookups within a chunk.
 //! - **Spatial index**: `QuadTreeIndex` over non-empty chunks — O(log N) range
 //!   queries, adaptive LOD for far-zoom rendering.
+//! - **Layer stacking**: Each cell holds up to `MAX_LAYERS` (8) tiles, indexed
+//!   by `TilePlacement.layer`. Memory per chunk: 64 KB (8 layers × 8 KB).
 //!
 //! Only chunks containing at least one tile exist. When the last tile in a chunk
 //! is removed, the chunk is dropped and its entry removed from the quadtree.
@@ -17,7 +19,7 @@
 use std::collections::HashMap;
 
 use super::chunk::Chunk;
-use super::coords::{ChunkCoord, TileCoord};
+use super::coords::{ChunkCoord, TileCoord, MAX_LAYERS};
 use super::quad_index::{ChunkAABB, LODResult, QuadDebugNode, QuadTreeIndex};
 use super::tile_placement::TilePlacement;
 
@@ -51,14 +53,27 @@ impl SparseWorld {
 
     // ── Point operations ───────────────────────────────────────────────────
 
-    /// Read tile at the given coordinate. Returns `None` if empty.
-    pub fn get(&self, coord: TileCoord) -> Option<&TilePlacement> {
+    /// Read tile at the given coordinate on a specific layer.
+    /// Returns `None` if the cell or layer slot is empty.
+    pub fn get(&self, coord: TileCoord, layer: u8) -> Option<&TilePlacement> {
         let cc = coord.chunk();
         let (lx, ly) = coord.local();
-        self.chunks.get(&cc)?.get(lx, ly)
+        self.chunks.get(&cc)?.get(lx, ly, layer)
     }
 
-    /// Place a tile. Returns the previous occupant if any.
+    /// Get the full layer stack at a coordinate.
+    /// Returns `[None; MAX_LAYERS]` if the chunk doesn't exist.
+    pub fn get_stack(&self, coord: TileCoord) -> [Option<TilePlacement>; MAX_LAYERS] {
+        let cc = coord.chunk();
+        let (lx, ly) = coord.local();
+        match self.chunks.get(&cc) {
+            Some(chunk) => *chunk.get_stack(lx, ly),
+            None => [None; MAX_LAYERS],
+        }
+    }
+
+    /// Place a tile. The tile's `layer` field determines which slot to use.
+    /// Returns the previous occupant of that slot if any.
     ///
     /// Creates a new chunk if needed. Updates the quadtree index.
     pub fn set(&mut self, coord: TileCoord, tile: TilePlacement) -> Option<TilePlacement> {
@@ -91,15 +106,16 @@ impl SparseWorld {
         old
     }
 
-    /// Remove the tile at the given coordinate. Returns the removed tile if any.
+    /// Remove the tile at the given coordinate on a specific layer.
+    /// Returns the removed tile if any.
     ///
     /// Destroys the chunk if it becomes empty. Updates the quadtree index.
-    pub fn remove(&mut self, coord: TileCoord) -> Option<TilePlacement> {
+    pub fn remove(&mut self, coord: TileCoord, layer: u8) -> Option<TilePlacement> {
         let cc = coord.chunk();
         let (lx, ly) = coord.local();
 
         let chunk = self.chunks.get_mut(&cc)?;
-        let old = chunk.remove(lx, ly)?;
+        let old = chunk.remove(lx, ly, layer)?;
 
         self.tile_count -= 1;
         self.generation += 1;
@@ -119,34 +135,34 @@ impl SparseWorld {
 
     // ── Neighbor queries ───────────────────────────────────────────────────
 
-    /// Get the 4 cardinal neighbors (N, E, S, W).
+    /// Get the 4 cardinal neighbors on a specific layer (N, E, S, W).
     /// Returns `[north, east, south, west]`. Each may be `None` if empty.
-    pub fn neighbors_4(&self, coord: TileCoord) -> [Option<TilePlacement>; 4] {
+    pub fn neighbors_4(&self, coord: TileCoord, layer: u8) -> [Option<TilePlacement>; 4] {
         [
-            self.get(TileCoord::new(coord.x, coord.y - 1)).copied(), // N
-            self.get(TileCoord::new(coord.x + 1, coord.y)).copied(), // E
-            self.get(TileCoord::new(coord.x, coord.y + 1)).copied(), // S
-            self.get(TileCoord::new(coord.x - 1, coord.y)).copied(), // W
+            self.get(TileCoord::new(coord.x, coord.y - 1), layer).copied(), // N
+            self.get(TileCoord::new(coord.x + 1, coord.y), layer).copied(), // E
+            self.get(TileCoord::new(coord.x, coord.y + 1), layer).copied(), // S
+            self.get(TileCoord::new(coord.x - 1, coord.y), layer).copied(), // W
         ]
     }
 
-    /// Get all 8 neighbors (N, NE, E, SE, S, SW, W, NW).
-    pub fn neighbors_8(&self, coord: TileCoord) -> [Option<TilePlacement>; 8] {
+    /// Get all 8 neighbors on a specific layer (N, NE, E, SE, S, SW, W, NW).
+    pub fn neighbors_8(&self, coord: TileCoord, layer: u8) -> [Option<TilePlacement>; 8] {
         [
-            self.get(TileCoord::new(coord.x, coord.y - 1)).copied(),     // N
-            self.get(TileCoord::new(coord.x + 1, coord.y - 1)).copied(), // NE
-            self.get(TileCoord::new(coord.x + 1, coord.y)).copied(),     // E
-            self.get(TileCoord::new(coord.x + 1, coord.y + 1)).copied(), // SE
-            self.get(TileCoord::new(coord.x, coord.y + 1)).copied(),     // S
-            self.get(TileCoord::new(coord.x - 1, coord.y + 1)).copied(), // SW
-            self.get(TileCoord::new(coord.x - 1, coord.y)).copied(),     // W
-            self.get(TileCoord::new(coord.x - 1, coord.y - 1)).copied(), // NW
+            self.get(TileCoord::new(coord.x, coord.y - 1), layer).copied(),     // N
+            self.get(TileCoord::new(coord.x + 1, coord.y - 1), layer).copied(), // NE
+            self.get(TileCoord::new(coord.x + 1, coord.y), layer).copied(),     // E
+            self.get(TileCoord::new(coord.x + 1, coord.y + 1), layer).copied(), // SE
+            self.get(TileCoord::new(coord.x, coord.y + 1), layer).copied(),     // S
+            self.get(TileCoord::new(coord.x - 1, coord.y + 1), layer).copied(), // SW
+            self.get(TileCoord::new(coord.x - 1, coord.y), layer).copied(),     // W
+            self.get(TileCoord::new(coord.x - 1, coord.y - 1), layer).copied(), // NW
         ]
     }
 
     // ── Spatial queries ────────────────────────────────────────────────────
 
-    /// All tiles within the given tile-coordinate rectangle (inclusive).
+    /// All tiles (across all layers) within the given tile-coordinate rectangle (inclusive).
     pub fn query_visible(&self, min: TileCoord, max: TileCoord) -> Vec<VisibleTile> {
         // Convert tile bounds to chunk bounds (inclusive)
         let chunk_min = min.chunk();
@@ -211,7 +227,7 @@ impl SparseWorld {
 
     // ── Statistics ──────────────────────────────────────────────────────────
 
-    /// Total number of placed tiles across all chunks.
+    /// Total number of placed tiles across all chunks and layers.
     pub fn tile_count(&self) -> u64 {
         self.tile_count
     }
@@ -272,12 +288,16 @@ mod tests {
         TilePlacement::new(id, 0, 0)
     }
 
+    fn tile_on(id: u16, layer: u8) -> TilePlacement {
+        TilePlacement::new(id, 0, layer)
+    }
+
     #[test]
     fn empty_world() {
         let world = SparseWorld::new();
         assert_eq!(world.tile_count(), 0);
         assert_eq!(world.chunk_count(), 0);
-        assert!(world.get(tc(0, 0)).is_none());
+        assert!(world.get(tc(0, 0), 0).is_none());
     }
 
     #[test]
@@ -287,7 +307,7 @@ mod tests {
 
         assert_eq!(world.tile_count(), 1);
         assert_eq!(world.chunk_count(), 1);
-        assert_eq!(world.get(tc(5, 10)).unwrap().asset_id, 42);
+        assert_eq!(world.get(tc(5, 10), 0).unwrap().asset_id, 42);
     }
 
     #[test]
@@ -297,26 +317,73 @@ mod tests {
         let old = world.set(tc(0, 0), tile(2));
 
         assert_eq!(old.unwrap().asset_id, 1);
-        assert_eq!(world.get(tc(0, 0)).unwrap().asset_id, 2);
+        assert_eq!(world.get(tc(0, 0), 0).unwrap().asset_id, 2);
         assert_eq!(world.tile_count(), 1); // count unchanged
+    }
+
+    #[test]
+    fn multi_layer_stacking() {
+        let mut world = SparseWorld::new();
+        world.set(tc(5, 5), tile_on(1, 0)); // ground
+        world.set(tc(5, 5), tile_on(2, 1)); // water
+        world.set(tc(5, 5), tile_on(3, 3)); // path
+
+        assert_eq!(world.tile_count(), 3);
+        assert_eq!(world.chunk_count(), 1);
+        assert_eq!(world.get(tc(5, 5), 0).unwrap().asset_id, 1);
+        assert_eq!(world.get(tc(5, 5), 1).unwrap().asset_id, 2);
+        assert!(world.get(tc(5, 5), 2).is_none());
+        assert_eq!(world.get(tc(5, 5), 3).unwrap().asset_id, 3);
+    }
+
+    #[test]
+    fn get_stack() {
+        let mut world = SparseWorld::new();
+        world.set(tc(3, 3), tile_on(10, 0));
+        world.set(tc(3, 3), tile_on(20, 2));
+
+        let stack = world.get_stack(tc(3, 3));
+        assert_eq!(stack[0].unwrap().asset_id, 10);
+        assert!(stack[1].is_none());
+        assert_eq!(stack[2].unwrap().asset_id, 20);
+    }
+
+    #[test]
+    fn get_stack_missing_chunk() {
+        let world = SparseWorld::new();
+        let stack = world.get_stack(tc(999, 999));
+        assert!(stack.iter().all(|s| s.is_none()));
     }
 
     #[test]
     fn remove() {
         let mut world = SparseWorld::new();
         world.set(tc(3, 3), tile(99));
-        let removed = world.remove(tc(3, 3));
+        let removed = world.remove(tc(3, 3), 0);
 
         assert_eq!(removed.unwrap().asset_id, 99);
-        assert!(world.get(tc(3, 3)).is_none());
+        assert!(world.get(tc(3, 3), 0).is_none());
         assert_eq!(world.tile_count(), 0);
         assert_eq!(world.chunk_count(), 0); // chunk cleaned up
     }
 
     #[test]
+    fn remove_one_layer_keeps_others() {
+        let mut world = SparseWorld::new();
+        world.set(tc(3, 3), tile_on(1, 0));
+        world.set(tc(3, 3), tile_on(2, 2));
+
+        world.remove(tc(3, 3), 0);
+        assert_eq!(world.tile_count(), 1);
+        assert_eq!(world.chunk_count(), 1); // still has layer 2
+        assert!(world.get(tc(3, 3), 0).is_none());
+        assert_eq!(world.get(tc(3, 3), 2).unwrap().asset_id, 2);
+    }
+
+    #[test]
     fn remove_nonexistent() {
         let mut world = SparseWorld::new();
-        assert!(world.remove(tc(0, 0)).is_none());
+        assert!(world.remove(tc(0, 0), 0).is_none());
     }
 
     #[test]
@@ -325,8 +392,8 @@ mod tests {
         world.set(tc(-1, -1), tile(10));
         world.set(tc(-33, -33), tile(20));
 
-        assert_eq!(world.get(tc(-1, -1)).unwrap().asset_id, 10);
-        assert_eq!(world.get(tc(-33, -33)).unwrap().asset_id, 20);
+        assert_eq!(world.get(tc(-1, -1), 0).unwrap().asset_id, 10);
+        assert_eq!(world.get(tc(-33, -33), 0).unwrap().asset_id, 20);
         assert_eq!(world.chunk_count(), 2); // different chunks
     }
 
@@ -361,6 +428,21 @@ mod tests {
     }
 
     #[test]
+    fn query_visible_multi_layer() {
+        let mut world = SparseWorld::new();
+        // Place 2 layers at each of 4 positions
+        for x in 0..2 {
+            for y in 0..2 {
+                world.set(tc(x, y), tile_on(1, 0));
+                world.set(tc(x, y), tile_on(2, 3));
+            }
+        }
+
+        let visible = world.query_visible(tc(0, 0), tc(1, 1));
+        assert_eq!(visible.len(), 8); // 4 cells × 2 layers each
+    }
+
+    #[test]
     fn query_visible_spanning_chunks() {
         let mut world = SparseWorld::new();
         // Place tiles across chunk boundary (chunk 0 ends at 31, chunk 1 starts at 32)
@@ -383,11 +465,31 @@ mod tests {
         world.set(tc(5, 6), tile(3)); // S
         // W is empty
 
-        let [n, e, s, w] = world.neighbors_4(tc(5, 5));
+        let [n, e, s, w] = world.neighbors_4(tc(5, 5), 0);
         assert_eq!(n.unwrap().asset_id, 1);
         assert_eq!(e.unwrap().asset_id, 2);
         assert_eq!(s.unwrap().asset_id, 3);
         assert!(w.is_none());
+    }
+
+    #[test]
+    fn neighbors_4_layer_specific() {
+        let mut world = SparseWorld::new();
+        world.set(tc(5, 5), tile_on(0, 0));
+        world.set(tc(5, 4), tile_on(1, 0)); // N on layer 0
+        world.set(tc(5, 4), tile_on(9, 3)); // N on layer 3
+
+        // Layer 0: sees tile 1 to the north
+        let [n, _, _, _] = world.neighbors_4(tc(5, 5), 0);
+        assert_eq!(n.unwrap().asset_id, 1);
+
+        // Layer 3: sees tile 9 to the north
+        let [n, _, _, _] = world.neighbors_4(tc(5, 5), 3);
+        assert_eq!(n.unwrap().asset_id, 9);
+
+        // Layer 1: sees nothing to the north
+        let [n, _, _, _] = world.neighbors_4(tc(5, 5), 1);
+        assert!(n.is_none());
     }
 
     #[test]
@@ -401,7 +503,7 @@ mod tests {
         world.set(tc(0, 0), tile(2)); // overwrite
         assert_eq!(world.generation(), 2);
 
-        world.remove(tc(0, 0));
+        world.remove(tc(0, 0), 0);
         assert_eq!(world.generation(), 3);
     }
 
@@ -431,7 +533,7 @@ mod tests {
         }
 
         assert_eq!(world.tile_count(), 10_000);
-        // 100/32 = 4 chunks per axis, ceil → 4x4 = 16 chunks
+        // 100/32 = 4 chunks per axis, ceil -> 4x4 = 16 chunks
         assert_eq!(world.chunk_count(), 16);
 
         // Query a 50x50 sub-region

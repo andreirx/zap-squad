@@ -26,6 +26,24 @@ const TOOL_IDS: Record<Tool, number> = {
 const GAME_WIDTH = 1920;
 const GAME_HEIGHT = 1080;
 
+/** Derive storage layer from tile type metadata.
+ *
+ * | tileType | terrainType | Layer | Semantic |
+ * |----------|-------------|-------|----------|
+ * | TILE     | *           | 0     | Ground   |
+ * | PATH     | WATER       | 1     | Rivers   |
+ * | BRIDGE   | *           | 2     | Bridges  |
+ * | PATH     | LAND        | 3     | Roads    |
+ */
+function tileTypeToLayer(entry: TileRegistryEntry | undefined): number {
+  if (!entry) return 0;
+  if (entry.tileType === 'BRIDGE') return 2;
+  if (entry.tileType === 'PATH') {
+    return entry.terrainType === 'WATER' ? 1 : 3;
+  }
+  return 0;
+}
+
 interface InfiniteCanvasProps {
   tool: Tool;
   activeAssetId: number;
@@ -91,7 +109,7 @@ export function InfiniteCanvas({
   // ── zap-engine hook ───────────────────────────────────────────────
   const { canvasRef, sendEvent, isReady, fps, canvasKey } = useZapEngine({
     wasmUrl: '/src/wasm/freedom_board_wasm.js',
-    assetsUrl: `${ASSETS_URL}/assets.json`,
+    assetsUrl: `${ASSETS_URL}/assets_feathered.json`,
     assetBasePath: `${ASSETS_URL}/`,
     gameWidth: GAME_WIDTH,
     gameHeight: GAME_HEIGHT,
@@ -174,10 +192,12 @@ export function InfiniteCanvas({
   }, [tool, isReady, sendEvent]);
 
   // ── Sync active asset changes ─────────────────────────────────────
+  const activeLayer = tileTypeToLayer(tileRegistry[activeAssetId]);
+
   useEffect(() => {
     if (!isReady) return;
-    sendEvent({ type: 'custom', kind: EVENTS.SET_ACTIVE_TILE, a: activeAssetId, b: 0, c: 0 });
-  }, [activeAssetId, isReady, sendEvent]);
+    sendEvent({ type: 'custom', kind: EVENTS.SET_ACTIVE_TILE, a: activeAssetId, b: activeLayer, c: 0 });
+  }, [activeAssetId, activeLayer, isReady, sendEvent]);
 
   // ── Resize observer ───────────────────────────────────────────────
   useEffect(() => {
@@ -233,12 +253,12 @@ export function InfiniteCanvas({
       if (tool === 'draw') {
         sendEvent({ type: 'custom', kind: EVENTS.PLACE_TILE, a: tile.x, b: tile.y, c: activeAssetId });
       } else if (tool === 'erase') {
-        sendEvent({ type: 'custom', kind: EVENTS.ERASE_TILE, a: tile.x, b: tile.y, c: 0 });
+        sendEvent({ type: 'custom', kind: EVENTS.ERASE_TILE, a: tile.x, b: tile.y, c: activeLayer });
       } else if (tool === 'fill') {
         sendEvent({ type: 'custom', kind: EVENTS.PLACE_TILE, a: tile.x, b: tile.y, c: activeAssetId });
       }
     }
-  }, [tool, activeAssetId, isReady, sendEvent, screenToTile]);
+  }, [tool, activeAssetId, activeLayer, isReady, sendEvent, screenToTile]);
 
   const handlePointerMove = useCallback((e: React.PointerEvent) => {
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
@@ -270,11 +290,11 @@ export function InfiniteCanvas({
         if (tool === 'draw') {
           sendEvent({ type: 'custom', kind: EVENTS.PLACE_TILE, a: tile.x, b: tile.y, c: activeAssetId });
         } else if (tool === 'erase') {
-          sendEvent({ type: 'custom', kind: EVENTS.ERASE_TILE, a: tile.x, b: tile.y, c: 0 });
+          sendEvent({ type: 'custom', kind: EVENTS.ERASE_TILE, a: tile.x, b: tile.y, c: activeLayer });
         }
       }
     }
-  }, [tool, activeAssetId, isReady, sendEvent, screenToTile, syncCamera, onCursorTileChange, getProjection]);
+  }, [tool, activeAssetId, activeLayer, isReady, sendEvent, screenToTile, syncCamera, onCursorTileChange, getProjection]);
 
   const handlePointerUp = useCallback((e: React.PointerEvent) => {
     dragRef.current = null;
@@ -301,7 +321,7 @@ export function InfiniteCanvas({
     const oldZoom = cam.zoom;
 
     const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
-    const newZoom = Math.min(256, Math.max(4, oldZoom * factor));
+    const newZoom = Math.min(512, Math.max(2, oldZoom * factor));
 
     // Zoom centered on cursor: keep the tile under cursor stationary
     const tileX = gameX / oldZoom + cam.x;

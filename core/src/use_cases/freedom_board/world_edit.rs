@@ -26,7 +26,10 @@ impl EditResult {
                 world.set(self.coord, tile);
             }
             None => {
-                world.remove(self.coord);
+                // Before this edit, the slot was empty. Remove what was placed.
+                if let Some(new_tile) = self.new {
+                    world.remove(self.coord, new_tile.layer);
+                }
             }
         }
     }
@@ -38,13 +41,16 @@ impl EditResult {
                 world.set(self.coord, tile);
             }
             None => {
-                world.remove(self.coord);
+                // The edit was an erase. Redo = remove again on the old tile's layer.
+                if let Some(old_tile) = self.old {
+                    world.remove(self.coord, old_tile.layer);
+                }
             }
         }
     }
 }
 
-/// Place a single tile.
+/// Place a single tile. The tile's `layer` field determines which slot to use.
 pub fn place_tile(
     world: &mut SparseWorld,
     coord: TileCoord,
@@ -58,9 +64,9 @@ pub fn place_tile(
     }
 }
 
-/// Remove a single tile.
-pub fn erase_tile(world: &mut SparseWorld, coord: TileCoord) -> EditResult {
-    let old = world.remove(coord);
+/// Remove a single tile on a specific layer.
+pub fn erase_tile(world: &mut SparseWorld, coord: TileCoord, layer: u8) -> EditResult {
+    let old = world.remove(coord, layer);
     EditResult {
         coord,
         old,
@@ -69,6 +75,7 @@ pub fn erase_tile(world: &mut SparseWorld, coord: TileCoord) -> EditResult {
 }
 
 /// Fill a rectangular region with a tile.
+/// The tile's `layer` field determines which layer slot to fill.
 pub fn fill_rect(
     world: &mut SparseWorld,
     min: TileCoord,
@@ -85,18 +92,19 @@ pub fn fill_rect(
     results
 }
 
-/// Erase all tiles in a rectangular region.
+/// Erase all tiles on a specific layer in a rectangular region.
 pub fn erase_rect(
     world: &mut SparseWorld,
     min: TileCoord,
     max: TileCoord,
+    layer: u8,
 ) -> Vec<EditResult> {
     let mut results = Vec::new();
     for y in min.y..=max.y {
         for x in min.x..=max.x {
             let coord = TileCoord::new(x, y);
-            if world.get(coord).is_some() {
-                results.push(erase_tile(world, coord));
+            if world.get(coord, layer).is_some() {
+                results.push(erase_tile(world, coord, layer));
             }
         }
     }
@@ -147,8 +155,9 @@ pub fn draw_line(
     results
 }
 
-/// Flood fill from a starting point, replacing tiles that match the original
-/// tile at the start position (or empty if start is empty).
+/// Flood fill from a starting point on the fill tile's layer, replacing
+/// tiles that match the original tile at the start position (or empty if
+/// start is empty on that layer).
 ///
 /// `max_tiles` is a safety limit to prevent runaway fills on large empty regions.
 /// Returns early if the limit is reached.
@@ -158,7 +167,8 @@ pub fn flood_fill(
     fill_tile: TilePlacement,
     max_tiles: usize,
 ) -> Vec<EditResult> {
-    let target = world.get(start).copied();
+    let layer = fill_tile.layer;
+    let target = world.get(start, layer).copied();
 
     // Don't fill if the start already has the fill tile
     if target.as_ref() == Some(&fill_tile) {
@@ -177,8 +187,8 @@ pub fn flood_fill(
             break;
         }
 
-        // Check if this cell matches the target (what we're replacing)
-        let current = world.get(coord).copied();
+        // Check if this cell's layer matches the target (what we're replacing)
+        let current = world.get(coord, layer).copied();
         if current != target {
             continue;
         }
@@ -212,6 +222,10 @@ mod tests {
         TilePlacement::new(id, 0, 0)
     }
 
+    fn tile_on(id: u16, layer: u8) -> TilePlacement {
+        TilePlacement::new(id, 0, layer)
+    }
+
     fn tc(x: i32, y: i32) -> TileCoord {
         TileCoord::new(x, y)
     }
@@ -221,10 +235,26 @@ mod tests {
         let mut world = SparseWorld::new();
         let edit = place_tile(&mut world, tc(5, 5), tile(42));
 
-        assert_eq!(world.get(tc(5, 5)).unwrap().asset_id, 42);
+        assert_eq!(world.get(tc(5, 5), 0).unwrap().asset_id, 42);
 
         edit.undo(&mut world);
-        assert!(world.get(tc(5, 5)).is_none());
+        assert!(world.get(tc(5, 5), 0).is_none());
+    }
+
+    #[test]
+    fn place_and_undo_with_layers() {
+        let mut world = SparseWorld::new();
+        // Place ground first
+        world.set(tc(5, 5), tile_on(10, 0));
+
+        // Place path on layer 3
+        let edit = place_tile(&mut world, tc(5, 5), tile_on(42, 3));
+        assert_eq!(world.get(tc(5, 5), 3).unwrap().asset_id, 42);
+        assert_eq!(world.get(tc(5, 5), 0).unwrap().asset_id, 10); // ground untouched
+
+        edit.undo(&mut world);
+        assert!(world.get(tc(5, 5), 3).is_none()); // path removed
+        assert_eq!(world.get(tc(5, 5), 0).unwrap().asset_id, 10); // ground still there
     }
 
     #[test]
@@ -232,11 +262,25 @@ mod tests {
         let mut world = SparseWorld::new();
         world.set(tc(3, 3), tile(99));
 
-        let edit = erase_tile(&mut world, tc(3, 3));
-        assert!(world.get(tc(3, 3)).is_none());
+        let edit = erase_tile(&mut world, tc(3, 3), 0);
+        assert!(world.get(tc(3, 3), 0).is_none());
 
         edit.undo(&mut world);
-        assert_eq!(world.get(tc(3, 3)).unwrap().asset_id, 99);
+        assert_eq!(world.get(tc(3, 3), 0).unwrap().asset_id, 99);
+    }
+
+    #[test]
+    fn erase_specific_layer_preserves_others() {
+        let mut world = SparseWorld::new();
+        world.set(tc(3, 3), tile_on(1, 0));
+        world.set(tc(3, 3), tile_on(2, 3));
+
+        let edit = erase_tile(&mut world, tc(3, 3), 3);
+        assert!(world.get(tc(3, 3), 3).is_none());
+        assert_eq!(world.get(tc(3, 3), 0).unwrap().asset_id, 1); // untouched
+
+        edit.undo(&mut world);
+        assert_eq!(world.get(tc(3, 3), 3).unwrap().asset_id, 2); // restored
     }
 
     #[test]
@@ -261,7 +305,7 @@ mod tests {
 
         assert_eq!(edits.len(), 6); // 0,1,2,3,4,5
         for x in 0..=5 {
-            assert!(world.get(tc(x, 0)).is_some());
+            assert!(world.get(tc(x, 0), 0).is_some());
         }
     }
 
@@ -310,12 +354,32 @@ mod tests {
         assert_eq!(edits.len(), 9);
 
         // Verify walls are untouched
-        assert_eq!(world.get(tc(0, 0)).unwrap().asset_id, 2);
-        assert_eq!(world.get(tc(4, 4)).unwrap().asset_id, 2);
+        assert_eq!(world.get(tc(0, 0), 0).unwrap().asset_id, 2);
+        assert_eq!(world.get(tc(4, 4), 0).unwrap().asset_id, 2);
 
         // Verify interior is filled
-        assert_eq!(world.get(tc(2, 2)).unwrap().asset_id, 3);
-        assert_eq!(world.get(tc(1, 1)).unwrap().asset_id, 3);
+        assert_eq!(world.get(tc(2, 2), 0).unwrap().asset_id, 3);
+        assert_eq!(world.get(tc(1, 1), 0).unwrap().asset_id, 3);
+    }
+
+    #[test]
+    fn flood_fill_layer_specific() {
+        let mut world = SparseWorld::new();
+        // Place ground everywhere
+        for x in 0..3 {
+            for y in 0..3 {
+                world.set(tc(x, y), tile_on(1, 0));
+            }
+        }
+
+        // Flood fill on layer 3 (empty on that layer)
+        let edits = flood_fill(&mut world, tc(1, 1), tile_on(5, 3), 100);
+        assert_eq!(edits.len(), 100); // fills outward from (1,1) on layer 3
+
+        // Ground layer untouched
+        assert_eq!(world.get(tc(1, 1), 0).unwrap().asset_id, 1);
+        // Layer 3 filled
+        assert_eq!(world.get(tc(1, 1), 3).unwrap().asset_id, 5);
     }
 
     #[test]
@@ -328,17 +392,25 @@ mod tests {
     }
 
     #[test]
-    fn erase_rect() {
+    fn erase_rect_on_layer() {
         let mut world = SparseWorld::new();
         for x in 0..5 {
             for y in 0..5 {
-                world.set(tc(x, y), tile(1));
+                world.set(tc(x, y), tile_on(1, 0));
+                world.set(tc(x, y), tile_on(2, 3));
             }
         }
-        assert_eq!(world.tile_count(), 25);
+        assert_eq!(world.tile_count(), 50); // 25 cells × 2 layers
 
-        let edits = super::erase_rect(&mut world, tc(1, 1), tc(3, 3));
-        assert_eq!(edits.len(), 9); // 3x3 interior
-        assert_eq!(world.tile_count(), 16); // 25 - 9
+        let edits = erase_rect(&mut world, tc(1, 1), tc(3, 3), 3);
+        assert_eq!(edits.len(), 9); // 3x3 interior on layer 3
+        assert_eq!(world.tile_count(), 41); // 50 - 9
+
+        // Layer 0 untouched in erased area
+        assert_eq!(world.get(tc(2, 2), 0).unwrap().asset_id, 1);
+        // Layer 3 erased in area
+        assert!(world.get(tc(2, 2), 3).is_none());
+        // Layer 3 outside area untouched
+        assert_eq!(world.get(tc(0, 0), 3).unwrap().asset_id, 2);
     }
 }

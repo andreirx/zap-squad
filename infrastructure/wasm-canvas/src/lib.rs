@@ -13,7 +13,7 @@
 //! ```text
 //! screen_x = (tile_x + 0.5 - camera_x) * zoom
 //! screen_y = (tile_y + 0.5 - camera_y) * zoom
-//! entity_scale = zoom (one tile = zoom pixels)
+//! entity_scale = zoom * SPRITE_SCALE (feathered 160px sprite over 128px tile)
 //! ```
 //!
 //! # Asset Registry
@@ -51,8 +51,18 @@ use zapsquad_core::entities::freedom_board::{
     SparseWorld, TileCoord, TilePlacement, VisibleTile, CHUNK_SIZE,
 };
 use zapsquad_core::use_cases::freedom_board::{
-    place_tile, erase_tile, query_viewport, EditResult,
+    connectivity_bitmask, place_tile, erase_tile, query_viewport, EditResult,
 };
+
+/// Feathered sprite geometry.
+///
+/// Tile atlases use 160x160 sprites with 16px feathered padding on each side.
+/// The logical tile content occupies the inner 128x128 region.
+/// When rendering, sprites must be scaled by SPRITE_SCALE so the 128px content
+/// maps to exactly `zoom` pixels and the feather extends past the cell boundary.
+const TILE_CONTENT_PX: f32 = 128.0;
+const SPRITE_PX: f32 = 160.0;
+const SPRITE_SCALE: f32 = SPRITE_PX / TILE_CONTENT_PX; // 1.25
 
 /// Custom event kinds: React -> WASM
 mod events {
@@ -91,15 +101,36 @@ impl Tool {
     }
 }
 
+/// Tile type classification — determines rendering pass and connectivity behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TileType {
+    Tile,   // Base terrain (grass, dirt, ocean)
+    Path,   // Walkable roads or water rivers
+    Bridge, // Auto-placed under paths crossing water
+}
+
+/// Terrain classification — determines bridge auto-placement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerrainType {
+    Land,
+    Water,
+}
+
 /// Per-tile metadata from manifest.json, indexed by asset_id (u16).
 /// Populated once at startup via `register_tiles()`.
 #[derive(Clone, Debug)]
 struct TileAssetInfo {
     /// String name used in sprite lookup: e.g. "iarba", "ocean", "river"
     name: String,
-    /// Number of base variations (atlas columns). Needed to compute
-    /// transition sprite indices: transition_index = (1 + dir) * variations + variation.
+    /// Number of base variations (atlas columns).
     variations: u8,
+    /// TILE, PATH, or BRIDGE — determines render layer and connectivity.
+    tile_type: TileType,
+    /// LAND or WATER — determines bridge auto-placement.
+    terrain_type: TerrainType,
+    /// For LAND PATH tiles: which bridge asset to render when crossing water.
+    /// Stored as the asset_id index (resolved at registration time).
+    bridge_asset_id: Option<u16>,
 }
 
 /// Main game struct implementing zap-engine's Game trait.
@@ -173,6 +204,11 @@ impl FreedomBoardGame {
         self.tile_registry.get(asset_id as usize).map(|t| t.name.as_str())
     }
 
+    /// Look up full tile info for an asset_id.
+    fn tile_info(&self, asset_id: u16) -> Option<&TileAssetInfo> {
+        self.tile_registry.get(asset_id as usize)
+    }
+
     /// Process a custom event from React.
     fn handle_custom_event(&mut self, kind: u32, a: f32, b: f32, c: f32) {
         match kind {
@@ -185,8 +221,9 @@ impl FreedomBoardGame {
             }
             events::ERASE_TILE => {
                 let coord = TileCoord::new(a as i32, b as i32);
-                if self.world.get(coord).is_some() {
-                    let edit = erase_tile(&mut self.world, coord);
+                let layer = c as u8;
+                if self.world.get(coord, layer).is_some() {
+                    let edit = erase_tile(&mut self.world, coord, layer);
                     self.undo_stack.push(vec![edit]);
                     self.redo_stack.clear();
                 }
@@ -242,10 +279,32 @@ impl FreedomBoardGame {
         (TileCoord::new(min_x, min_y), TileCoord::new(max_x, max_y))
     }
 
+    /// Map storage layer index (0-7) to zap-engine RenderLayer.
+    ///
+    /// | Storage | RenderLayer  | Semantic          |
+    /// |---------|-------------|-------------------|
+    /// | 0       | Background  | Ground terrain     |
+    /// | 1       | Terrain     | Water/rivers       |
+    /// | 2       | Objects     | Bridges            |
+    /// | 3       | Foreground  | Paths              |
+    /// | 4       | VFX         | Objects/decoration |
+    /// | 5-7     | UI          | Characters / HUD   |
+    fn storage_to_render_layer(layer: u8) -> RenderLayer {
+        match layer {
+            0 => RenderLayer::Background,
+            1 => RenderLayer::Terrain,
+            2 => RenderLayer::Objects,
+            3 => RenderLayer::Foreground,
+            4 => RenderLayer::VFX,
+            _ => RenderLayer::UI,
+        }
+    }
+
     /// Despawn all current tile entities, query visible tiles, spawn new entities.
     ///
-    /// Sprite lookup: `ctx.sprite("{tile_name}_{variant}")` using the tile registry
-    /// to resolve asset_id (u16) → tile name (string).
+    /// All layers are rendered in a single pass, sorted by layer (back-to-front).
+    /// Path and bridge tiles compute connectivity bitmask for sprite variation.
+    /// Bridge auto-placement checks the water layer underneath land paths.
     ///
     /// TODO(perf): Entity pooling — reuse EntityIds, only update positions on camera pan.
     /// Current approach: full despawn/respawn. Acceptable for <10K visible tiles.
@@ -256,44 +315,95 @@ impl FreedomBoardGame {
         }
 
         let (vp_min, vp_max) = self.visible_bounds();
-        let visible: Vec<VisibleTile> = query_viewport(&self.world, vp_min, vp_max);
+        let mut visible: Vec<VisibleTile> = query_viewport(&self.world, vp_min, vp_max);
+        let scale = Vec2::splat(self.zoom * SPRITE_SCALE);
+
+        // Sort by layer for correct back-to-front compositing order
+        visible.sort_by_key(|vt| vt.placement.layer);
 
         for vt in &visible {
-            let id = ctx.next_id();
+            // Extract owned tile metadata so the immutable borrow of `self` drops
+            // before we mutate `self.tile_entities`.
+            let (tile_name, tile_type, terrain_type, bridge_asset_id) =
+                match self.tile_info(vt.placement.asset_id) {
+                    Some(i) => (i.name.clone(), i.tile_type, i.terrain_type, i.bridge_asset_id),
+                    None => continue,
+                };
 
-            // Convert tile center to screen pixels
-            let screen_x = (vt.x as f32 + 0.5 - self.camera_x) * self.zoom;
-            let screen_y = (vt.y as f32 + 0.5 - self.camera_y) * self.zoom;
+            let layer = vt.placement.layer;
+            let coord = TileCoord::new(vt.x, vt.y);
+            let screen = self.tile_to_screen(vt.x as f32 + 0.5, vt.y as f32 + 0.5);
 
-            let layer = match vt.placement.layer {
-                0 => RenderLayer::Background,
-                1 => RenderLayer::Terrain,
-                2 => RenderLayer::Objects,
-                3 => RenderLayer::Foreground,
-                4 => RenderLayer::VFX,
-                _ => RenderLayer::UI,
+            // Determine sprite variation based on tile type:
+            //   PATH/BRIDGE: connectivity bitmask (same-asset neighbors on same layer)
+            //   TILE: stored variant from TilePlacement
+            let variation = if tile_type == TileType::Path || tile_type == TileType::Bridge {
+                let bits = connectivity_bitmask(&self.world, coord, layer);
+                if bits == 0 { 0 } else { bits - 1 }
+            } else {
+                vt.placement.variant
             };
 
-            let mut entity = Entity::new(id)
-                .with_pos(Vec2::new(screen_x, screen_y))
-                .with_scale(Vec2::splat(self.zoom))
-                .with_layer(layer);
+            let render_layer = Self::storage_to_render_layer(layer);
 
-            // Resolve asset_id → tile name via registry, then look up sprite
-            if let Some(tile_name) = self.tile_name(vt.placement.asset_id) {
-                let sprite_key = format!("{}_{}", tile_name, vt.placement.variant);
-                if let Some(sprite) = ctx.sprite(&sprite_key) {
-                    entity.sprite = Some(sprite);
+            // Bridge auto-placement: LAND PATH over water → spawn bridge entity
+            // on the bridge render layer (Objects) before spawning the path itself.
+            if tile_type == TileType::Path && terrain_type == TerrainType::Land {
+                if let Some(bridge_aid) = bridge_asset_id {
+                    if self.check_water_underneath(coord) {
+                        let bridge_name = self.tile_info(bridge_aid).map(|bi| bi.name.clone());
+                        if let Some(bname) = bridge_name {
+                            let bridge_key = format!("{}_{}", bname, variation);
+
+                            let bid = ctx.next_id();
+                            let mut bridge_entity = Entity::new(bid)
+                                .with_pos(screen)
+                                .with_scale(scale)
+                                .with_layer(Self::storage_to_render_layer(2)); // bridge layer
+
+                            if let Some(sprite) = ctx.sprite(&bridge_key) {
+                                bridge_entity.sprite = Some(sprite);
+                            }
+
+                            ctx.scene.spawn(bridge_entity);
+                            self.tile_entities.push(bid);
+                        }
+                    }
                 }
-                // If sprite not found, entity renders as invisible — expected for
-                // tiles whose atlas hasn't loaded yet.
             }
-            // If asset_id not in registry, entity is invisible — expected before
-            // register_tiles() is called.
+
+            // Spawn the tile entity
+            let id = ctx.next_id();
+            let mut entity = Entity::new(id)
+                .with_pos(screen)
+                .with_scale(scale)
+                .with_layer(render_layer);
+
+            let sprite_key = format!("{}_{}", tile_name, variation);
+            if let Some(sprite) = ctx.sprite(&sprite_key) {
+                entity.sprite = Some(sprite);
+            }
 
             ctx.scene.spawn(entity);
             self.tile_entities.push(id);
         }
+    }
+
+    /// Check if there's water terrain underneath a given coordinate.
+    ///
+    /// With multi-layer storage, checks layers 0 (ground) and 1 (water)
+    /// at the same position for any tile with terrainType=WATER.
+    fn check_water_underneath(&self, coord: TileCoord) -> bool {
+        for layer in 0..2u8 {
+            if let Some(tile) = self.world.get(coord, layer) {
+                if let Some(info) = self.tile_info(tile.asset_id) {
+                    if info.terrain_type == TerrainType::Water {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Emit world stats to React if they changed.
@@ -534,28 +644,76 @@ thread_local! {
 
 /// Load the tile asset registry. Called by the engine worker via `reload_game_manifest` dispatch.
 ///
-/// JSON format: `[{"name": "iarba", "variations": 3}, {"name": "pamant", "variations": 2}, ...]`
+/// JSON format:
+/// ```json
+/// [
+///   {"name": "iarba", "variations": 3, "tileType": "TILE", "terrainType": "LAND"},
+///   {"name": "river", "variations": 15, "tileType": "PATH", "terrainType": "WATER"},
+///   {"name": "drum_gri", "variations": 15, "tileType": "PATH", "terrainType": "LAND",
+///    "bridgeAssetId": "bridge_80px"},
+///   ...
+/// ]
+/// ```
 ///
 /// Array index becomes the tile's asset_id (u16). React and WASM must agree on ordering.
-/// For freedom-board, the "game manifest" IS the tile registry — different games use
-/// different manifest formats, and the engine worker dispatches to this export generically.
+/// `bridgeAssetId` is resolved to a u16 index after all entries are parsed (two-pass).
 #[wasm_bindgen]
 pub fn reload_game_manifest(json: &str) {
     #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct TileEntry {
         name: String,
+        #[serde(default = "default_variations")]
         variations: u8,
+        #[serde(default)]
+        tile_type: Option<String>,
+        #[serde(default)]
+        terrain_type: Option<String>,
+        #[serde(default)]
+        bridge_asset_id: Option<String>,
+    }
+
+    fn default_variations() -> u8 {
+        1
     }
 
     match serde_json::from_str::<Vec<TileEntry>>(json) {
         Ok(entries) => {
+            // First pass: build name → index lookup for bridge_asset_id resolution
+            let name_to_idx: std::collections::HashMap<&str, u16> = entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (e.name.as_str(), i as u16))
+                .collect();
+
+            // Second pass: build registry with resolved bridge references
             let registry: Vec<TileAssetInfo> = entries
-                .into_iter()
-                .map(|e| TileAssetInfo {
-                    name: e.name,
-                    variations: e.variations,
+                .iter()
+                .map(|e| {
+                    let tile_type = match e.tile_type.as_deref() {
+                        Some("PATH") => TileType::Path,
+                        Some("BRIDGE") => TileType::Bridge,
+                        _ => TileType::Tile,
+                    };
+                    let terrain_type = match e.terrain_type.as_deref() {
+                        Some("WATER") => TerrainType::Water,
+                        _ => TerrainType::Land,
+                    };
+                    let bridge_asset_id = e
+                        .bridge_asset_id
+                        .as_deref()
+                        .and_then(|name| name_to_idx.get(name).copied());
+
+                    TileAssetInfo {
+                        name: e.name.clone(),
+                        variations: e.variations,
+                        tile_type,
+                        terrain_type,
+                        bridge_asset_id,
+                    }
                 })
                 .collect();
+
             let count = registry.len();
             PENDING_TILE_REGISTRY.with(|p| *p.borrow_mut() = Some(registry));
             web_sys::console::log_1(
