@@ -214,6 +214,32 @@ pub fn flood_fill(
     results
 }
 
+/// Stamp a collection of pre-resolved tile placements onto the world at an origin.
+///
+/// Each entry is `(offset, tile)` where `offset` is relative to `origin`.
+/// The tile is placed at `origin + offset`. This is the mechanism for importing
+/// MapEditor-authored maps onto the infinite canvas as prefabs.
+///
+/// The caller (WASM adapter) is responsible for:
+/// - Parsing the map format (LDtk JSON)
+/// - Resolving tile names to asset_ids via the tile registry
+/// - Deriving layers from tile type metadata
+///
+/// Returns `Vec<EditResult>` — a single undo entry for the entire stamp.
+pub fn stamp_tiles(
+    world: &mut SparseWorld,
+    origin: TileCoord,
+    tiles: &[(TileCoord, TilePlacement)],
+) -> Vec<EditResult> {
+    tiles
+        .iter()
+        .map(|(offset, tile)| {
+            let coord = TileCoord::new(origin.x + offset.x, origin.y + offset.y);
+            place_tile(world, coord, *tile)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +415,63 @@ mod tests {
 
         let edits = flood_fill(&mut world, tc(0, 0), tile(1), 100);
         assert!(edits.is_empty()); // already the fill tile
+    }
+
+    #[test]
+    fn stamp_tiles_at_origin() {
+        let mut world = SparseWorld::new();
+        let tiles = vec![
+            (tc(0, 0), tile(1)),
+            (tc(1, 0), tile(2)),
+            (tc(0, 1), tile(3)),
+            (tc(1, 1), tile(4)),
+        ];
+
+        let edits = stamp_tiles(&mut world, tc(10, 20), &tiles);
+        assert_eq!(edits.len(), 4);
+        assert_eq!(world.get(tc(10, 20), 0).unwrap().asset_id, 1);
+        assert_eq!(world.get(tc(11, 20), 0).unwrap().asset_id, 2);
+        assert_eq!(world.get(tc(10, 21), 0).unwrap().asset_id, 3);
+        assert_eq!(world.get(tc(11, 21), 0).unwrap().asset_id, 4);
+    }
+
+    #[test]
+    fn stamp_tiles_undo() {
+        let mut world = SparseWorld::new();
+        // Pre-existing tile at stamp target
+        world.set(tc(10, 20), tile(99));
+
+        let tiles = vec![
+            (tc(0, 0), tile(1)),
+            (tc(1, 0), tile(2)),
+        ];
+
+        let edits = stamp_tiles(&mut world, tc(10, 20), &tiles);
+        assert_eq!(world.get(tc(10, 20), 0).unwrap().asset_id, 1); // overwritten
+        assert_eq!(world.get(tc(11, 20), 0).unwrap().asset_id, 2);
+
+        // Undo restores original
+        for edit in edits.iter().rev() {
+            edit.undo(&mut world);
+        }
+        assert_eq!(world.get(tc(10, 20), 0).unwrap().asset_id, 99); // restored
+        assert!(world.get(tc(11, 20), 0).is_none());
+    }
+
+    #[test]
+    fn stamp_tiles_multi_layer() {
+        let mut world = SparseWorld::new();
+        let tiles = vec![
+            (tc(0, 0), tile_on(1, 0)), // ground
+            (tc(0, 0), tile_on(5, 3)), // path on same cell
+            (tc(1, 0), tile_on(2, 0)), // ground neighbor
+        ];
+
+        let edits = stamp_tiles(&mut world, tc(0, 0), &tiles);
+        assert_eq!(edits.len(), 3);
+        assert_eq!(world.get(tc(0, 0), 0).unwrap().asset_id, 1);
+        assert_eq!(world.get(tc(0, 0), 3).unwrap().asset_id, 5);
+        assert_eq!(world.get(tc(1, 0), 0).unwrap().asset_id, 2);
     }
 
     #[test]

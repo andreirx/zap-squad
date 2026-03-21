@@ -413,21 +413,27 @@ rebuild_visible_entities():
 
 ---
 
-## 11. Maturity: PROTOTYPE
+## 11. Maturity: PROTOTYPE → MATURE (freedom-board), PROTOTYPE (MapEditor), DEPRECATED (GameCanvas)
 
-### What's Implemented
+### What's Implemented (2026-03-21)
 - Feathered tile edges: `tools/feather_atlases.py` converts 128x128 atlases to 160x160
 - Freedom-board renders feathered tiles via `SPRITE_SCALE = 1.25`
 - Visually validated: same-type seams at 96% opacity (edge_alpha=0.8), inter-type soft edges visible
+- Path connectivity wired in WASM (`connectivity_bitmask` from core, layer-aware)
+- Bridge auto-placement wired in WASM (checks water layer underneath, auto-spawns bridge entities)
+- Extended tile registry in WASM (`tile_type`, `terrain_type`, `bridge_asset_id`, two-pass parsing)
+- Transition rows stripped from feathered atlases (1 row only, `--rows 1` flag in feather_atlases.py)
+- `assets_feathered.json` updated: 325 sprites (1335 transition entries removed)
+- Multi-layer tile storage: `MAX_LAYERS=8`, ADR-007. Ground visible under rivers/bridges/paths.
+- Layer auto-derived from tile type in React (`tileTypeToLayer()`)
+- Single-pass sorted rendering replaces 4-pass type-filtered rendering
 
 ### What's NOT Yet Implemented
-- Path connectivity in freedom-board WASM (connectivity_bitmask exists in core, not wired)
-- Bridge auto-placement in freedom-board WASM
-- Extended tile registry (tile_type, terrain_type, bridge_asset_id)
-- Migration of MapEditor and GameCanvas to feathered tiles
-- Stripping of transition rows 1-8 from source atlases
+- MapEditor keeps source atlases (128x128, no feathering) — **Decision: Option A (2026-03-21)**. Editor shows raw tile edges; feathering is runtime-only. MapEditor is the authoring tool for discrete maps (prefabs) that get stamped onto the infinite canvas.
+- ~~GameCanvas migration~~ — DEPRECATED (2026-03-21). Freedom-board supersedes GameCanvas as the runtime renderer. Code retained for reference only.
+- Integration with TileEditor save pipeline (128x128 → feathered auto-conversion)
 - WASM-based feathering for production (currently Python only)
-- Integration with TileEditor save pipeline
+- ~~Fill tool~~ DONE (2026-03-21): FLOOD_FILL event kind=5, calls `flood_fill()` with 10K safety limit, full undo/redo
 
 ### Source Reference
 
@@ -457,11 +463,18 @@ Tile Editor → tile PNGs (128x128, row 0 only)
 ### Intermediate State (Now)
 
 ```
-Tile Editor → tile PNGs (128x128, 9 rows) → feather_atlases.py → 9-row atlases (160x160)
+Tile Editor → tile PNGs (128x128, 9 rows) → feather_atlases.py --rows 1 → 1-row atlases (160x160)
   → assets_feathered.json → freedom-board only
 
-Original assets.json → MapEditor, GameCanvas (unchanged, still using transitions)
+Original assets.json → MapEditor (stays on source atlases, Option A decision)
+GameCanvas — DEPRECATED. Freedom-board is the runtime renderer.
 ```
+
+### Decision: MapEditor Stays on Source Atlases (2026-03-21)
+
+**Option A chosen.** The MapEditor reads 128x128 source atlases directly. No SPRITE_SCALE, no feathering visible. The editor shows raw tile edges while editing. Feathering is a runtime-only visual treatment applied by freedom-board and (future) GameCanvas.
+
+Rationale: the editor is a creation tool, not a preview tool. Adding SPRITE_SCALE math and feathered rendering to the legacy MapEditor is unnecessary complexity. The freedom-board IS the preview.
 
 ---
 

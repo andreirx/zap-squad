@@ -285,6 +285,17 @@ The array index IS the asset_id. React and WASM must sort tiles identically (alp
 | 2 | tile_x (i32) | tile_y (i32) | layer (u8) | Erase tile |
 | 3 | tool_id | -- | -- | Set active tool |
 | 4 | asset_id | layer | variant | Set active tile |
+| 5 | tile_x (i32) | tile_y (i32) | asset_id (u16) | Flood fill (max 10K tiles) |
+| 6 | end_x (i32) | end_y (i32) | asset_id (u16) | Draw line (from drag_start) |
+| 7 | end_x (i32) | end_y (i32) | asset_id (u16) | Fill rect (from drag_start) |
+| 8 | end_x (i32) | end_y (i32) | layer (u8) | Erase rect (from drag_start) |
+| 9 | -- | -- | -- | Undo |
+| 10 | -- | -- | -- | Redo |
+| 20 | tile_x (i32) | tile_y (i32) | -- | Drag start (store origin) |
+| 30 | tile_x (i32) | tile_y (i32) | body_idx | Place character |
+| 31 | tile_x (i32) | tile_y (i32) | -- | Remove character (or selected if 0,0) |
+| 32 | tile_x (i32) | tile_y (i32) | -- | Select character |
+| 33 | tile_x (i32) | tile_y (i32) | -- | Move character to tile |
 | 100 | camera_x | camera_y | zoom (px/tile) | Camera state update |
 | 101 | width_px | height_px | -- | Viewport resize |
 
@@ -480,11 +491,25 @@ Total: **61 tests** covering core entities and use cases.
 | **Deterministic registry ordering** | Medium | Alphabetical sort of tile IDs for asset_id assignment means adding a tile can shift all IDs. Serialized maps must store tile names, not IDs. |
 | **Force2D rendering** | Low | Using Canvas2D fallback due to WebGPU texture size limit. Fix: request `maxTextureDimension2D: 16384` in `requestDevice()`. |
 | **Feathered tiles not in production pipeline** | Medium | `feather_atlases.py` is Python; AWS Lambda/production needs a WASM-based equivalent. Currently a local dev tool only. |
-| **Path connectivity not wired** | Medium | `connectivity_bitmask()` exists in core but WASM doesn't use it. Path tiles render as variation 0 (isolated). |
-| **Bridge auto-placement not wired** | Medium | Core use case not written yet. WASM has no bridge detection. |
-| **Extended tile registry not implemented** | Medium | WASM `TileAssetInfo` has `{name, variations}` only. Needs `tile_type`, `terrain_type`, `bridge_asset_id` for path/bridge rendering. |
-| **Old transition atlases not stripped** | Low | Source tile PNGs still have 9 rows (rows 1-8 are transition sprites). Can be reduced to 1 row once MapEditor and GameCanvas are migrated to feathered edges. |
-| **Fill tool incomplete** | Low | UI sends `PLACE_TILE` for fill. Should trigger `flood_fill()` use case instead. Requires adding a new custom event kind or changing fill behavior in WASM. |
+| ~~Path connectivity not wired~~ | ~~Medium~~ | DONE (2026-03-21). WASM uses `connectivity_bitmask()` for PATH and BRIDGE tiles. |
+| ~~Bridge auto-placement not wired~~ | ~~Medium~~ | DONE (2026-03-21). WASM auto-spawns bridge entities under LAND PATHs over water. |
+| ~~Extended tile registry not implemented~~ | ~~Medium~~ | DONE (2026-03-21). `TileAssetInfo` has `tile_type`, `terrain_type`, `bridge_asset_id`. Two-pass JSON parsing resolves bridge IDs. |
+| ~~Old transition atlases not stripped~~ | ~~Low~~ | DONE (2026-03-21). Feathered atlases have 1 row only. `assets_feathered.json` has 325 sprites (1335 transition sprites removed). Source PNGs in `tiles/` still have 9 rows (preserved for TileEditor). |
+| ~~Fill tool incomplete~~ | ~~Low~~ | DONE (2026-03-21). UI sends `FLOOD_FILL` (kind=5) event. WASM calls `flood_fill()` with 10K tile safety limit. Full undo/redo support. |
+| ~~Drawing tools not wired~~ | ~~Medium~~ | DONE (2026-03-21). Line tool (Bresenham), Rect fill tool, Erase rect, Undo/Redo (Ctrl+Z/Ctrl+Shift+Z). Two-point drag protocol via DRAG_START event. Keyboard shortcuts wired (H/B/E/G/L/R/C). Drag preview overlay for line/rect tools (SVG, Bresenham-accurate for line, bounding rect for rect). |
+| ~~Character system missing~~ | ~~High~~ | DONE (2026-03-21). Characters stored as CompositeActor (core entity) in WASM HashMap. Place (Shift+click), Select (click), Move (right-click), Delete. Rendered as colored vector rectangles with direction indicator and health bar. Pathfinding trait (InfiniteNavGrid) ready but movement is instant teleport for now. |
+| ~~Tile selector flat dropdown~~ | ~~Medium~~ | DONE (2026-03-21). Replaced single `<select>` with categorized AssetPanel. Tiles grouped by tileType (Terrain/Paths/Bridges). Sprite previews from atlas first-frame CSS crop. Characters and weapons sections with previews. |
+| **MapEditor stays on source atlases** | Low | Decision: Option A (2026-03-21). MapEditor keeps 128x128 source atlases, no feathering. Old transition system remains. MapEditor is the authoring tool for discrete maps that get stamped onto the infinite canvas. |
+| ~~GameCanvas renderer~~ | ~~N/A~~ | DEPRECATED (2026-03-21). Freedom-board supersedes GameCanvas as the runtime renderer. GameCanvas code retained for reference only. |
+| **TileEditor save pipeline not updated** | Medium | Tile Editor outputs 128x128 PNGs but no auto-feathering step. Production pipeline needs WASM featherer or CI hook. |
+| **WASM featherer for production** | Medium | `feather_atlases.py` is Python-only. AWS Lambda needs a WASM or Rust-native equivalent. |
+| **Character sprite pipeline** | Medium | Characters rendered as vector rectangles. Need to bake character sprites into atlases and integrate with engine sprite system for proper visual rendering. |
+| **A* pathfinding for movement** | Medium | `find_path_in_radius` exists in core with `InfiniteNavGrid` trait. WASM needs NavGrid adapter (walkability from tile metadata). Currently instant teleport. |
+| **stamp_tiles not wired to UI** | Low | Core `stamp_tiles()` function exists with tests. Needs WASM event + React UI for map import (file picker → JSON parse → stamp). |
+| **Undo stack unbounded** | Medium | `Vec<Vec<EditResult>>` grows without limit. Need max depth (e.g., 1000) with tail truncation. |
+| **Character state not serialized** | High | Characters are in-memory only. Need serialization alongside SparseWorld for save/load. |
+| **Chunk-level serialization** | High | Large worlds (10M+ tiles) need chunk-level save/load (stream chunks as camera moves) rather than monolithic JSON. WASM memory ceiling is ~4GB. |
+| **movementCost not in AssetPanel** | Low | Tile passable/movementCost lives in per-tile `properties.json` files under `/mods/tiles/`, not in `manifest.json`. AssetPanel shows terrainType (LAND/WATER) only. Fix: either merge properties into manifest during bake, or batch-fetch properties.json files on startup (18 requests). |
 
 ### Assumptions
 
@@ -498,8 +523,9 @@ Total: **61 tests** covering core entities and use cases.
 
 1. **No adapters layer**: The WASM crate imports core directly. If Rhai scripting or persistence gateways are added, an adapters layer should be introduced.
 2. **Camera owned by React**: Originally considered WASM-owned camera. React-owned was chosen because the infinite canvas pan/zoom is a UI concern, and React already handles pointer events natively.
-3. **Single-layer tiles**: TilePlacement supports multi-layer (0-5) but the current UI only places on layer 0. Multi-layer editing is a future feature.
+3. **Multi-layer tiles**: ADR-007 (2026-03-21). `MAX_LAYERS=8`. Chunk stores `[[Option<TP>; 8]; 1024]` (64KB). Layer auto-derived from tile type in React via `tileTypeToLayer()`. Ground=0, Water=1, Bridge=2, Path=3, Objects=4, Reserved=5-7.
 4. **Feathered tile edges replace transitions**: ADR-006. Terrain blending uses pre-baked alpha feathering instead of 8-directional transition sprites. See `docs/tile-rendering-system.md` and `docs/architecture_decisions.md`.
+5. **MapEditor stays on source atlases (Option A)**: MapEditor keeps 128x128 source atlases with old transition system. Feathering is runtime-only (freedom-board, GameCanvas). Editor shows raw tile edges — it's a creation tool, not a preview tool.
 
 ---
 
@@ -534,7 +560,8 @@ ui/canvas/
     App.tsx           # State container, manifest loading
     lib/manifest.ts   # loadTileManifest(), deterministic tile ordering
     components/
-      InfiniteCanvas.tsx  # Camera, input, zap-engine hook, event dispatch
-      Toolbar.tsx         # Tool buttons, tile selector
+      InfiniteCanvas.tsx  # Camera, input, zap-engine hook, event dispatch, drag preview
+      Toolbar.tsx         # Tool buttons, undo/redo hint
+      AssetPanel.tsx      # Categorized tile/character/weapon selector with sprite previews
       StatusBar.tsx       # Cursor, camera, stats display
 ```

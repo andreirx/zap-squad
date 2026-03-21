@@ -1,4 +1,4 @@
-import { useRef, useEffect, useCallback } from 'react';
+import { useRef, useEffect, useCallback, useState } from 'react';
 import { useZapEngine } from '@zap/web/react';
 import type { Tool } from '../App';
 import type { TileRegistryEntry } from '../lib/manifest';
@@ -10,6 +10,17 @@ const EVENTS = {
   ERASE_TILE: 2,
   SET_TOOL: 3,
   SET_ACTIVE_TILE: 4,
+  FLOOD_FILL: 5,
+  DRAW_LINE: 6,
+  FILL_RECT: 7,
+  ERASE_RECT: 8,
+  UNDO: 9,
+  REDO: 10,
+  DRAG_START: 20,
+  PLACE_CHARACTER: 30,
+  REMOVE_CHARACTER: 31,
+  SELECT_CHARACTER: 32,
+  MOVE_CHARACTER: 33,
   CAMERA_UPDATE: 100,
   VIEWPORT_SIZE: 101,
 } as const;
@@ -20,11 +31,36 @@ const TOOL_IDS: Record<Tool, number> = {
   draw: 1,
   erase: 2,
   fill: 3,
+  line: 4,
+  rect: 5,
+  character: 6,
 };
 
 /** Engine game world dimensions. Must match GameConfig in lib.rs. */
 const GAME_WIDTH = 1920;
 const GAME_HEIGHT = 1080;
+
+/** Bresenham's line algorithm — returns list of integer tile coordinates on the line.
+ *  Used for line-tool drag preview. Matches the Rust-side draw_line in core/. */
+function bresenhamTiles(x0: number, y0: number, x1: number, y1: number): { x: number; y: number }[] {
+  const tiles: { x: number; y: number }[] = [];
+  const dx = Math.abs(x1 - x0);
+  const dy = Math.abs(y1 - y0);
+  const sx = x0 < x1 ? 1 : -1;
+  const sy = y0 < y1 ? 1 : -1;
+  let err = dx - dy;
+  let x = x0, y = y0;
+  for (;;) {
+    tiles.push({ x, y });
+    if (x === x1 && y === y1) break;
+    const e2 = 2 * err;
+    if (e2 > -dy) { err -= dy; x += sx; }
+    if (e2 < dx) { err += dx; y += sy; }
+    // Safety cap — preview only, no reason to render 1000+ tiles
+    if (tiles.length >= 500) break;
+  }
+  return tiles;
+}
 
 /** Derive storage layer from tile type metadata.
  *
@@ -105,6 +141,13 @@ export function InfiniteCanvas({
 
   // ── Track whether we've sent the tile registry to WASM ────────────
   const registrySentRef = useRef(false);
+
+  // ── Two-point tool preview (line/rect drag overlay) ─────────────
+  const [preview, setPreview] = useState<{
+    startX: number; startY: number;
+    endX: number; endY: number;
+    tool: 'line' | 'rect';
+  } | null>(null);
 
   // ── zap-engine hook ───────────────────────────────────────────────
   const { canvasRef, sendEvent, isReady, fps, canvasKey } = useZapEngine({
@@ -199,6 +242,31 @@ export function InfiniteCanvas({
     sendEvent({ type: 'custom', kind: EVENTS.SET_ACTIVE_TILE, a: activeAssetId, b: activeLayer, c: 0 });
   }, [activeAssetId, activeLayer, isReady, sendEvent]);
 
+  // ── Keyboard shortcuts (undo/redo, tool hotkeys) ─────────────────
+  useEffect(() => {
+    if (!isReady) return;
+    const handler = (e: KeyboardEvent) => {
+      // Undo: Ctrl+Z (or Cmd+Z on Mac)
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        sendEvent({ type: 'custom', kind: EVENTS.UNDO, a: 0, b: 0, c: 0 });
+      }
+      // Redo: Ctrl+Shift+Z or Ctrl+Y
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'Z' || e.key === 'y')) {
+        e.preventDefault();
+        sendEvent({ type: 'custom', kind: EVENTS.REDO, a: 0, b: 0, c: 0 });
+      }
+      // Delete/Backspace: remove character at selection (when in character tool)
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        if (tool === 'character') {
+          sendEvent({ type: 'custom', kind: EVENTS.REMOVE_CHARACTER, a: 0, b: 0, c: 0 });
+        }
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [isReady, sendEvent, tool]);
+
   // ── Resize observer ───────────────────────────────────────────────
   useEffect(() => {
     const el = containerRef.current;
@@ -225,6 +293,22 @@ export function InfiniteCanvas({
       y: Math.floor(gameY / cam.zoom + cam.y),
     };
   }, [getProjection]);
+
+  // ── Tile-to-screen conversion (tile coords → CSS pixels) ──────────
+  //
+  // Inverse of screenToTile. Returns CSS pixel position of the tile's
+  // top-left corner relative to the container element.
+  const tileToScreen = useCallback((tileX: number, tileY: number) => {
+    const cam = cameraRef.current;
+    const { scale } = getProjection();
+    return {
+      x: (tileX - cam.x) * cam.zoom / scale,
+      y: (tileY - cam.y) * cam.zoom / scale,
+    };
+  }, [getProjection]);
+
+  // ── Clear preview when tool changes (safety) ──────────────────────
+  useEffect(() => { setPreview(null); }, [tool]);
 
   // ── Mouse handlers ────────────────────────────────────────────────
 
@@ -255,7 +339,21 @@ export function InfiniteCanvas({
       } else if (tool === 'erase') {
         sendEvent({ type: 'custom', kind: EVENTS.ERASE_TILE, a: tile.x, b: tile.y, c: activeLayer });
       } else if (tool === 'fill') {
-        sendEvent({ type: 'custom', kind: EVENTS.PLACE_TILE, a: tile.x, b: tile.y, c: activeAssetId });
+        sendEvent({ type: 'custom', kind: EVENTS.FLOOD_FILL, a: tile.x, b: tile.y, c: activeAssetId });
+      } else if (tool === 'line' || tool === 'rect') {
+        // Two-point tools: store start on pointer down, complete on pointer up
+        sendEvent({ type: 'custom', kind: EVENTS.DRAG_START, a: tile.x, b: tile.y, c: 0 });
+        setPreview({ startX: tile.x, startY: tile.y, endX: tile.x, endY: tile.y, tool });
+      } else if (tool === 'character') {
+        // Left click: try to select existing character, or place new one
+        // Right click handled by context menu prevention
+        // Shift+click: place character; plain click: select, then click elsewhere to move
+        if (e.shiftKey) {
+          sendEvent({ type: 'custom', kind: EVENTS.PLACE_CHARACTER, a: tile.x, b: tile.y, c: 0 });
+        } else {
+          // First try select; if nothing selected, this is a no-op on WASM side
+          sendEvent({ type: 'custom', kind: EVENTS.SELECT_CHARACTER, a: tile.x, b: tile.y, c: 0 });
+        }
       }
     }
   }, [tool, activeAssetId, activeLayer, isReady, sendEvent, screenToTile]);
@@ -291,15 +389,31 @@ export function InfiniteCanvas({
           sendEvent({ type: 'custom', kind: EVENTS.PLACE_TILE, a: tile.x, b: tile.y, c: activeAssetId });
         } else if (tool === 'erase') {
           sendEvent({ type: 'custom', kind: EVENTS.ERASE_TILE, a: tile.x, b: tile.y, c: activeLayer });
+        } else if (tool === 'line' || tool === 'rect') {
+          setPreview(prev => prev ? { ...prev, endX: tile.x, endY: tile.y } : null);
         }
       }
     }
   }, [tool, activeAssetId, activeLayer, isReady, sendEvent, screenToTile, syncCamera, onCursorTileChange, getProjection]);
 
   const handlePointerUp = useCallback((e: React.PointerEvent) => {
+    const drag = dragRef.current;
+    if (drag?.active && !drag.isPan && isReady) {
+      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+      const sx = e.clientX - rect.left;
+      const sy = e.clientY - rect.top;
+      const tile = screenToTile(sx, sy);
+
+      if (tool === 'line') {
+        sendEvent({ type: 'custom', kind: EVENTS.DRAW_LINE, a: tile.x, b: tile.y, c: activeAssetId });
+      } else if (tool === 'rect') {
+        sendEvent({ type: 'custom', kind: EVENTS.FILL_RECT, a: tile.x, b: tile.y, c: activeAssetId });
+      }
+    }
     dragRef.current = null;
+    setPreview(null);
     (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
-  }, []);
+  }, [tool, activeAssetId, isReady, sendEvent, screenToTile]);
 
   const handlePointerLeave = useCallback(() => {
     onCursorTileChange(null);
@@ -342,7 +456,16 @@ export function InfiniteCanvas({
       onPointerUp={handlePointerUp}
       onPointerLeave={handlePointerLeave}
       onWheel={handleWheel}
-      onContextMenu={e => e.preventDefault()}
+      onContextMenu={e => {
+        e.preventDefault();
+        if (tool === 'character' && isReady) {
+          const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+          const sx = e.clientX - rect.left;
+          const sy = e.clientY - rect.top;
+          const tile = screenToTile(sx, sy);
+          sendEvent({ type: 'custom', kind: EVENTS.MOVE_CHARACTER, a: tile.x, b: tile.y, c: 0 });
+        }
+      }}
     >
       <canvas
         ref={canvasRef}
@@ -354,6 +477,46 @@ export function InfiniteCanvas({
           imageRendering: 'pixelated',
         }}
       />
+
+      {/* ── Two-point tool preview overlay (line/rect) ──────────── */}
+      {preview && (() => {
+        const cam = cameraRef.current;
+        const { scale } = getProjection();
+        const tilePx = cam.zoom / scale; // CSS pixels per tile
+
+        if (preview.tool === 'rect') {
+          const minX = Math.min(preview.startX, preview.endX);
+          const minY = Math.min(preview.startY, preview.endY);
+          const maxX = Math.max(preview.startX, preview.endX);
+          const maxY = Math.max(preview.startY, preview.endY);
+          const tl = tileToScreen(minX, minY);
+          const w = (maxX - minX + 1) * tilePx;
+          const h = (maxY - minY + 1) * tilePx;
+          return (
+            <svg style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none' }}>
+              <rect x={tl.x} y={tl.y} width={w} height={h}
+                fill="rgba(233, 69, 96, 0.15)" stroke="rgba(233, 69, 96, 0.6)" strokeWidth={1.5} />
+            </svg>
+          );
+        }
+
+        if (preview.tool === 'line') {
+          const cells = bresenhamTiles(preview.startX, preview.startY, preview.endX, preview.endY);
+          return (
+            <svg style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none' }}>
+              {cells.map((t, i) => {
+                const pos = tileToScreen(t.x, t.y);
+                return (
+                  <rect key={i} x={pos.x} y={pos.y} width={tilePx} height={tilePx}
+                    fill="rgba(233, 69, 96, 0.15)" stroke="rgba(233, 69, 96, 0.5)" strokeWidth={1} />
+                );
+              })}
+            </svg>
+          );
+        }
+
+        return null;
+      })()}
 
       {/* FPS counter — UI chrome, not coordinate-dependent */}
       <div style={{

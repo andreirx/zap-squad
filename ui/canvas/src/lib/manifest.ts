@@ -2,28 +2,76 @@ import { ASSETS_URL } from '../config';
 
 /**
  * Tile metadata from manifest.json, matching the bake-atlases output format.
+ * Extended with atlas info for sprite preview rendering in AssetPanel.
  */
 export interface TileDefinition {
   id: string;
   name: string;
   variations: number;
   hasTransitions: boolean;
-  tileType: string;    // "TILE" | "PATH" | "BRIDGE" | "TRANSITION" | "WATER"
+  tileType: string;    // "TILE" | "PATH" | "BRIDGE"
   terrainType: string; // "LAND" | "WATER"
+  /** Relative path to atlas image (e.g. "tiles/iarba.png"). */
+  atlas: string;
+  atlasWidth: number;
+  atlasHeight: number;
+  spriteSize: number;
 }
 
 /**
- * The subset of manifest.json we care about.
+ * Character metadata from manifest.json.
+ * Preview uses first frame (row 0, col 0) of the atlas.
+ */
+export interface CharacterDefinition {
+  id: string;
+  name: string;
+  atlas: string;
+  spriteSize: number;
+}
+
+/**
+ * Weapon/object metadata from manifest.json.
+ * Preview uses first frame (row 0, col 0) of the atlas.
+ */
+export interface WeaponDefinition {
+  id: string;
+  name: string;
+  atlas: string;
+  spriteSize: number;
+}
+
+/**
+ * Raw manifest.json shape — only the fields we parse.
  */
 interface Manifest {
   tiles: Record<string, {
     id: string;
     name: string;
+    atlas: string;
+    atlasWidth: number;
+    atlasHeight: number;
+    spriteSize: number;
     variations: number;
     hasTransitions?: boolean;
     tileType?: string;
     terrainType?: string;
     bridgeAssetId?: string;
+  }>;
+  characters?: Record<string, {
+    id: string;
+    name: string;
+    atlas: string;
+    atlasWidth: number;
+    atlasHeight: number;
+    spriteSize: number;
+  }>;
+  weapons?: Record<string, {
+    id: string;
+    name: string;
+    atlas: string;
+    atlasWidth: number;
+    atlasHeight: number;
+    spriteSize: number;
   }>;
 }
 
@@ -40,12 +88,14 @@ export interface TileRegistryEntry {
 }
 
 /**
- * Load manifest.json and extract tile definitions.
+ * Load manifest.json and extract tile definitions, characters, and weapons.
  * Returns tiles sorted alphabetically by id for deterministic asset_id assignment.
  */
 export async function loadTileManifest(): Promise<{
   tiles: TileDefinition[];
   registry: TileRegistryEntry[];
+  characters: CharacterDefinition[];
+  weapons: WeaponDefinition[];
 }> {
   const url = `${ASSETS_URL}/manifest.json`;
   const resp = await fetch(url);
@@ -68,6 +118,10 @@ export async function loadTileManifest(): Promise<{
       hasTransitions: t.hasTransitions ?? false,
       tileType: t.tileType ?? 'TILE',
       terrainType: t.terrainType ?? 'LAND',
+      atlas: t.atlas,
+      atlasWidth: t.atlasWidth,
+      atlasHeight: t.atlasHeight,
+      spriteSize: t.spriteSize,
     };
   });
 
@@ -86,5 +140,17 @@ export async function loadTileManifest(): Promise<{
     return entry;
   });
 
-  return { tiles, registry };
+  // Characters — sorted by id for consistency
+  const characters: CharacterDefinition[] = Object.keys(manifest.characters ?? {}).sort().map(id => {
+    const c = manifest.characters![id];
+    return { id: c.id, name: c.name, atlas: c.atlas, spriteSize: c.spriteSize };
+  });
+
+  // Weapons — sorted by id for consistency
+  const weapons: WeaponDefinition[] = Object.keys(manifest.weapons ?? {}).sort().map(id => {
+    const w = manifest.weapons![id];
+    return { id: w.id, name: w.name, atlas: w.atlas, spriteSize: w.spriteSize };
+  });
+
+  return { tiles, registry, characters, weapons };
 }

@@ -2,9 +2,16 @@ import { useState, useCallback, useEffect } from 'react';
 import { InfiniteCanvas } from './components/InfiniteCanvas';
 import { Toolbar } from './components/Toolbar';
 import { StatusBar } from './components/StatusBar';
-import { loadTileManifest, TileDefinition, TileRegistryEntry } from './lib/manifest';
+import { AssetPanel } from './components/AssetPanel';
+import {
+  loadTileManifest,
+  TileDefinition,
+  TileRegistryEntry,
+  CharacterDefinition,
+  WeaponDefinition,
+} from './lib/manifest';
 
-export type Tool = 'pan' | 'draw' | 'erase' | 'fill';
+export type Tool = 'pan' | 'draw' | 'erase' | 'fill' | 'line' | 'rect' | 'character';
 
 export interface WorldStats {
   tileCount: number;
@@ -18,16 +25,47 @@ export default function App() {
   const [cursorTile, setCursorTile] = useState<{ x: number; y: number } | null>(null);
   const [cameraState, setCameraState] = useState({ x: 0, y: 0, zoom: 64 });
 
-  // Tile manifest data — loaded once at startup
+  // Manifest data — loaded once at startup
   const [tiles, setTiles] = useState<TileDefinition[]>([]);
   const [tileRegistry, setTileRegistry] = useState<TileRegistryEntry[]>([]);
+  const [characters, setCharacters] = useState<CharacterDefinition[]>([]);
+  const [weapons, setWeapons] = useState<WeaponDefinition[]>([]);
+
+  // ── Tool hotkeys (global) ────────────────────────────────────────
+  // Matches the key labels shown in Toolbar button tooltips.
+  // Guarded against modifier keys (Ctrl/Meta/Alt bypass) and form focus.
+  useEffect(() => {
+    const HOTKEYS: Record<string, Tool> = {
+      h: 'pan',
+      b: 'draw',
+      e: 'erase',
+      g: 'fill',
+      l: 'line',
+      r: 'rect',
+      c: 'character',
+    };
+    const handler = (ev: KeyboardEvent) => {
+      if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+      const tag = (ev.target as HTMLElement)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      const mapped = HOTKEYS[ev.key.toLowerCase()];
+      if (mapped) {
+        ev.preventDefault();
+        setTool(mapped);
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, []);
 
   useEffect(() => {
     loadTileManifest()
-      .then(({ tiles, registry }) => {
+      .then(({ tiles, registry, characters, weapons }) => {
         setTiles(tiles);
         setTileRegistry(registry);
-        console.log(`[freedom-board] loaded ${tiles.length} tile definitions`);
+        setCharacters(characters);
+        setWeapons(weapons);
+        console.log(`[freedom-board] loaded ${tiles.length} tiles, ${characters.length} characters, ${weapons.length} weapons`);
       })
       .catch(err => {
         console.error('[freedom-board] failed to load manifest:', err);
@@ -44,22 +82,25 @@ export default function App() {
 
   return (
     <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column' }}>
-      <Toolbar
-        tool={tool}
-        onToolChange={setTool}
-        activeAssetId={activeAssetId}
-        onAssetChange={setActiveAssetId}
-        tiles={tiles}
-      />
-      <div style={{ flex: 1, position: 'relative' }}>
-        <InfiniteCanvas
-          tool={tool}
+      <Toolbar tool={tool} onToolChange={setTool} />
+      <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+        <AssetPanel
+          tiles={tiles}
+          characters={characters}
+          weapons={weapons}
           activeAssetId={activeAssetId}
-          tileRegistry={tileRegistry}
-          onCursorTileChange={setCursorTile}
-          onCameraChange={setCameraState}
-          onGameEvent={handleGameEvent}
+          onAssetChange={setActiveAssetId}
         />
+        <div style={{ flex: 1, position: 'relative' }}>
+          <InfiniteCanvas
+            tool={tool}
+            activeAssetId={activeAssetId}
+            tileRegistry={tileRegistry}
+            onCursorTileChange={setCursorTile}
+            onCameraChange={setCameraState}
+            onGameEvent={handleGameEvent}
+          />
+        </div>
       </div>
       <StatusBar
         cursorTile={cursorTile}

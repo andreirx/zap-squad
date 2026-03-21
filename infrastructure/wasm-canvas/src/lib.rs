@@ -33,6 +33,17 @@
 //! | 2    | tile_x (i32) | tile_y (i32) | layer (u8)     | Erase tile          |
 //! | 3    | tool_id      | —            | —              | Set active tool      |
 //! | 4    | asset_id     | layer        | variant        | Set active tile      |
+//! | 5    | tile_x (i32) | tile_y (i32) | asset_id (u16) | Flood fill          |
+//! | 6    | end_x (i32)  | end_y (i32)  | asset_id (u16) | Draw line (from drag_start) |
+//! | 7    | end_x (i32)  | end_y (i32)  | asset_id (u16) | Fill rect (from drag_start) |
+//! | 8    | end_x (i32)  | end_y (i32)  | layer (u8)     | Erase rect (from drag_start) |
+//! | 9    | —            | —            | —              | Undo                |
+//! | 10   | —            | —            | —              | Redo                |
+//! | 20   | tile_x (i32) | tile_y (i32) | —              | Drag start (store origin) |
+//! | 30   | tile_x (i32) | tile_y (i32) | body_idx (u16) | Place character     |
+//! | 31   | tile_x (i32) | tile_y (i32) | —              | Remove character    |
+//! | 32   | tile_x (i32) | tile_y (i32) | —              | Select character    |
+//! | 33   | tile_x (i32) | tile_y (i32) | —              | Move character      |
 //! | 100  | camera_x     | camera_y     | zoom (px/tile) | Camera state update |
 //! | 101  | width_px     | height_px    | —              | Viewport resize     |
 //!
@@ -50,8 +61,10 @@ use zap_engine::*;
 use zapsquad_core::entities::freedom_board::{
     SparseWorld, TileCoord, TilePlacement, VisibleTile, CHUNK_SIZE,
 };
+use zapsquad_core::entities::{ActorId, CompositeActor, Direction};
 use zapsquad_core::use_cases::freedom_board::{
-    connectivity_bitmask, place_tile, erase_tile, query_viewport, EditResult,
+    connectivity_bitmask, draw_line, erase_rect, erase_tile, fill_rect, flood_fill, place_tile,
+    query_viewport, EditResult,
 };
 
 /// Feathered sprite geometry.
@@ -70,6 +83,17 @@ mod events {
     pub const ERASE_TILE: u32 = 2;
     pub const SET_TOOL: u32 = 3;
     pub const SET_ACTIVE_TILE: u32 = 4;
+    pub const FLOOD_FILL: u32 = 5;
+    pub const DRAW_LINE: u32 = 6;
+    pub const FILL_RECT: u32 = 7;
+    pub const ERASE_RECT: u32 = 8;
+    pub const UNDO: u32 = 9;
+    pub const REDO: u32 = 10;
+    pub const DRAG_START: u32 = 20;
+    pub const PLACE_CHARACTER: u32 = 30;
+    pub const REMOVE_CHARACTER: u32 = 31;
+    pub const SELECT_CHARACTER: u32 = 32;
+    pub const MOVE_CHARACTER: u32 = 33;
     pub const CAMERA_UPDATE: u32 = 100;
     pub const VIEWPORT_SIZE: u32 = 101;
 }
@@ -87,6 +111,9 @@ enum Tool {
     Draw = 1,
     Erase = 2,
     Fill = 3,
+    Line = 4,
+    Rect = 5,
+    Character = 6,
 }
 
 impl Tool {
@@ -96,6 +123,9 @@ impl Tool {
             1 => Tool::Draw,
             2 => Tool::Erase,
             3 => Tool::Fill,
+            4 => Tool::Line,
+            5 => Tool::Rect,
+            6 => Tool::Character,
             _ => Tool::Pan,
         }
     }
@@ -153,6 +183,20 @@ pub struct FreedomBoardGame {
     viewport_width: f32,  // visible game-world width (projection-adjusted)
     viewport_height: f32, // visible game-world height (projection-adjusted)
 
+    // ── Character state ────────────────────────────────────────────────
+    /// Characters on the infinite canvas. Separate from tile storage.
+    /// Characters use float positions for smooth animation, snapped to
+    /// tile grid for placement and collision detection.
+    characters: std::collections::HashMap<ActorId, CompositeActor>,
+    /// Next actor ID for spawning new characters.
+    next_actor_id: u32,
+    /// Currently selected character for commands (move, attack).
+    selected_character: Option<ActorId>,
+    /// Engine entity IDs for character rendering (despawned/respawned like tiles).
+    character_entities: Vec<EntityId>,
+    /// True when character state changed and entities need rebuild.
+    characters_dirty: bool,
+
     // ── Rendering state ─────────────────────────────────────────────────
     /// Engine entity IDs currently spawned for visible tiles.
     tile_entities: Vec<EntityId>,
@@ -166,6 +210,9 @@ pub struct FreedomBoardGame {
     active_layer: u8,
     active_variant: u8,
     tool: Tool,
+    /// Start coordinate for two-point operations (line, rect).
+    /// Set by DRAG_START event, consumed by DRAW_LINE / FILL_RECT / ERASE_RECT.
+    drag_start: Option<TileCoord>,
 
     // ── Stats tracking ──────────────────────────────────────────────────
     /// Last tile_count sent to React, to avoid spamming events.
@@ -186,6 +233,12 @@ impl FreedomBoardGame {
             viewport_width: 1920.0,
             viewport_height: 1080.0,
 
+            characters: std::collections::HashMap::new(),
+            next_actor_id: 1,
+            selected_character: None,
+            character_entities: Vec::new(),
+            characters_dirty: false,
+
             tile_entities: Vec::new(),
             last_rendered_generation: u64::MAX, // force initial render
             camera_dirty: true,
@@ -194,6 +247,7 @@ impl FreedomBoardGame {
             active_layer: 0,
             active_variant: 0,
             tool: Tool::Draw,
+            drag_start: None,
 
             last_reported_tile_count: u64::MAX,
         }
@@ -226,6 +280,143 @@ impl FreedomBoardGame {
                     let edit = erase_tile(&mut self.world, coord, layer);
                     self.undo_stack.push(vec![edit]);
                     self.redo_stack.clear();
+                }
+            }
+            events::FLOOD_FILL => {
+                let coord = TileCoord::new(a as i32, b as i32);
+                let tile = TilePlacement::new(c as u16, self.active_variant, self.active_layer);
+                let edits = flood_fill(&mut self.world, coord, tile, 10_000);
+                if !edits.is_empty() {
+                    self.undo_stack.push(edits);
+                    self.redo_stack.clear();
+                }
+            }
+            events::DRAW_LINE => {
+                if let Some(start) = self.drag_start.take() {
+                    let end = TileCoord::new(a as i32, b as i32);
+                    let tile = TilePlacement::new(c as u16, self.active_variant, self.active_layer);
+                    let edits = draw_line(&mut self.world, start, end, tile);
+                    if !edits.is_empty() {
+                        self.undo_stack.push(edits);
+                        self.redo_stack.clear();
+                    }
+                }
+            }
+            events::FILL_RECT => {
+                if let Some(start) = self.drag_start.take() {
+                    let end = TileCoord::new(a as i32, b as i32);
+                    let tile = TilePlacement::new(c as u16, self.active_variant, self.active_layer);
+                    let min = TileCoord::new(start.x.min(end.x), start.y.min(end.y));
+                    let max = TileCoord::new(start.x.max(end.x), start.y.max(end.y));
+                    let edits = fill_rect(&mut self.world, min, max, tile);
+                    if !edits.is_empty() {
+                        self.undo_stack.push(edits);
+                        self.redo_stack.clear();
+                    }
+                }
+            }
+            events::ERASE_RECT => {
+                if let Some(start) = self.drag_start.take() {
+                    let end = TileCoord::new(a as i32, b as i32);
+                    let layer = c as u8;
+                    let min = TileCoord::new(start.x.min(end.x), start.y.min(end.y));
+                    let max = TileCoord::new(start.x.max(end.x), start.y.max(end.y));
+                    let edits = erase_rect(&mut self.world, min, max, layer);
+                    if !edits.is_empty() {
+                        self.undo_stack.push(edits);
+                        self.redo_stack.clear();
+                    }
+                }
+            }
+            events::UNDO => {
+                if let Some(edits) = self.undo_stack.pop() {
+                    for edit in edits.iter().rev() {
+                        edit.undo(&mut self.world);
+                    }
+                    self.redo_stack.push(edits);
+                }
+            }
+            events::REDO => {
+                if let Some(edits) = self.redo_stack.pop() {
+                    for edit in &edits {
+                        edit.redo(&mut self.world);
+                    }
+                    self.undo_stack.push(edits);
+                }
+            }
+            events::DRAG_START => {
+                self.drag_start = Some(TileCoord::new(a as i32, b as i32));
+            }
+            events::PLACE_CHARACTER => {
+                // a=tile_x, b=tile_y, c=body_def_index (from character selector)
+                let tx = a as i32;
+                let ty = b as i32;
+                let body_idx = c as usize;
+                // For now, use a placeholder body_def_id based on index
+                // TODO: Wire character asset registry from React
+                let body_id = format!("character_{}", body_idx);
+                let id = ActorId(self.next_actor_id);
+                self.next_actor_id += 1;
+                let actor = CompositeActor::new(
+                    id,
+                    glam::Vec2::new(tx as f32 + 0.5, ty as f32 + 0.5),
+                    body_id,
+                );
+                self.characters.insert(id, actor);
+                self.characters_dirty = true;
+            }
+            events::REMOVE_CHARACTER => {
+                // If a=0, b=0: remove selected character (keyboard shortcut)
+                // Otherwise a=tile_x, b=tile_y: remove character at tile
+                let target = if a == 0.0 && b == 0.0 {
+                    self.selected_character
+                } else {
+                    let tx = a as f32 + 0.5;
+                    let ty = b as f32 + 0.5;
+                    self.characters
+                        .iter()
+                        .find(|(_, c)| {
+                            (c.position.x - tx).abs() < 0.5 && (c.position.y - ty).abs() < 0.5
+                        })
+                        .map(|(id, _)| *id)
+                };
+                if let Some(id) = target {
+                    self.characters.remove(&id);
+                    if self.selected_character == Some(id) {
+                        self.selected_character = None;
+                    }
+                    self.characters_dirty = true;
+                }
+            }
+            events::SELECT_CHARACTER => {
+                // a=tile_x, b=tile_y — select character at this tile
+                let tx = a as f32 + 0.5;
+                let ty = b as f32 + 0.5;
+                self.selected_character = self
+                    .characters
+                    .iter()
+                    .find(|(_, c)| {
+                        (c.position.x - tx).abs() < 0.5 && (c.position.y - ty).abs() < 0.5
+                    })
+                    .map(|(id, _)| *id);
+                self.characters_dirty = true; // redraw selection indicator
+            }
+            events::MOVE_CHARACTER => {
+                // a=tile_x, b=tile_y — command selected character to move here
+                if let Some(sel_id) = self.selected_character {
+                    let target_x = a as i32;
+                    let target_y = b as i32;
+                    // For now: instant teleport to target tile (pathfinding wired later)
+                    // TODO: Use find_path_in_radius for proper A* movement
+                    if let Some(actor) = self.characters.get_mut(&sel_id) {
+                        let dx = target_x as f32 + 0.5 - actor.position.x;
+                        let dy = target_y as f32 + 0.5 - actor.position.y;
+                        if let Some(dir) = Direction::from_velocity(glam::Vec2::new(dx, dy)) {
+                            actor.direction = dir;
+                        }
+                        actor.position = glam::Vec2::new(target_x as f32 + 0.5, target_y as f32 + 0.5);
+                        self.characters_dirty = true;
+                    }
                 }
             }
             events::SET_TOOL => {
@@ -404,6 +595,112 @@ impl FreedomBoardGame {
             }
         }
         false
+    }
+
+    /// Rebuild character entities as colored rectangles on the UI layer.
+    ///
+    /// Characters are rendered as vector rectangles (not sprites) for now.
+    /// This decouples character placement/movement from the character sprite pipeline.
+    /// TODO: Replace with proper sprite rendering once character atlases are integrated.
+    fn rebuild_character_entities(&mut self, ctx: &mut EngineContext) {
+        // Despawn old character entities
+        for eid in self.character_entities.drain(..) {
+            ctx.despawn(eid);
+        }
+
+        let (vp_min, vp_max) = self.visible_bounds();
+
+        for (id, actor) in &self.characters {
+            // Frustum cull — skip characters outside viewport
+            let tx = actor.position.x.floor() as i32;
+            let ty = actor.position.y.floor() as i32;
+            if tx < vp_min.x - 1 || tx > vp_max.x + 1 || ty < vp_min.y - 1 || ty > vp_max.y + 1
+            {
+                continue;
+            }
+
+            let screen = self.tile_to_screen(actor.position.x, actor.position.y);
+
+            // Draw character as a colored rectangle on UI layer
+            let is_selected = self.selected_character == Some(*id);
+            let size = self.zoom * 0.7; // slightly smaller than a tile
+            let half = size / 2.0;
+
+            // Body color: green for player, red for enemy, blue for selected
+            let color = if is_selected {
+                VectorColor::new(0.3, 0.6, 1.0, 0.9) // blue
+            } else if actor.tag == "enemy" {
+                VectorColor::new(0.9, 0.2, 0.2, 0.8) // red
+            } else {
+                VectorColor::new(0.2, 0.8, 0.3, 0.8) // green
+            };
+
+            ctx.vectors.fill_rect(
+                Vec2::new(screen.x - half, screen.y - half),
+                size,
+                size,
+                color,
+            );
+
+            // Direction indicator: small triangle pointing in facing direction
+            let indicator_color = VectorColor::new(1.0, 1.0, 1.0, 0.9);
+            let dir_offset = match actor.direction {
+                Direction::North => Vec2::new(0.0, -half),
+                Direction::East => Vec2::new(half, 0.0),
+                Direction::South => Vec2::new(0.0, half),
+                Direction::West => Vec2::new(-half, 0.0),
+            };
+            let tip = screen + dir_offset;
+            let indicator_size = self.zoom * 0.12;
+            ctx.vectors.fill_rect(
+                Vec2::new(tip.x - indicator_size / 2.0, tip.y - indicator_size / 2.0),
+                indicator_size,
+                indicator_size,
+                indicator_color,
+            );
+
+            // Selection ring
+            if is_selected {
+                let ring_color = VectorColor::new(1.0, 1.0, 0.3, 0.6);
+                ctx.vectors.stroke_rect(
+                    Vec2::new(screen.x - half - 2.0, screen.y - half - 2.0),
+                    size + 4.0,
+                    size + 4.0,
+                    2.0,
+                    ring_color,
+                );
+            }
+
+            // Health bar (if damaged)
+            if actor.health < actor.max_health {
+                let bar_width = size;
+                let bar_height = self.zoom * 0.08;
+                let bar_y = screen.y - half - bar_height - 2.0;
+                let hp_pct = actor.health as f32 / actor.max_health as f32;
+
+                // Background
+                ctx.vectors.fill_rect(
+                    Vec2::new(screen.x - half, bar_y),
+                    bar_width,
+                    bar_height,
+                    VectorColor::new(0.2, 0.2, 0.2, 0.8),
+                );
+                // Health fill
+                let hp_color = if hp_pct > 0.5 {
+                    VectorColor::new(0.2, 0.8, 0.2, 0.9)
+                } else if hp_pct > 0.25 {
+                    VectorColor::new(0.8, 0.6, 0.1, 0.9)
+                } else {
+                    VectorColor::new(0.9, 0.1, 0.1, 0.9)
+                };
+                ctx.vectors.fill_rect(
+                    Vec2::new(screen.x - half, bar_y),
+                    bar_width * hp_pct,
+                    bar_height,
+                    hp_color,
+                );
+            }
+        }
     }
 
     /// Emit world stats to React if they changed.
@@ -618,12 +915,18 @@ impl Game for FreedomBoardGame {
             self.rebuild_visible_entities(ctx);
             self.last_rendered_generation = self.world.generation();
             self.camera_dirty = false;
+            self.characters_dirty = true; // camera moved, redraw characters
         }
 
         // 3. Draw vector overlays (cleared each frame, must redraw every update)
         self.draw_grid(ctx);
         self.draw_origin_crosshair(ctx);
         self.draw_quadtree_debug(ctx);
+
+        // 4. Characters are drawn as vectors (cleared each frame), so always redraw
+        if !self.characters.is_empty() {
+            self.rebuild_character_entities(ctx);
+        }
 
         // 4. Emit stats to React
         self.emit_stats_if_changed(ctx);

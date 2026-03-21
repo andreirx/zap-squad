@@ -1,12 +1,8 @@
 import type { Tool } from '../App';
-import type { TileDefinition } from '../lib/manifest';
 
 interface ToolbarProps {
   tool: Tool;
   onToolChange: (tool: Tool) => void;
-  activeAssetId: number;
-  onAssetChange: (id: number) => void;
-  tiles: TileDefinition[];
 }
 
 const TOOLS: { id: Tool; label: string; key: string }[] = [
@@ -14,9 +10,12 @@ const TOOLS: { id: Tool; label: string; key: string }[] = [
   { id: 'draw', label: 'Draw', key: 'B' },
   { id: 'erase', label: 'Erase', key: 'E' },
   { id: 'fill', label: 'Fill', key: 'G' },
+  { id: 'line', label: 'Line', key: 'L' },
+  { id: 'rect', label: 'Rect', key: 'R' },
+  { id: 'character', label: 'Char', key: 'C' },
 ];
 
-export function Toolbar({ tool, onToolChange, activeAssetId, onAssetChange, tiles }: ToolbarProps) {
+export function Toolbar({ tool, onToolChange }: ToolbarProps) {
   return (
     <div style={{
       display: 'flex',
@@ -49,32 +48,9 @@ export function Toolbar({ tool, onToolChange, activeAssetId, onAssetChange, tile
         </button>
       ))}
 
-      <span style={{ marginLeft: 16, color: '#556677' }}>|</span>
-
-      <label style={{ marginLeft: 8, color: '#8899aa', fontSize: 12 }}>
-        Tile:
-        <select
-          value={activeAssetId}
-          onChange={e => onAssetChange(parseInt(e.target.value))}
-          style={{
-            marginLeft: 4,
-            padding: '2px 4px',
-            background: '#0a0a1a',
-            color: '#e0e0e0',
-            border: '1px solid #0f3460',
-            borderRadius: 3,
-            fontSize: 12,
-            maxWidth: 180,
-          }}
-        >
-          {tiles.length === 0 && <option value={0}>Loading...</option>}
-          {tiles.map((t, i) => (
-            <option key={t.id} value={i}>
-              {t.id} ({t.variations}v)
-            </option>
-          ))}
-        </select>
-      </label>
+      <span style={{ marginLeft: 'auto', color: '#445566', fontSize: 10 }}>
+        Ctrl+Z undo | Ctrl+Shift+Z redo
+      </span>
     </div>
   );
 }

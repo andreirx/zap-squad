@@ -121,6 +121,96 @@ pub fn find_path(grid: &impl NavGrid, start: IVec2, goal: IVec2) -> PathResult {
     None // No path found
 }
 
+/// Navigation grid for infinite/unbounded worlds.
+///
+/// Unlike `NavGrid`, this trait does not require width/height bounds.
+/// The pathfinder limits search with a radius parameter instead.
+pub trait InfiniteNavGrid {
+    fn is_walkable(&self, x: i32, y: i32) -> bool;
+}
+
+/// A* pathfinding on an unbounded grid, limited by search radius.
+///
+/// The search explores a square region of `(2*max_radius+1)^2` tiles
+/// centered on `start`. This prevents infinite exploration when no
+/// path exists.
+///
+/// Uses the same 8-directional movement and Chebyshev heuristic as `find_path`.
+pub fn find_path_in_radius(
+    grid: &impl InfiniteNavGrid,
+    start: IVec2,
+    goal: IVec2,
+    max_radius: i32,
+) -> PathResult {
+    // Quick reject: goal outside search radius
+    if (goal.x - start.x).abs() > max_radius || (goal.y - start.y).abs() > max_radius {
+        return None;
+    }
+
+    if !grid.is_walkable(goal.x, goal.y) {
+        return None;
+    }
+
+    let mut open = BinaryHeap::new();
+    let mut came_from: HashMap<IVec2, IVec2> = HashMap::new();
+    let mut g_score: HashMap<IVec2, i32> = HashMap::new();
+
+    g_score.insert(start, 0);
+    open.push(Node {
+        pos: start,
+        cost: 0,
+        priority: heuristic(start, goal),
+    });
+
+    while let Some(current) = open.pop() {
+        if current.pos == goal {
+            let mut path = vec![goal];
+            let mut curr = goal;
+            while let Some(&prev) = came_from.get(&curr) {
+                if prev == start {
+                    break;
+                }
+                path.push(prev);
+                curr = prev;
+            }
+            path.reverse();
+            return Some(path);
+        }
+
+        let current_g = *g_score.get(&current.pos).unwrap_or(&i32::MAX);
+
+        for (dx, dy) in DIRECTIONS {
+            let neighbor = IVec2::new(current.pos.x + dx, current.pos.y + dy);
+
+            // Radius bounds check (replaces width/height check)
+            if (neighbor.x - start.x).abs() > max_radius
+                || (neighbor.y - start.y).abs() > max_radius
+            {
+                continue;
+            }
+
+            if !grid.is_walkable(neighbor.x, neighbor.y) {
+                continue;
+            }
+
+            let move_cost = if dx != 0 && dy != 0 { 14 } else { 10 };
+            let tentative_g = current_g + move_cost;
+
+            if tentative_g < *g_score.get(&neighbor).unwrap_or(&i32::MAX) {
+                came_from.insert(neighbor, current.pos);
+                g_score.insert(neighbor, tentative_g);
+                open.push(Node {
+                    pos: neighbor,
+                    cost: tentative_g,
+                    priority: tentative_g + heuristic(neighbor, goal) * 10,
+                });
+            }
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +263,61 @@ mod tests {
             blocked: vec![IVec2::new(3, 3)],
         };
         let path = find_path(&grid, IVec2::new(0, 0), IVec2::new(3, 3));
+        assert!(path.is_none());
+    }
+
+    // ── InfiniteNavGrid tests ────────────────────────────────────────
+
+    struct InfiniteTestGrid {
+        blocked: Vec<IVec2>,
+    }
+
+    impl InfiniteNavGrid for InfiniteTestGrid {
+        fn is_walkable(&self, x: i32, y: i32) -> bool {
+            !self.blocked.contains(&IVec2::new(x, y))
+        }
+    }
+
+    #[test]
+    fn infinite_direct_path() {
+        let grid = InfiniteTestGrid { blocked: vec![] };
+        let path = find_path_in_radius(&grid, IVec2::new(100, 200), IVec2::new(103, 200), 50);
+        assert!(path.is_some());
+        let path = path.unwrap();
+        assert_eq!(*path.last().unwrap(), IVec2::new(103, 200));
+    }
+
+    #[test]
+    fn infinite_negative_coords() {
+        let grid = InfiniteTestGrid { blocked: vec![] };
+        let path = find_path_in_radius(&grid, IVec2::new(-10, -10), IVec2::new(-5, -5), 20);
+        assert!(path.is_some());
+        assert_eq!(*path.unwrap().last().unwrap(), IVec2::new(-5, -5));
+    }
+
+    #[test]
+    fn infinite_path_around_obstacle() {
+        let grid = InfiniteTestGrid {
+            blocked: vec![IVec2::new(2, 1), IVec2::new(2, 2), IVec2::new(2, 3)],
+        };
+        let path = find_path_in_radius(&grid, IVec2::new(0, 2), IVec2::new(4, 2), 20);
+        assert!(path.is_some());
+        assert!(!path.as_ref().unwrap().contains(&IVec2::new(2, 2)));
+    }
+
+    #[test]
+    fn infinite_goal_outside_radius() {
+        let grid = InfiniteTestGrid { blocked: vec![] };
+        let path = find_path_in_radius(&grid, IVec2::new(0, 0), IVec2::new(100, 0), 10);
+        assert!(path.is_none()); // goal beyond search radius
+    }
+
+    #[test]
+    fn infinite_blocked_goal() {
+        let grid = InfiniteTestGrid {
+            blocked: vec![IVec2::new(5, 5)],
+        };
+        let path = find_path_in_radius(&grid, IVec2::new(0, 0), IVec2::new(5, 5), 20);
         assert!(path.is_none());
     }
 }
