@@ -225,6 +225,38 @@ impl SparseWorld {
         self.chunks.get(&coord)
     }
 
+    // ── Full-world iteration ────────────────────────────────────────────────
+
+    /// Iterate over ALL tiles in the world, yielding `(world_coord, &TilePlacement)`.
+    ///
+    /// Iteration order is **unspecified** — depends on HashMap iteration order.
+    /// For deterministic serialization, the caller must sort the output.
+    ///
+    /// Zero allocation: returns a composed iterator over chunks and their cells.
+    pub fn iter_all(&self) -> impl Iterator<Item = (TileCoord, &TilePlacement)> {
+        self.chunks.iter().flat_map(|(cc, chunk)| {
+            let origin = cc.origin_tile();
+            chunk.iter_occupied().map(move |(lx, ly, tile)| {
+                (
+                    TileCoord::new(origin.x + lx as i32, origin.y + ly as i32),
+                    tile,
+                )
+            })
+        })
+    }
+
+    /// Remove all tiles, chunks, and spatial index entries.
+    ///
+    /// After clear(), the world is in the same state as `SparseWorld::new()`
+    /// except the generation counter continues incrementing (so renderers
+    /// detect the change).
+    pub fn clear(&mut self) {
+        self.chunks.clear();
+        self.index = QuadTreeIndex::new();
+        self.tile_count = 0;
+        self.generation += 1;
+    }
+
     // ── Statistics ──────────────────────────────────────────────────────────
 
     /// Total number of placed tiles across all chunks and layers.
@@ -539,5 +571,118 @@ mod tests {
         // Query a 50x50 sub-region
         let visible = world.query_visible(tc(25, 25), tc(74, 74));
         assert_eq!(visible.len(), 2500);
+    }
+
+    // ── iter_all tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn iter_all_empty_world() {
+        let world = SparseWorld::new();
+        assert_eq!(world.iter_all().count(), 0);
+    }
+
+    #[test]
+    fn iter_all_single_tile() {
+        let mut world = SparseWorld::new();
+        world.set(tc(5, 10), tile(42));
+
+        let all: Vec<_> = world.iter_all().collect();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, tc(5, 10));
+        assert_eq!(all[0].1.asset_id, 42);
+    }
+
+    #[test]
+    fn iter_all_multi_layer_same_cell() {
+        let mut world = SparseWorld::new();
+        world.set(tc(3, 3), tile_on(10, 0));
+        world.set(tc(3, 3), tile_on(20, 2));
+        world.set(tc(3, 3), tile_on(30, 5));
+
+        let mut all: Vec<_> = world.iter_all().collect();
+        all.sort_by_key(|(_, t)| t.layer);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].1.asset_id, 10);
+        assert_eq!(all[1].1.asset_id, 20);
+        assert_eq!(all[2].1.asset_id, 30);
+        // All at same world coord
+        assert!(all.iter().all(|(c, _)| *c == tc(3, 3)));
+    }
+
+    #[test]
+    fn iter_all_across_chunks() {
+        let mut world = SparseWorld::new();
+        world.set(tc(0, 0), tile(1));       // chunk (0,0)
+        world.set(tc(50, 50), tile(2));     // chunk (1,1)
+        world.set(tc(-10, -10), tile(3));   // chunk (-1,-1)
+
+        assert_eq!(world.chunk_count(), 3);
+        assert_eq!(world.iter_all().count(), 3);
+
+        let mut all: Vec<_> = world.iter_all().collect();
+        all.sort_by_key(|(c, _)| (c.x, c.y));
+        assert_eq!(all[0].0, tc(-10, -10));
+        assert_eq!(all[1].0, tc(0, 0));
+        assert_eq!(all[2].0, tc(50, 50));
+    }
+
+    #[test]
+    fn iter_all_count_matches_tile_count() {
+        let mut world = SparseWorld::new();
+        for x in 0..10 {
+            for y in 0..10 {
+                world.set(tc(x, y), tile_on((x + y) as u16, 0));
+                world.set(tc(x, y), tile_on((x + y) as u16, 3));
+            }
+        }
+        assert_eq!(world.tile_count(), 200);
+        assert_eq!(world.iter_all().count(), 200);
+    }
+
+    // ── clear tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn clear_empty_world() {
+        let mut world = SparseWorld::new();
+        let gen_before = world.generation();
+        world.clear();
+        assert_eq!(world.tile_count(), 0);
+        assert_eq!(world.chunk_count(), 0);
+        assert_eq!(world.generation(), gen_before + 1);
+    }
+
+    #[test]
+    fn clear_populated_world() {
+        let mut world = SparseWorld::new();
+        for x in 0..50 {
+            world.set(tc(x, 0), tile(x as u16));
+        }
+        assert_eq!(world.tile_count(), 50);
+        assert!(world.chunk_count() > 0);
+
+        let gen_before = world.generation();
+        world.clear();
+
+        assert_eq!(world.tile_count(), 0);
+        assert_eq!(world.chunk_count(), 0);
+        assert!(world.bounds().is_none());
+        assert_eq!(world.generation(), gen_before + 1);
+        // All tiles gone
+        for x in 0..50 {
+            assert!(world.get(tc(x, 0), 0).is_none());
+        }
+    }
+
+    #[test]
+    fn clear_then_reuse() {
+        let mut world = SparseWorld::new();
+        world.set(tc(0, 0), tile(1));
+        world.clear();
+        world.set(tc(10, 10), tile(99));
+
+        assert_eq!(world.tile_count(), 1);
+        assert_eq!(world.chunk_count(), 1);
+        assert_eq!(world.get(tc(10, 10), 0).unwrap().asset_id, 99);
+        assert!(world.get(tc(0, 0), 0).is_none());
     }
 }

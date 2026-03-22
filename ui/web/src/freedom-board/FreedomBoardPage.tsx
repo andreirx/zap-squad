@@ -1,8 +1,9 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { InfiniteCanvas } from './components/InfiniteCanvas';
-import { Toolbar } from './components/Toolbar';
+import { InfiniteCanvas, tileTypeToLayer } from './components/InfiniteCanvas';
+import { FBToolbar } from './components/FBToolbar';
 import { StatusBar } from './components/StatusBar';
 import { AssetPanel } from './components/AssetPanel';
+import { WorldListModal } from './components/WorldListModal';
 import {
   loadTileManifest,
   TileDefinition,
@@ -10,13 +11,9 @@ import {
   CharacterDefinition,
   WeaponDefinition,
 } from './lib/manifest';
-
-export type Tool = 'pan' | 'draw' | 'erase' | 'fill' | 'line' | 'rect' | 'character';
-
-export interface WorldStats {
-  tileCount: number;
-  chunkCount: number;
-}
+import type { Tool, WorldStats } from './types';
+import { worldStore } from '../lib/idb';
+import type { WorldData } from '../lib/idb';
 
 // ── LDtk grid tile (matches MapEditor output) ────────────────────────
 interface LdtkGridTile {
@@ -39,29 +36,6 @@ interface LdtkLevel {
     pxHei: number;
     layerInstances: LdtkLayerInstance[];
   }>;
-}
-
-/**
- * Derive storage layer from tile type metadata.
- * Duplicated from InfiniteCanvas.tsx — same logic React uses for individual tile placement.
- *
- * | tileType | terrainType | Layer | Semantic |
- * |----------|-------------|-------|----------|
- * | TILE     | *           | 0     | Ground   |
- * | PATH     | WATER       | 1     | Rivers   |
- * | BRIDGE   | *           | 2     | Bridges  |
- * | PATH     | LAND        | 3     | Roads    |
- *
- * TECH DEBT: This duplicates tileTypeToLayer in InfiniteCanvas.tsx.
- * Should be extracted to a shared utility if a third consumer appears.
- */
-function tileTypeToLayer(entry: TileRegistryEntry | undefined): number {
-  if (!entry) return 0;
-  if (entry.tileType === 'BRIDGE') return 2;
-  if (entry.tileType === 'PATH') {
-    return entry.terrainType === 'WATER' ? 1 : 3;
-  }
-  return 0;
 }
 
 /**
@@ -143,7 +117,22 @@ function parseLdtkToStamp(
   return JSON.stringify({ originX, originY, tiles });
 }
 
-export default function App() {
+/**
+ * Trigger a browser file download with the given content.
+ */
+function downloadFile(filename: string, content: string, mimeType = 'application/json') {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+export function FreedomBoardPage() {
   const [tool, setTool] = useState<Tool>('draw');
   const [activeAssetId, setActiveAssetId] = useState(0);
   const [activeCharacterId, setActiveCharacterId] = useState(0);
@@ -159,10 +148,17 @@ export default function App() {
 
   // Stamp state — set when user imports a map file, cleared after dispatch to WASM
   const [pendingStamp, setPendingStamp] = useState<string | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  // World import state — set when user loads a world file from disk
+  const [pendingWorldImport, setPendingWorldImport] = useState<string | null>(null);
+  const [showWorldList, setShowWorldList] = useState(false);
+  const mapFileInputRef = useRef<HTMLInputElement>(null);
+  const worldFileInputRef = useRef<HTMLInputElement>(null);
+
+  // Last exported world data (for save-to-disk)
+  const lastExportRef = useRef<WorldData | null>(null);
 
   // ── Tool hotkeys (global) ────────────────────────────────────────
-  // Matches the key labels shown in Toolbar button tooltips.
+  // Matches the key labels shown in FBToolbar button tooltips.
   // Guarded against modifier keys (Ctrl/Meta/Alt bypass) and form focus.
   useEffect(() => {
     const HOTKEYS: Record<string, Tool> = {
@@ -228,10 +224,10 @@ export default function App() {
   }, [cameraState, tileRegistry]);
 
   const handleImportClick = useCallback(() => {
-    fileInputRef.current?.click();
+    mapFileInputRef.current?.click();
   }, []);
 
-  const handleFileChange = useCallback((ev: React.ChangeEvent<HTMLInputElement>) => {
+  const handleMapFileChange = useCallback((ev: React.ChangeEvent<HTMLInputElement>) => {
     const file = ev.target.files?.[0];
     if (file) {
       handleImportFile(file);
@@ -244,17 +240,101 @@ export default function App() {
     setPendingStamp(null);
   }, []);
 
+  // ── Save to disk (download world JSON) ─────────────────────────────
+  const handleWorldExport = useCallback((worldData: WorldData) => {
+    lastExportRef.current = worldData;
+  }, []);
+
+  const handleSaveToDisk = useCallback(() => {
+    const data = lastExportRef.current;
+    if (!data) {
+      console.warn('[freedom-board] no world data to save — draw some tiles first');
+      return;
+    }
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const filename = `freedom-board-${timestamp}.json`;
+    downloadFile(filename, JSON.stringify(data, null, 2));
+    console.log(`[freedom-board] saved world to ${filename}`);
+  }, []);
+
+  // ── Load from disk (upload world JSON → import to WASM) ────────────
+  const handleLoadFromDisk = useCallback(() => {
+    worldFileInputRef.current?.click();
+  }, []);
+
+  const handleWorldFileChange = useCallback((ev: React.ChangeEvent<HTMLInputElement>) => {
+    const file = ev.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const text = reader.result as string;
+        const data = JSON.parse(text) as WorldData;
+        if (!data.version || !data.tiles) {
+          console.error('[freedom-board] invalid world file: missing version or tiles');
+          return;
+        }
+        // Send directly to WASM via import_world (no page reload needed).
+        // Also save to IDB so it persists across sessions.
+        setPendingWorldImport(JSON.stringify(data));
+        worldStore.save('autosave', data).catch(err =>
+          console.warn('[freedom-board] failed to save imported world to IDB:', err)
+        );
+        console.log(`[freedom-board] loaded from disk: ${data.tiles.length} tiles, ${data.characters.length} characters`);
+      } catch (err) {
+        console.error('[freedom-board] failed to parse world file:', err);
+      }
+    };
+    reader.readAsText(file);
+    ev.target.value = '';
+  }, []);
+
+  // ── World list handlers ─────────────────────────────────────────────
+  const handleWorldListLoad = useCallback((name: string) => {
+    worldStore.load(name).then(data => {
+      if (data) {
+        setPendingWorldImport(JSON.stringify(data));
+        console.log(`[freedom-board] loading world "${name}": ${data.tiles.length} tiles`);
+      }
+    });
+  }, []);
+
+  const handleWorldListSaveAs = useCallback((name: string) => {
+    const data = lastExportRef.current;
+    if (!data) {
+      console.warn('[freedom-board] no world data to save — draw some tiles first');
+      return;
+    }
+    worldStore.save(name, data).then(() => {
+      console.log(`[freedom-board] saved world as "${name}"`);
+    });
+  }, []);
+
   return (
     <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column' }}>
-      {/* Hidden file input for map import */}
+      {/* Hidden file inputs for map import and world load */}
       <input
-        ref={fileInputRef}
+        ref={mapFileInputRef}
         type="file"
         accept=".json"
         style={{ display: 'none' }}
-        onChange={handleFileChange}
+        onChange={handleMapFileChange}
       />
-      <Toolbar tool={tool} onToolChange={setTool} onImport={handleImportClick} />
+      <input
+        ref={worldFileInputRef}
+        type="file"
+        accept=".json"
+        style={{ display: 'none' }}
+        onChange={handleWorldFileChange}
+      />
+      <FBToolbar
+        tool={tool}
+        onToolChange={setTool}
+        onImport={handleImportClick}
+        onSaveToDisk={handleSaveToDisk}
+        onLoadFromDisk={handleLoadFromDisk}
+        onWorldList={useCallback(() => setShowWorldList(true), [])}
+      />
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
         <AssetPanel
           tiles={tiles}
@@ -274,9 +354,12 @@ export default function App() {
             characterNames={characters.map(c => c.id)}
             pendingStamp={pendingStamp}
             onStampComplete={handleStampComplete}
+            pendingWorldImport={pendingWorldImport}
+            onWorldImportComplete={useCallback(() => setPendingWorldImport(null), [])}
             onCursorTileChange={setCursorTile}
             onCameraChange={setCameraState}
             onGameEvent={handleGameEvent}
+            onWorldExport={handleWorldExport}
           />
         </div>
       </div>
@@ -285,6 +368,15 @@ export default function App() {
         camera={cameraState}
         worldStats={worldStats}
       />
+      {showWorldList && (
+        <WorldListModal
+          onClose={useCallback(() => setShowWorldList(false), [])}
+          onLoad={handleWorldListLoad}
+          onSaveAs={handleWorldListSaveAs}
+        />
+      )}
     </div>
   );
 }
+
+export default FreedomBoardPage;

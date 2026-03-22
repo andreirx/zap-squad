@@ -5,6 +5,7 @@ members = [
     "adapters",
     "infrastructure/wasm",
     "infrastructure/wasm-canvas",
+    "infrastructure/wasm-feather",
 ]
 
 [workspace.dependencies]

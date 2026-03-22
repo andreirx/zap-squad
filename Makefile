@@ -1,15 +1,17 @@
-.PHONY: test lint build clean wasm wasm-canvas dev dev-canvas check pack-sprites tools-install import-hexmanos bake-atlases
+.PHONY: test lint build clean wasm wasm-canvas wasm-feather dev dev-canvas check pack-sprites tools-install import-hexmanos bake-atlases
 
 # Run all tests (core must pass without WASM)
 test:
 	cargo test -p zapsquad-core
 	cargo test -p zapsquad-adapters
+	cargo test -p wasm-feather
 
 # Check compilation for all targets
 check:
 	cargo check --workspace
 	cargo check -p zapsquad-wasm --target wasm32-unknown-unknown
 	cargo check -p freedom-board-wasm --target wasm32-unknown-unknown
+	cargo check -p wasm-feather --target wasm32-unknown-unknown
 
 # Lint with clippy
 lint:
@@ -19,9 +21,17 @@ lint:
 wasm:
 	wasm-pack build infrastructure/wasm --target web --out-dir ../../ui/web/src/wasm
 
-# Build WASM for freedom-board canvas (outputs to ui/canvas/src/wasm)
+# Build WASM for feathering atlas processing (outputs to ui/web/src/wasm)
+wasm-feather:
+	wasm-pack build infrastructure/wasm-feather --target web --out-dir ../../ui/web/src/wasm-feather
+
+# Build WASM for freedom-board canvas (outputs to both ui/canvas and ui/web)
 wasm-canvas:
 	wasm-pack build infrastructure/wasm-canvas --target web --out-dir ../../ui/canvas/src/wasm
+	cp ui/canvas/src/wasm/freedom_board_wasm.js ui/web/src/wasm/
+	cp ui/canvas/src/wasm/freedom_board_wasm.d.ts ui/web/src/wasm/
+	cp ui/canvas/src/wasm/freedom_board_wasm_bg.wasm ui/web/src/wasm/
+	cp ui/canvas/src/wasm/freedom_board_wasm_bg.wasm.d.ts ui/web/src/wasm/
 
 # Install tools dependencies
 tools-install:
@@ -32,10 +42,10 @@ pack-sprites: tools-install
 	cd tools && npx tsx pack-sprites.ts --input ../ui/web/public/mods --output ../ui/web/public/assets
 
 # Build everything
-build: wasm pack-sprites
+build: wasm wasm-canvas wasm-feather pack-sprites
 
-# Development server (hot-reload packs sprites in browser, no need for node tool)
-dev: wasm
+# Development server (unified app with freedom-board + editors)
+dev: wasm wasm-canvas
 	cd ui/web && npm run dev
 
 # Freedom-board dev server
@@ -59,6 +69,7 @@ clean:
 	cargo clean
 	rm -rf ui/web/pkg
 	rm -rf ui/web/src/wasm
+	rm -rf ui/web/src/wasm-feather
 	rm -rf ui/canvas/src/wasm
 	rm -rf ui/web/dist
 	rm -rf ui/canvas/dist

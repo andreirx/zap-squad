@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route, Link, useLocation } from 'react-router-dom';
 import { GamePage } from './pages/GamePage';
 import { WasmGamePage } from './pages/WasmGamePage';
+import { FreedomBoardPage } from './freedom-board/FreedomBoardPage';
 import { CharacterEditor, ObjectEditor, TileEditor, WeaponEditor, MapEditor } from './editors';
 
 export default function App() {
@@ -8,21 +9,40 @@ export default function App() {
     <BrowserRouter>
       <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
         <Routes>
-          {/* WASM game has its own full-screen layout */}
+          {/* Freedom Board has its own full-screen layout (toolbar + canvas + status bar) */}
+          <Route path="/" element={
+            <div style={{ height: '100vh', display: 'flex', flexDirection: 'column' }}>
+              <Navigation />
+              <div style={{ flex: 1, overflow: 'hidden' }}>
+                <FreedomBoardPage />
+              </div>
+            </div>
+          } />
+
+          {/* Legacy WASM game — retained as reference, not actively developed */}
           <Route path="/game/wasm" element={<WasmGamePage />} />
 
-          {/* Regular pages with navigation */}
-          <Route path="*" element={
+          {/* Legacy Canvas2D game page */}
+          <Route path="/game/canvas2d" element={
+            <>
+              <Navigation />
+              <main style={{ flex: 1 }}>
+                <GamePage />
+              </main>
+            </>
+          } />
+
+          {/* Editors with shared navigation */}
+          <Route path="/editor/*" element={
             <>
               <Navigation />
               <main style={{ flex: 1 }}>
                 <Routes>
-                  <Route path="/" element={<GamePage />} />
-                  <Route path="/editor/character" element={<CharacterEditor />} />
-                  <Route path="/editor/object" element={<ObjectEditor />} />
-                  <Route path="/editor/weapon" element={<WeaponEditor />} />
-                  <Route path="/editor/tile" element={<TileEditor />} />
-                  <Route path="/editor/map" element={<MapEditor />} />
+                  <Route path="character" element={<CharacterEditor />} />
+                  <Route path="object" element={<ObjectEditor />} />
+                  <Route path="weapon" element={<WeaponEditor />} />
+                  <Route path="tile" element={<TileEditor />} />
+                  <Route path="map" element={<MapEditor />} />
                 </Routes>
               </main>
             </>
@@ -49,24 +69,25 @@ function Navigation() {
 
   return (
     <nav style={{
-      padding: '0.75rem 1rem',
+      padding: '0.5rem 1rem',
       background: '#16213e',
       display: 'flex',
       gap: '0.5rem',
       alignItems: 'center',
+      flexShrink: 0,
     }}>
-      <Link to="/" style={{ ...linkStyle('/'), fontWeight: 'bold' }}>
-        ZAP-SQUAD
-      </Link>
-      <Link to="/game/wasm" style={{
-        ...linkStyle('/game/wasm'),
-        background: '#4ecca3',
-        color: '#1a1a2e',
+      <Link to="/" style={{
+        ...linkStyle('/'),
         fontWeight: 'bold',
+        color: isActive('/') ? '#e94560' : '#ccc',
+        background: isActive('/') ? 'rgba(233, 69, 96, 0.1)' : 'transparent',
       }}>
-        Play (WebGPU)
+        Freedom Board
       </Link>
       <span style={{ color: '#333' }}>|</span>
+      <Link to="/editor/tile" style={linkStyle('/editor/tile')}>
+        Tiles
+      </Link>
       <Link to="/editor/character" style={linkStyle('/editor/character')}>
         Characters
       </Link>
@@ -76,11 +97,15 @@ function Navigation() {
       <Link to="/editor/weapon" style={linkStyle('/editor/weapon')}>
         Weapons
       </Link>
-      <Link to="/editor/tile" style={linkStyle('/editor/tile')}>
-        Tiles
-      </Link>
       <Link to="/editor/map" style={linkStyle('/editor/map')}>
         Maps
+      </Link>
+      <span style={{ color: '#333' }}>|</span>
+      <Link to="/game/canvas2d" style={linkStyle('/game/canvas2d')}>
+        Canvas2D
+      </Link>
+      <Link to="/game/wasm" style={linkStyle('/game/wasm')}>
+        WebGPU
       </Link>
     </nav>
   );

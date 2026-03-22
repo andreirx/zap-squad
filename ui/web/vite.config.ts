@@ -110,6 +110,29 @@ function fileWritePlugin(): Plugin {
   };
 }
 
+/**
+ * Serve baked assets (feathered atlases, manifest) from public/assets/.
+ * In local dev, the freedom-board needs /assets/* to resolve to public/assets/*.
+ * Vite normally serves public/ at root, so /assets/ maps to public/assets/
+ * automatically. This plugin adds the CORP header required by COEP for
+ * cross-origin resource loading.
+ *
+ * In production, VITE_ASSETS_URL points to CloudFront and this is inactive.
+ */
+function assetCorsPlugin(): Plugin {
+  return {
+    name: 'vite-plugin-asset-cors',
+    configureServer(server) {
+      server.middlewares.use('/assets', (_req, res, next) => {
+        // Required for COEP require-corp — without this, the browser blocks
+        // asset loads when SharedArrayBuffer isolation is active.
+        res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+        next();
+      });
+    },
+  };
+}
+
 function listFilesRecursive(dir: string): string[] {
   if (!fs.existsSync(dir)) {
     return [];
@@ -131,7 +154,7 @@ function listFilesRecursive(dir: string): string[] {
 }
 
 export default defineConfig({
-  plugins: [react(), crossOriginIsolationPlugin(), fileWritePlugin(), wasm(), topLevelAwait()],
+  plugins: [react(), crossOriginIsolationPlugin(), fileWritePlugin(), assetCorsPlugin(), wasm(), topLevelAwait()],
   server: {
     port: 5178,
     strictPort: true,

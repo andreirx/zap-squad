@@ -1,12 +1,12 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
 import { useZapEngine } from '@zap/web/react';
-import type { Tool } from '../App';
+import type { Tool } from '../types';
 import type { TileRegistryEntry } from '../lib/manifest';
 import { DebugPanel } from './DebugPanel';
 import type { DebugFlags } from './DebugPanel';
-import { ASSETS_URL } from '../config';
-import { worldStore } from '../lib/idb';
-import type { WorldData } from '../lib/idb';
+import { ASSETS_URL } from '../../lib/config';
+import { worldStore, configStore } from '../../lib/idb';
+import type { WorldData } from '../../lib/idb';
 
 /** Custom event kinds matching WASM-side `events` module. */
 const EVENTS = {
@@ -45,6 +45,12 @@ const TOOL_IDS: Record<Tool, number> = {
 const GAME_WIDTH = 1920;
 const GAME_HEIGHT = 1080;
 
+/** IDB config keys for persisted settings. */
+const CONFIG_KEYS = {
+  DEBUG_FLAGS: 'freedom-board.debugFlags',
+  SAB_LOCK: 'freedom-board.sabLock',
+} as const;
+
 /** Bresenham's line algorithm — returns list of integer tile coordinates on the line.
  *  Used for line-tool drag preview. Matches the Rust-side draw_line in core/. */
 function bresenhamTiles(x0: number, y0: number, x1: number, y1: number): { x: number; y: number }[] {
@@ -76,7 +82,7 @@ function bresenhamTiles(x0: number, y0: number, x1: number, y1: number): { x: nu
  * | BRIDGE   | *           | 2     | Bridges  |
  * | PATH     | LAND        | 3     | Roads    |
  */
-function tileTypeToLayer(entry: TileRegistryEntry | undefined): number {
+export function tileTypeToLayer(entry: TileRegistryEntry | undefined): number {
   if (!entry) return 0;
   if (entry.tileType === 'BRIDGE') return 2;
   if (entry.tileType === 'PATH') {
@@ -92,13 +98,19 @@ interface InfiniteCanvasProps {
   tileRegistry: TileRegistryEntry[];
   /** Character ID strings in index order (matches WASM body_def_index). */
   characterNames: string[];
-  /** JSON string of a resolved stamp payload, or null. Set by App when user imports a map. */
+  /** JSON string of a resolved stamp payload, or null. Set by parent when user imports a map. */
   pendingStamp: string | null;
-  /** Called after the stamp is dispatched to WASM so App can clear pendingStamp. */
+  /** Called after the stamp is dispatched to WASM so parent can clear pendingStamp. */
   onStampComplete: () => void;
+  /** JSON string of a full world to import, or null. Set by parent on load-from-disk. */
+  pendingWorldImport: string | null;
+  /** Called after the world import is dispatched to WASM. */
+  onWorldImportComplete: () => void;
   onCursorTileChange: (tile: { x: number; y: number } | null) => void;
   onCameraChange: (camera: { x: number; y: number; zoom: number }) => void;
   onGameEvent: (events: Array<{ kind: number; a: number; b: number; c: number }>) => void;
+  /** Called when WASM exports world JSON (for parent to handle save-to-disk). */
+  onWorldExport?: (worldData: WorldData) => void;
 }
 
 /**
@@ -135,9 +147,12 @@ export function InfiniteCanvas({
   characterNames,
   pendingStamp,
   onStampComplete,
+  pendingWorldImport,
+  onWorldImportComplete,
   onCursorTileChange,
   onCameraChange,
   onGameEvent,
+  onWorldExport,
 }: InfiniteCanvasProps) {
   // ── Camera state (local, sent to WASM on change) ──────────────────
   const cameraRef = useRef({ x: -5, y: -5, zoom: 64 });
@@ -165,15 +180,53 @@ export function InfiniteCanvas({
     tool: 'line' | 'rect';
   } | null>(null);
 
-  // ── Debug flags state ─────────────────────────────────────────────
+  // ── Debug flags state (loaded from IDB on mount) ───────────────────
   const [debugFlags, setDebugFlags] = useState<DebugFlags>({
     showGrid: true,
     showCrosshair: true,
     showQuadtree: false,
   });
 
-  // ── SAB lock toggle (render setting, separate from WASM debug overlays) ──
+  // ── SAB lock toggle (loaded from IDB on mount) ─────────────────────
   const [useSabLock, setUseSabLock] = useState(false);
+
+  // ── Settings loaded flag (prevents saving defaults before load completes) ──
+  const settingsLoadedRef = useRef(false);
+
+  // ── Load persisted settings from IDB on mount ──────────────────────
+  useEffect(() => {
+    Promise.all([
+      configStore.get<DebugFlags>(CONFIG_KEYS.DEBUG_FLAGS),
+      configStore.get<boolean>(CONFIG_KEYS.SAB_LOCK),
+    ]).then(([savedFlags, savedLock]) => {
+      if (savedFlags) setDebugFlags(savedFlags);
+      if (savedLock !== undefined) setUseSabLock(savedLock);
+      settingsLoadedRef.current = true;
+    }).catch(err => {
+      console.warn('[freedom-board] failed to load settings from IDB:', err);
+      settingsLoadedRef.current = true;
+    });
+  }, []);
+
+  // ── Persist debug flags to IDB on change ───────────────────────────
+  const handleDebugFlagsChange = useCallback((flags: DebugFlags) => {
+    setDebugFlags(flags);
+    if (settingsLoadedRef.current) {
+      configStore.set(CONFIG_KEYS.DEBUG_FLAGS, flags).catch(err =>
+        console.warn('[freedom-board] failed to save debug flags:', err)
+      );
+    }
+  }, []);
+
+  // ── Persist SAB lock to IDB on change ──────────────────────────────
+  const handleSabLockChange = useCallback((value: boolean) => {
+    setUseSabLock(value);
+    if (settingsLoadedRef.current) {
+      configStore.set(CONFIG_KEYS.SAB_LOCK, value).catch(err =>
+        console.warn('[freedom-board] failed to save SAB lock:', err)
+      );
+    }
+  }, []);
 
   // ── Persistence state ──────────────────────────────────────────────
   // Auto-save: debounce 2 seconds after last world change.
@@ -190,11 +243,13 @@ export function InfiniteCanvas({
         worldStore.save('autosave', worldData).then(() => {
           console.log(`[freedom-board] auto-saved: ${worldData.tiles.length} tiles`);
         });
+        // Also notify parent (for save-to-disk flow)
+        onWorldExport?.(worldData);
       } catch (err) {
         console.error('[freedom-board] auto-save parse error:', err);
       }
     }
-  }, []);
+  }, [onWorldExport]);
 
   // Wrap onGameEvent to detect world changes and schedule saves
   const wrappedGameEvent = useCallback((events: Array<{ kind: number; a: number; b: number; c: number }>) => {
@@ -293,6 +348,16 @@ export function InfiniteCanvas({
     console.log('[freedom-board] stamp dispatched to WASM');
     onStampComplete();
   }, [isReady, pendingStamp, sendEvent, onStampComplete]);
+
+  // ── Dispatch pending world import (load from disk) to WASM ─────────
+  useEffect(() => {
+    if (!isReady || !pendingWorldImport) return;
+    sendEvent({ type: 'import_world', json: pendingWorldImport });
+    // Suppress auto-save for 5 seconds to avoid re-saving what we just imported
+    suppressSaveUntilRef.current = Date.now() + 5000;
+    console.log('[freedom-board] world import dispatched to WASM');
+    onWorldImportComplete();
+  }, [isReady, pendingWorldImport, sendEvent, onWorldImportComplete]);
 
   // ── Send debug flags to WASM when they change ──────────────────────
   useEffect(() => {
@@ -630,9 +695,9 @@ export function InfiniteCanvas({
         fps={fps}
         timing={timing}
         debugFlags={debugFlags}
-        onDebugFlagsChange={setDebugFlags}
+        onDebugFlagsChange={handleDebugFlagsChange}
         useSabLock={useSabLock}
-        onSabLockChange={setUseSabLock}
+        onSabLockChange={handleSabLockChange}
       />
 
       {!isReady && (

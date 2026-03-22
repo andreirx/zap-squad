@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { TileDefinition, CharacterDefinition, WeaponDefinition } from '../lib/manifest';
-import { ASSETS_URL } from '../config';
+import { ASSETS_URL } from '../../lib/config';
 
 /** Preview thumbnail size in CSS pixels. */
 const THUMB = 48;

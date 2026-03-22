@@ -1,9 +1,12 @@
-import type { Tool } from '../App';
+import type { Tool } from '../types';
 
-interface ToolbarProps {
+interface FBToolbarProps {
   tool: Tool;
   onToolChange: (tool: Tool) => void;
   onImport: () => void;
+  onSaveToDisk: () => void;
+  onLoadFromDisk: () => void;
+  onWorldList: () => void;
 }
 
 const TOOLS: { id: Tool; label: string; key: string }[] = [
@@ -16,7 +19,7 @@ const TOOLS: { id: Tool; label: string; key: string }[] = [
   { id: 'character', label: 'Char', key: 'C' },
 ];
 
-export function Toolbar({ tool, onToolChange, onImport }: ToolbarProps) {
+export function FBToolbar({ tool, onToolChange, onImport, onSaveToDisk, onLoadFromDisk, onWorldList }: FBToolbarProps) {
   return (
     <div style={{
       display: 'flex',
@@ -66,6 +69,57 @@ export function Toolbar({ tool, onToolChange, onImport }: ToolbarProps) {
         title="Import LDtk map file (stamps at viewport position)"
       >
         Import Map
+      </button>
+
+      {/* Separator */}
+      <div style={{ width: 1, height: 20, background: '#0f3460', marginLeft: 4, marginRight: 4 }} />
+
+      <button
+        onClick={onSaveToDisk}
+        style={{
+          padding: '4px 10px',
+          background: '#1a2a4a',
+          color: '#8ac060',
+          border: '1px solid #3a5a2a',
+          borderRadius: 4,
+          cursor: 'pointer',
+          fontSize: 12,
+        }}
+        title="Download world as JSON file"
+      >
+        Save
+      </button>
+
+      <button
+        onClick={onLoadFromDisk}
+        style={{
+          padding: '4px 10px',
+          background: '#1a2a4a',
+          color: '#e0a060',
+          border: '1px solid #5a4a2a',
+          borderRadius: 4,
+          cursor: 'pointer',
+          fontSize: 12,
+        }}
+        title="Load world from JSON file (replaces current)"
+      >
+        Load
+      </button>
+
+      <button
+        onClick={onWorldList}
+        style={{
+          padding: '4px 10px',
+          background: '#1a2a4a',
+          color: '#a080e0',
+          border: '1px solid #4a3a6a',
+          borderRadius: 4,
+          cursor: 'pointer',
+          fontSize: 12,
+        }}
+        title="Manage saved worlds (list, rename, delete)"
+      >
+        Worlds
       </button>
 
       <span style={{ marginLeft: 'auto', color: '#445566', fontSize: 10 }}>

@@ -298,6 +298,7 @@ The array index IS the asset_id. React and WASM must sort tiles identically (alp
 | 33 | tile_x (i32) | tile_y (i32) | -- | Move character to tile |
 | 100 | camera_x | camera_y | zoom (px/tile) | Camera state update |
 | 101 | width_px | height_px | -- | Viewport resize |
+| 102 | grid (0/1) | crosshair (0/1) | quadtree (0/1) | Debug flags toggle |
 
 #### WASM -> React (via `GameEvent { kind, a, b, c }`)
 
@@ -317,6 +318,33 @@ The registry doesn't use the custom event system. Instead:
 
 This reuses existing zap-engine infrastructure without modification.
 
+### World Persistence Exports
+
+Three WASM exports handle world serialization:
+
+| Export | Signature | Purpose |
+|--------|-----------|---------|
+| `request_world_export()` | `() -> void` | Sets EXPORT_REQUESTED flag |
+| `take_world_export()` | `() -> string?` | Returns serialized JSON, clears result |
+| `import_world(json)` | `(string) -> void` | Queues world replacement |
+
+**Export** uses a two-phase pattern because the game instance is owned by the engine macro:
+1. Worker calls `request_world_export()` → flag set
+2. Worker calls `game_tick()` → `update()` serializes world, writes to thread_local
+3. Worker calls `take_world_export()` → reads JSON string
+
+**Import** is single-phase: `import_world(json)` queues the JSON, next `update()` deserializes and replaces the world state. Clears undo/redo stacks.
+
+The serialization format uses UUID strings (tile names for seed assets), not u16 handles. See `docs/storage-architecture.md` for the full persistence architecture.
+
+### Map Stamp Export
+
+`load_level(json)` stamps an LDtk map onto the canvas. React pre-resolves tile names to u16 asset_ids and layers before sending. The payload format:
+```json
+{ "originX": 10, "originY": 5, "tiles": [{"x": 0, "y": 0, "assetId": 3, "layer": 0, "variant": 2}] }
+```
+Creates a single undo entry for the entire stamp.
+
 ---
 
 ## UI Layer (React + TypeScript)
@@ -327,9 +355,10 @@ This reuses existing zap-engine infrastructure without modification.
 
 | Component | Role |
 |-----------|------|
-| `App.tsx` | State container: tool, activeAssetId, worldStats, camera, tiles |
-| `InfiniteCanvas.tsx` | Canvas host, camera control, input dispatch to WASM |
-| `Toolbar.tsx` | Tool buttons (Pan/Draw/Erase/Fill), tile selector dropdown |
+| `App.tsx` | State container: tool, activeAssetId, worldStats, camera, tiles, LDtk stamp parsing |
+| `InfiniteCanvas.tsx` | Canvas host, camera control, input dispatch to WASM, stamp dispatch |
+| `Toolbar.tsx` | Tool buttons (Pan/Draw/Erase/Fill), tile selector, Import Map button |
+| `DebugPanel.tsx` | Collapsible profiling overlay: TimingBars, FPS, debug flag toggles (grid/crosshair/quadtree) |
 | `StatusBar.tsx` | Cursor coords, camera state, world stats |
 
 ### InfiniteCanvas
@@ -456,11 +485,11 @@ All core logic has tests that run on the host machine (`cargo test`), with no WA
 | `tile_placement.rs` | 7 | Size compactness, flag bitfield operations |
 | `chunk.rs` | 9 | Set/get/remove, dirty flag, density, bounds |
 | `quad_index.rs` | 13 | Insert/remove, growth, range query, LOD query, stress |
-| `sparse_world.rs` | 11 | CRUD, negative coords, chunk lifecycle, generation, bounds |
+| `sparse_world.rs` | 27 | CRUD, negative coords, chunk lifecycle, generation, bounds, iter_all, clear |
 | `world_edit.rs` | 9 | Place/erase, undo/redo, fill_rect, Bresenham, flood_fill |
 | `world_query.rs` | 5 | Viewport query, connectivity bitmask, count |
 
-Total: **61 tests** covering core entities and use cases.
+Total: **77 tests** covering core entities and use cases.
 
 ---
 
@@ -485,7 +514,7 @@ Total: **61 tests** covering core entities and use cases.
 | **Entity pooling** | Medium | `rebuild_visible_entities()` does full despawn/respawn every frame the world or camera changes. Acceptable for <10K visible tiles. Beyond that, need diff-based spawning. |
 | **LOD rendering not wired** | Low | `query_viewport_lod()` exists in core and quadtree supports it, but WASM always uses `query_viewport()`. Wire when infinite zoom-out is needed. |
 | **Undo stack unbounded** | Medium | `Vec<Vec<EditResult>>` grows without limit. Need max depth (e.g., 1000 operations) with tail truncation. |
-| **No persistence** | High | World state is in-memory only. Need serialization to/from JSON or binary format. Design decision required: chunk-level files? Single world file? |
+| ~~No persistence~~ | ~~High~~ | IN PROGRESS (2026-03-22). IDB module done. WASM serialize/deserialize done. Worker bridge and React wiring pending. See `docs/storage-architecture.md`. |
 | **No Rhai scripting** | High | Play mode not implemented. SparseWorld is ready to be read/mutated by scripts but the scripting bridge doesn't exist yet. |
 | **f32 event precision** | Low | Tile coordinates and asset IDs travel as f32 in the custom event protocol. Safe up to 2^24 (~16M). Not a concern for practical use but worth documenting. |
 | **Deterministic registry ordering** | Medium | Alphabetical sort of tile IDs for asset_id assignment means adding a tile can shift all IDs. Serialized maps must store tile names, not IDs. |
@@ -505,9 +534,11 @@ Total: **61 tests** covering core entities and use cases.
 | **WASM featherer for production** | Medium | `feather_atlases.py` is Python-only. AWS Lambda needs a WASM or Rust-native equivalent. |
 | **Character sprite pipeline** | Medium | Characters rendered as vector rectangles. Need to bake character sprites into atlases and integrate with engine sprite system for proper visual rendering. |
 | **A* pathfinding for movement** | Medium | `find_path_in_radius` exists in core with `InfiniteNavGrid` trait. WASM needs NavGrid adapter (walkability from tile metadata). Currently instant teleport. |
-| **stamp_tiles not wired to UI** | Low | Core `stamp_tiles()` function exists with tests. Needs WASM event + React UI for map import (file picker → JSON parse → stamp). |
+| **stamp_tiles not wired to UI** | ~~Low~~ DONE 2026-03-22 | Wired via `load_level` WASM export. React parses LDtk JSON, resolves tiles, sends resolved payload. Toolbar "Import Map" button + file picker. Single undo entry per stamp. |
 | **Undo stack unbounded** | Medium | `Vec<Vec<EditResult>>` grows without limit. Need max depth (e.g., 1000) with tail truncation. |
-| **Character state not serialized** | High | Characters are in-memory only. Need serialization alongside SparseWorld for save/load. |
+| ~~Character state not serialized~~ | ~~High~~ | DONE (2026-03-22). Characters included in `serialize_world()` / `import_world_from_json()` with body_def_id, direction, health. |
+| ~~World persistence (IndexedDB)~~ | ~~High~~ | IN PROGRESS (2026-03-22). IDB schema + module done. WASM export/import done. Worker bridge + React UI pending. See `docs/storage-architecture.md`. |
+| **SAB lock flag for data consistency** | Medium | SharedArrayBuffer has no read-side lock. Worker writes + renderer reads concurrently. Causes occasional tile position glitches during pan/zoom. Fix: HEADER_LOCK check in frame reader. |
 | **Chunk-level serialization** | High | Large worlds (10M+ tiles) need chunk-level save/load (stream chunks as camera moves) rather than monolithic JSON. WASM memory ceiling is ~4GB. |
 | **movementCost not in AssetPanel** | Low | Tile passable/movementCost lives in per-tile `properties.json` files under `/mods/tiles/`, not in `manifest.json`. AssetPanel shows terrainType (LAND/WATER) only. Fix: either merge properties into manifest during bake, or batch-fetch properties.json files on startup (18 requests). |
 
@@ -559,9 +590,13 @@ ui/canvas/
     config.ts         # ASSETS_URL from env
     App.tsx           # State container, manifest loading
     lib/manifest.ts   # loadTileManifest(), deterministic tile ordering
+    lib/
+      idb.ts            # IndexedDB persistence: worldStore, levelStore, assetStore, configStore
+      manifest.ts       # loadTileManifest(), deterministic tile ordering
     components/
-      InfiniteCanvas.tsx  # Camera, input, zap-engine hook, event dispatch, drag preview
-      Toolbar.tsx         # Tool buttons, undo/redo hint
+      InfiniteCanvas.tsx  # Camera, input, zap-engine hook, event dispatch, stamp/debug dispatch
+      Toolbar.tsx         # Tool buttons, Import Map button, undo/redo hint
       AssetPanel.tsx      # Categorized tile/character/weapon selector with sprite previews
+      DebugPanel.tsx      # Collapsible profiling overlay: TimingBars, FPS, debug flag toggles
       StatusBar.tsx       # Cursor, camera, stats display
 ```
