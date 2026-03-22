@@ -166,19 +166,92 @@ struct TileAssetInfo {
     /// For LAND PATH tiles: which bridge asset to render when crossing water.
     /// Stored as the asset_id index (resolved at registration time).
     bridge_asset_id: Option<u16>,
+    /// Can characters walk on this tile? false = impassable (water, walls).
+    passable: bool,
+    /// Movement cost (1-100). Lower = easier. Default 10. Paths typically 5.
+    movement_cost: u8,
 }
 
-/// Adapter: SparseWorld as InfiniteNavGrid for A* pathfinding.
+/// Adapter: SparseWorld + tile registry as InfiniteNavGrid for A* pathfinding.
 ///
-/// A tile is walkable if it has any tile placed on layer 0 (ground).
-/// Empty space is not walkable — characters cannot walk off placed terrain.
+/// Layer precedence (top-down, highest layer with a tile determines passability):
+///
+/// | Priority | Layer | Content    | Effect                                           |
+/// |----------|-------|------------|--------------------------------------------------|
+/// | 1st      | 3     | Road       | Passable, cost from road tile (typically 5)      |
+/// | 2nd      | 2     | Bridge     | Passable, cost from bridge tile — overrides water |
+/// | 3rd      | 1     | River      | Impassable (PATH+WATER) — overrides ground below |
+/// | 4th      | 0     | Ground     | Passable if tile.passable=true, cost from tile   |
+/// | —        | none  | Empty      | Impassable                                       |
+///
+/// A river on layer 1 makes the cell impassable even if the ground (layer 0) is land.
+/// A bridge on layer 2 restores passability over water/rivers.
+/// A road on layer 3 is always passable and provides its own cost.
 struct SparseWorldNav<'a> {
     world: &'a SparseWorld,
+    registry: &'a [TileAssetInfo],
+}
+
+impl<'a> SparseWorldNav<'a> {
+    /// Look up a tile's asset info from the registry. Returns None for unknown asset IDs.
+    fn asset_of(&self, tile: &TilePlacement) -> Option<&TileAssetInfo> {
+        self.registry.get(tile.asset_id as usize)
+    }
 }
 
 impl<'a> InfiniteNavGrid for SparseWorldNav<'a> {
     fn is_walkable(&self, x: i32, y: i32) -> bool {
-        self.world.get(TileCoord::new(x, y), 0).is_some()
+        let coord = TileCoord::new(x, y);
+
+        // Layer 3: road — always passable if present
+        if self.world.get(coord, 3).is_some() {
+            return true;
+        }
+
+        // Layer 2: bridge — passable, overrides water/river below
+        if self.world.get(coord, 2).is_some() {
+            return true;
+        }
+
+        // Layer 1: river (PATH+WATER) — impassable, overrides ground below
+        if let Some(tile) = self.world.get(coord, 1) {
+            let passable = self.asset_of(tile).map_or(false, |a| a.passable);
+            if !passable {
+                return false;
+            }
+            // Rare: a passable tile on layer 1 (unusual but respect it)
+            return true;
+        }
+
+        // Layer 0: ground — passable based on tile property
+        if let Some(tile) = self.world.get(coord, 0) {
+            return self.asset_of(tile).map_or(true, |a| a.passable);
+        }
+
+        // No tile at all — impassable
+        false
+    }
+
+    fn movement_cost(&self, x: i32, y: i32) -> i32 {
+        let coord = TileCoord::new(x, y);
+
+        // Cost comes from the highest-priority layer that has a tile.
+        // Same precedence as is_walkable: road > bridge > river > ground.
+
+        if let Some(tile) = self.world.get(coord, 3) {
+            return self.asset_of(tile).map_or(10, |a| a.movement_cost as i32);
+        }
+        if let Some(tile) = self.world.get(coord, 2) {
+            return self.asset_of(tile).map_or(10, |a| a.movement_cost as i32);
+        }
+        if let Some(tile) = self.world.get(coord, 1) {
+            return self.asset_of(tile).map_or(10, |a| a.movement_cost as i32);
+        }
+        if let Some(tile) = self.world.get(coord, 0) {
+            return self.asset_of(tile).map_or(10, |a| a.movement_cost as i32);
+        }
+
+        i32::MAX
     }
 }
 
@@ -258,6 +331,11 @@ pub struct FreedomBoardGame {
     /// Last world generation sent to React. Used alongside tile_count to detect
     /// overwrites (same count, different generation).
     last_reported_generation: u64,
+    /// Monotonic counter bumped on any character state change (placement, movement,
+    /// removal, health). Used by emit_stats_if_changed to trigger auto-save for
+    /// character-only edits that don't touch the tile world.
+    character_generation: u64,
+    last_reported_character_generation: u64,
 }
 
 impl FreedomBoardGame {
@@ -300,6 +378,8 @@ impl FreedomBoardGame {
 
             last_reported_tile_count: u64::MAX,
             last_reported_generation: u64::MAX,
+            character_generation: 0,
+            last_reported_character_generation: u64::MAX,
         }
     }
 
@@ -437,6 +517,7 @@ impl FreedomBoardGame {
                     );
                     self.characters.insert(id, actor);
                     self.selected_character = Some(id); // auto-select newly placed
+                    self.character_generation += 1;
                 }
                 self.characters_dirty = true;
             }
@@ -462,6 +543,7 @@ impl FreedomBoardGame {
                     if self.selected_character == Some(id) {
                         self.selected_character = None;
                     }
+                    self.character_generation += 1;
                     self.characters_dirty = true;
                 }
             }
@@ -491,7 +573,7 @@ impl FreedomBoardGame {
                         );
 
                         // Try A* pathfinding on placed ground tiles
-                        let nav = SparseWorldNav { world: &self.world };
+                        let nav = SparseWorldNav { world: &self.world, registry: &self.tile_registry };
                         let path = find_path_in_radius(&nav, start_tile, goal_tile, 50);
 
                         if let Some(waypoints) = path {
@@ -509,10 +591,7 @@ impl FreedomBoardGame {
                                 }
                             }
                         } else {
-                            // No path (no ground tiles, or goal unreachable) — straight line fallback
-                            let target = glam::Vec2::new(goal_tile.x as f32 + 0.5, goal_tile.y as f32 + 0.5);
-                            self.movement_targets.insert(sel_id, target);
-                            self.waypoint_queues.remove(&sel_id);
+                            // No path — destination is impassable or unreachable. Don't move.
                         }
                     }
 
@@ -741,14 +820,47 @@ impl FreedomBoardGame {
             if self.selected_character == Some(*dead_id) {
                 self.selected_character = None;
             }
+            self.character_generation += 1;
             self.characters_dirty = true;
         }
     }
 
+    /// Look up the movement cost of the tile under a world position.
+    /// Uses the same layer precedence as SparseWorldNav.
+    /// Returns the base cost (default 10) if no tile or unknown asset.
+    fn terrain_cost_at(&self, pos: glam::Vec2) -> f32 {
+        let coord = TileCoord::new(pos.x.floor() as i32, pos.y.floor() as i32);
+        // Same precedence: road > bridge > river > ground
+        for layer in [3u8, 2, 1, 0] {
+            if let Some(tile) = self.world.get(coord, layer) {
+                if let Some(asset) = self.tile_registry.get(tile.asset_id as usize) {
+                    return asset.movement_cost as f32;
+                }
+            }
+        }
+        10.0
+    }
+
+    /// Debug: log the movement cost and passable flag for every tile in the registry.
+    /// Call once after manifest is loaded to verify properties made it through the pipeline.
+    fn debug_print_tile_costs(&self) {
+        for (i, info) in self.tile_registry.iter().enumerate() {
+            web_sys::console::log_1(
+                &format!(
+                    "[tile-debug] #{} {} type={:?} terrain={:?} passable={} cost={}",
+                    i, info.name, info.tile_type, info.terrain_type, info.passable, info.movement_cost
+                ).into(),
+            );
+        }
+    }
+
     fn update_character_movement(&mut self) {
-        const MOVE_SPEED: f32 = 4.0;           // tiles per second
-        const ARRIVAL_THRESHOLD: f32 = 0.05;   // snap when this close
-        const DT: f32 = 1.0 / 60.0;            // fixed timestep
+        /// Base movement speed at cost=1 (tiles per second).
+        const BASE_SPEED: f32 = 4.0;
+        /// Reference cost that produces BASE_SPEED. Speed scales as BASE_COST / actual_cost.
+        const BASE_COST: f32 = 1.0;
+        const ARRIVAL_THRESHOLD: f32 = 0.05;
+        const DT: f32 = 1.0 / 60.0;
 
         if self.movement_targets.is_empty() {
             return;
@@ -756,19 +868,29 @@ impl FreedomBoardGame {
 
         let mut arrived: Vec<ActorId> = Vec::new();
 
+        // Pre-read terrain costs before mutable character borrows (avoids borrow conflict)
+        let costs: Vec<(ActorId, f32)> = self.movement_targets.keys()
+            .filter_map(|id| {
+                self.characters.get(id).map(|a| (*id, self.terrain_cost_at(a.position)))
+            })
+            .collect();
+        let cost_map: std::collections::HashMap<ActorId, f32> = costs.into_iter().collect();
+
         for (id, target) in &self.movement_targets {
             if let Some(actor) = self.characters.get_mut(id) {
                 let delta = *target - actor.position;
                 let dist = delta.length();
 
                 if dist < ARRIVAL_THRESHOLD {
-                    // Arrived — snap to target, stop walking
                     actor.position = *target;
                     actor.animation_state = AnimationState::Idle;
                     arrived.push(*id);
                 } else {
-                    // Move toward target
-                    let step_dist = MOVE_SPEED * DT;
+                    // Scale speed by terrain difficulty: cost 5 → 2x speed, cost 20 → 0.5x speed
+                    let cost = cost_map.get(id).copied().unwrap_or(BASE_COST);
+                    let speed = BASE_SPEED * (BASE_COST / cost.max(1.0));
+                    let step_dist = speed * DT;
+
                     if step_dist >= dist {
                         actor.position = *target;
                         actor.animation_state = AnimationState::Idle;
@@ -777,7 +899,6 @@ impl FreedomBoardGame {
                         let direction = delta / dist;
                         actor.position += direction * step_dist;
                         actor.animation_state = AnimationState::Walk;
-                        // Update facing direction
                         if let Some(dir) = Direction::from_velocity(delta) {
                             actor.direction = dir;
                         }
@@ -785,7 +906,6 @@ impl FreedomBoardGame {
                     self.characters_dirty = true;
                 }
             } else {
-                // Actor was deleted while moving — clean up
                 arrived.push(*id);
             }
         }
@@ -1066,16 +1186,22 @@ impl FreedomBoardGame {
         }
     }
 
-    /// Emit world stats to React if they changed.
+    /// Emit world stats to React if anything changed (tiles, characters, or both).
     ///
-    /// Checks both tile count AND world generation. This ensures that overwriting
-    /// existing tiles (same count, different generation) still triggers auto-save.
+    /// Checks tile count, world generation, AND character generation. This ensures
+    /// that any edit — tile placement, character placement, combat kill — triggers
+    /// the React-side auto-save debounce.
     fn emit_stats_if_changed(&mut self, ctx: &mut EngineContext) {
         let tc = self.world.tile_count();
         let gen = self.world.generation();
-        if tc != self.last_reported_tile_count || gen != self.last_reported_generation {
+        let cgen = self.character_generation;
+        if tc != self.last_reported_tile_count
+            || gen != self.last_reported_generation
+            || cgen != self.last_reported_character_generation
+        {
             self.last_reported_tile_count = tc;
             self.last_reported_generation = gen;
+            self.last_reported_character_generation = cgen;
             ctx.events.push(GameEvent {
                 kind: game_events::WORLD_STATS as f32,
                 a: tc as f32,
@@ -1202,6 +1328,15 @@ impl FreedomBoardGame {
                 zoom: self.zoom,
             },
         };
+
+        web_sys::console::log_1(
+            &format!(
+                "[freedom-board] serialize_world: {} tiles, {} characters",
+                export.tiles.len(),
+                export.characters.len()
+            )
+            .into(),
+        );
 
         serde_json::to_string(&export).unwrap_or_else(|e| {
             web_sys::console::error_1(
@@ -1330,6 +1465,7 @@ impl FreedomBoardGame {
             actor.max_health = ch.max_health;
             self.characters.insert(id, actor);
         }
+        self.character_generation += 1;
 
         // Restore camera if provided
         if let Some(cam) = import.camera {
@@ -1531,6 +1667,7 @@ impl Game for FreedomBoardGame {
                     &format!("[freedom-board] tile registry updated: {} tiles", registry.len()).into(),
                 );
                 self.tile_registry = registry;
+                self.debug_print_tile_costs();
                 self.camera_dirty = true; // force re-render with new sprites
             }
         });
@@ -1714,7 +1851,13 @@ pub fn reload_game_manifest(json: &str) {
         terrain_type: Option<String>,
         #[serde(default)]
         bridge_asset_id: Option<String>,
+        #[serde(default = "default_passable")]
+        passable: bool,
+        #[serde(default = "default_movement_cost")]
+        movement_cost: u8,
     }
+    fn default_passable() -> bool { true }
+    fn default_movement_cost() -> u8 { 10 }
 
     /// Extended manifest payload: tiles + character names.
     /// Falls back to parsing as flat Vec<TileEntry> for backward compat.
@@ -1775,6 +1918,8 @@ pub fn reload_game_manifest(json: &str) {
                 tile_type,
                 terrain_type,
                 bridge_asset_id,
+                passable: e.passable,
+                movement_cost: e.movement_cost,
             }
         })
         .collect();

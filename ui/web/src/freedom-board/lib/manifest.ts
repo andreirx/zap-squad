@@ -56,6 +56,8 @@ interface Manifest {
     tileType?: string;
     terrainType?: string;
     bridgeAssetId?: string;
+    passable?: boolean;
+    movementCost?: number;
   }>;
   characters?: Record<string, {
     id: string;
@@ -85,6 +87,8 @@ export interface TileRegistryEntry {
   tileType: string;       // "TILE" | "PATH" | "BRIDGE"
   terrainType: string;    // "LAND" | "WATER"
   bridgeAssetId?: string; // For LAND PATH: which bridge asset to use
+  passable: boolean;      // Can characters walk on this tile?
+  movementCost: number;   // 1-100, lower = easier to traverse. Default 10.
 }
 
 /**
@@ -133,6 +137,8 @@ export async function loadTileManifest(): Promise<{
       variations: t.variations ?? 1,
       tileType: t.tileType ?? 'TILE',
       terrainType: t.terrainType ?? 'LAND',
+      passable: t.passable ?? (t.terrainType !== 'WATER'),
+      movementCost: t.movementCost ?? 10,
     };
     if (t.bridgeAssetId) {
       entry.bridgeAssetId = t.bridgeAssetId;

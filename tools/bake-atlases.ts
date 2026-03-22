@@ -65,8 +65,10 @@ interface TileDefinition {
   id: string;
   name: string;
   walkable: boolean;
+  passable?: boolean;       // newer alias for walkable
   blocksVision: boolean;
   damagePerTurn: number;
+  movementCost?: number;    // 1-100, default 10
   tileType?: string;
   terrainType?: string;
   bridgeAssetId?: string;
@@ -110,6 +112,8 @@ interface TileAtlasInfo {
   tileType?: string;
   terrainType?: string;
   bridgeAssetId?: string;
+  passable?: boolean;
+  movementCost?: number;
 }
 
 interface WeaponAtlasInfo {
@@ -248,13 +252,17 @@ async function bakeCharacterAtlas(id: string, charDir: string): Promise<Characte
 const TILE_TRANSITIONS = ['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw'];
 
 async function bakeTileAtlas(id: string, tileDir: string): Promise<TileAtlasInfo | null> {
+  // Prefer properties.json (saved by TileEditor with passable + movementCost),
+  // fall back to definition.json (legacy import format with walkable only).
+  const propsPath = path.join(tileDir, 'properties.json');
   const defPath = path.join(tileDir, 'definition.json');
-  if (!fs.existsSync(defPath)) {
-    console.log(`  Skipping ${id} (no definition.json)`);
+  const filePath = fs.existsSync(propsPath) ? propsPath : defPath;
+  if (!fs.existsSync(filePath)) {
+    console.log(`  Skipping ${id} (no definition.json or properties.json)`);
     return null;
   }
 
-  const def: TileDefinition = JSON.parse(fs.readFileSync(defPath, 'utf-8'));
+  const def: TileDefinition = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
 
   // Scan for tile sprites
   const files = fs.readdirSync(tileDir).filter(f => f.endsWith('.png'));
@@ -354,6 +362,8 @@ async function bakeTileAtlas(id: string, tileDir: string): Promise<TileAtlasInfo
     tileType: def.tileType,
     terrainType: def.terrainType,
     bridgeAssetId: def.bridgeAssetId,
+    passable: def.passable ?? def.walkable ?? true,
+    movementCost: def.movementCost ?? 10,
   };
 }
 

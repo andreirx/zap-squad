@@ -127,6 +127,13 @@ pub fn find_path(grid: &impl NavGrid, start: IVec2, goal: IVec2) -> PathResult {
 /// The pathfinder limits search with a radius parameter instead.
 pub trait InfiniteNavGrid {
     fn is_walkable(&self, x: i32, y: i32) -> bool;
+
+    /// Movement cost for entering this tile (1-255). Higher = harder to traverse.
+    /// Default implementation returns 10 for all walkable tiles.
+    /// Override to make paths (5) cheaper than terrain (10) and difficult tiles (20+) costlier.
+    fn movement_cost(&self, x: i32, y: i32) -> i32 {
+        if self.is_walkable(x, y) { 10 } else { i32::MAX }
+    }
 }
 
 /// A* pathfinding on an unbounded grid, limited by search radius.
@@ -193,7 +200,14 @@ pub fn find_path_in_radius(
                 continue;
             }
 
-            let move_cost = if dx != 0 && dy != 0 { 14 } else { 10 };
+            // Scale tile cost by 10 for integer precision, then apply diagonal multiplier.
+            // This ensures cost=1 tiles still distinguish straight (10) from diagonal (14).
+            let tile_cost = grid.movement_cost(neighbor.x, neighbor.y) * 10;
+            let move_cost = if dx != 0 && dy != 0 {
+                tile_cost * 14 / 10  // ~1.4x for diagonal
+            } else {
+                tile_cost            // straight
+            };
             let tentative_g = current_g + move_cost;
 
             if tentative_g < *g_score.get(&neighbor).unwrap_or(&i32::MAX) {

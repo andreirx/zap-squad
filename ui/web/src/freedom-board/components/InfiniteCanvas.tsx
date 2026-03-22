@@ -244,17 +244,29 @@ export function InfiniteCanvas({
   // Auto-save: debounce 2 seconds after last world change.
   // Auto-load: on startup after registry is sent to WASM.
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  /** Incremented each time WASM reports world stats. Used to detect ANY world change. */
-  const statsSeqRef = useRef<number>(0);
-  const suppressSaveUntilRef = useRef<number>(0); // suppress save right after load
+  /** Suppress auto-save until this timestamp. Set after load/import to avoid saving stale data. */
+  const suppressSaveUntilRef = useRef<number>(Date.now() + 3000); // suppress during initial startup
+
+  /** Cancel any pending save timer. Call before any world import/load. */
+  const cancelPendingSave = useCallback(() => {
+    if (saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+  }, []);
 
   // Handle worker messages (world_export response → save to IDB)
   const handleWorkerMessage = useCallback((data: Record<string, unknown>) => {
     if (data.type === 'world_export' && typeof data.json === 'string') {
+      // Guard: don't save if we're in the suppress window (stale export from before import)
+      if (Date.now() < suppressSaveUntilRef.current) {
+        console.log('[freedom-board] export received but save suppressed (recent load/import)');
+        return;
+      }
       try {
         const worldData = JSON.parse(data.json) as WorldData;
         worldStore.save('autosave', worldData).then(() => {
-          console.log(`[freedom-board] auto-saved: ${worldData.tiles.length} tiles`);
+          console.log(`[freedom-board] auto-saved: ${worldData.tiles.length} tiles, ${worldData.characters.length} characters`);
         });
         // Also notify parent (for save-to-disk flow)
         onWorldExport?.(worldData);
@@ -269,19 +281,16 @@ export function InfiniteCanvas({
     onGameEvent(events);
     for (const e of events) {
       if (e.kind === 1) {
-        // WASM emits WORLD_STATS on any world change (tile count OR generation).
-        // Every emission means something changed — schedule a save.
-        statsSeqRef.current++;
-        // Don't save right after loading
+        // Don't schedule saves during suppress window
         if (Date.now() < suppressSaveUntilRef.current) continue;
         // Debounce: save 2 seconds after last change
-        if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+        cancelPendingSave();
         saveTimerRef.current = setTimeout(() => {
           sendEventRef.current({ type: 'export_world' });
         }, 2000);
       }
     }
-  }, [onGameEvent]);
+  }, [onGameEvent, cancelPendingSave]);
 
   // ── zap-engine hook ───────────────────────────────────────────────
   const { canvasRef, sendEvent, isReady, fps, timing, canvasKey } = useZapEngine({
@@ -346,9 +355,9 @@ export function InfiniteCanvas({
     //    Messages are ordered in the worker queue — registry is processed before import.
     worldStore.load('autosave').then((data) => {
       if (data && data.tiles.length > 0) {
+        cancelPendingSave();
         sendEvent({ type: 'import_world', json: JSON.stringify(data) });
-        // Suppress save for 5 seconds to avoid immediately re-saving what we just loaded
-        suppressSaveUntilRef.current = Date.now() + 5000;
+        suppressSaveUntilRef.current = Date.now() + 2500;
         console.log(`[freedom-board] loaded autosave: ${data.tiles.length} tiles, ${data.characters.length} characters`);
       }
     }).catch(err => {
@@ -367,12 +376,12 @@ export function InfiniteCanvas({
   // ── Dispatch pending world import (load from disk) to WASM ─────────
   useEffect(() => {
     if (!isReady || !pendingWorldImport) return;
+    cancelPendingSave();
     sendEvent({ type: 'import_world', json: pendingWorldImport });
-    // Suppress auto-save for 5 seconds to avoid re-saving what we just imported
-    suppressSaveUntilRef.current = Date.now() + 5000;
+    suppressSaveUntilRef.current = Date.now() + 2500;
     console.log('[freedom-board] world import dispatched to WASM');
     onWorldImportComplete();
-  }, [isReady, pendingWorldImport, sendEvent, onWorldImportComplete]);
+  }, [isReady, pendingWorldImport, sendEvent, onWorldImportComplete, cancelPendingSave]);
 
   // ── Send debug flags to WASM when they change ──────────────────────
   useEffect(() => {
