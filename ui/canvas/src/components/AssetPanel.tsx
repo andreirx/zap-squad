@@ -11,6 +11,8 @@ interface AssetPanelProps {
   weapons: WeaponDefinition[];
   activeAssetId: number;
   onAssetChange: (id: number) => void;
+  activeCharacterId: number;
+  onCharacterChange: (id: number) => void;
 }
 
 /** Categorize tiles by tileType for the collapsible sections. */
@@ -141,6 +143,8 @@ export function AssetPanel({
   weapons,
   activeAssetId,
   onAssetChange,
+  activeCharacterId,
+  onCharacterChange,
 }: AssetPanelProps) {
   // Group tiles by category, preserving their index in the sorted array
   // (the index IS the asset_id used by WASM)
@@ -211,23 +215,39 @@ export function AssetPanel({
         </Section>
       ))}
 
-      {/* Characters */}
+      {/* Characters — selectable; index = body_def_index sent to WASM */}
       {characters.length > 0 && (
-        <Section label="Characters" count={characters.length} defaultOpen={false}>
-          {characters.map(c => (
-            <div
+        <Section label="Characters" count={characters.length} defaultOpen>
+          {characters.map((c, index) => (
+            <button
               key={c.id}
+              onClick={() => onCharacterChange(index)}
               style={{
                 display: 'flex',
                 alignItems: 'center',
                 gap: 8,
                 padding: '4px 6px',
+                background: activeCharacterId === index ? '#1a2a4a' : 'transparent',
+                border: activeCharacterId === index ? '1px solid #60a0e0' : '1px solid transparent',
+                borderRadius: 4,
+                cursor: 'pointer',
+                width: '100%',
+                textAlign: 'left',
               }}
             >
               <SpritePreview atlas={c.atlas} spriteSize={c.spriteSize} />
-              <div style={{ color: '#c0c8d0', fontSize: 11 }}>{c.name}</div>
-            </div>
+              <div style={{
+                color: activeCharacterId === index ? '#60a0e0' : '#c0c8d0',
+                fontSize: 11,
+                fontWeight: activeCharacterId === index ? 600 : 400,
+              }}>
+                {c.name}
+              </div>
+            </button>
           ))}
+          <div style={{ fontSize: 9, color: '#445566', padding: '2px 6px' }}>
+            Char tool (C): click to place, right-click to move selected, Del to remove
+          </div>
         </Section>
       )}
 

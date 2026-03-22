@@ -2,7 +2,11 @@ import { useRef, useEffect, useCallback, useState } from 'react';
 import { useZapEngine } from '@zap/web/react';
 import type { Tool } from '../App';
 import type { TileRegistryEntry } from '../lib/manifest';
+import { DebugPanel } from './DebugPanel';
+import type { DebugFlags } from './DebugPanel';
 import { ASSETS_URL } from '../config';
+import { worldStore } from '../lib/idb';
+import type { WorldData } from '../lib/idb';
 
 /** Custom event kinds matching WASM-side `events` module. */
 const EVENTS = {
@@ -23,6 +27,7 @@ const EVENTS = {
   MOVE_CHARACTER: 33,
   CAMERA_UPDATE: 100,
   VIEWPORT_SIZE: 101,
+  DEBUG_FLAGS: 102,
 } as const;
 
 /** Tool name to WASM tool ID. */
@@ -83,7 +88,14 @@ function tileTypeToLayer(entry: TileRegistryEntry | undefined): number {
 interface InfiniteCanvasProps {
   tool: Tool;
   activeAssetId: number;
+  activeCharacterId: number;
   tileRegistry: TileRegistryEntry[];
+  /** Character ID strings in index order (matches WASM body_def_index). */
+  characterNames: string[];
+  /** JSON string of a resolved stamp payload, or null. Set by App when user imports a map. */
+  pendingStamp: string | null;
+  /** Called after the stamp is dispatched to WASM so App can clear pendingStamp. */
+  onStampComplete: () => void;
   onCursorTileChange: (tile: { x: number; y: number } | null) => void;
   onCameraChange: (camera: { x: number; y: number; zoom: number }) => void;
   onGameEvent: (events: Array<{ kind: number; a: number; b: number; c: number }>) => void;
@@ -118,7 +130,11 @@ interface InfiniteCanvasProps {
 export function InfiniteCanvas({
   tool,
   activeAssetId,
+  activeCharacterId,
   tileRegistry,
+  characterNames,
+  pendingStamp,
+  onStampComplete,
   onCursorTileChange,
   onCameraChange,
   onGameEvent,
@@ -149,16 +165,70 @@ export function InfiniteCanvas({
     tool: 'line' | 'rect';
   } | null>(null);
 
+  // ── Debug flags state ─────────────────────────────────────────────
+  const [debugFlags, setDebugFlags] = useState<DebugFlags>({
+    showGrid: true,
+    showCrosshair: true,
+    showQuadtree: false,
+  });
+
+  // ── SAB lock toggle (render setting, separate from WASM debug overlays) ──
+  const [useSabLock, setUseSabLock] = useState(false);
+
+  // ── Persistence state ──────────────────────────────────────────────
+  // Auto-save: debounce 2 seconds after last world change.
+  // Auto-load: on startup after registry is sent to WASM.
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastTileCountRef = useRef<number>(-1);
+  const suppressSaveUntilRef = useRef<number>(0); // suppress save right after load
+
+  // Handle worker messages (world_export response → save to IDB)
+  const handleWorkerMessage = useCallback((data: Record<string, unknown>) => {
+    if (data.type === 'world_export' && typeof data.json === 'string') {
+      try {
+        const worldData = JSON.parse(data.json) as WorldData;
+        worldStore.save('autosave', worldData).then(() => {
+          console.log(`[freedom-board] auto-saved: ${worldData.tiles.length} tiles`);
+        });
+      } catch (err) {
+        console.error('[freedom-board] auto-save parse error:', err);
+      }
+    }
+  }, []);
+
+  // Wrap onGameEvent to detect world changes and schedule saves
+  const wrappedGameEvent = useCallback((events: Array<{ kind: number; a: number; b: number; c: number }>) => {
+    onGameEvent(events);
+    for (const e of events) {
+      if (e.kind === 1 && e.a !== lastTileCountRef.current) {
+        lastTileCountRef.current = e.a;
+        // Don't save right after loading
+        if (Date.now() < suppressSaveUntilRef.current) continue;
+        // Debounce: save 2 seconds after last change
+        if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = setTimeout(() => {
+          sendEventRef.current({ type: 'export_world' });
+        }, 2000);
+      }
+    }
+  }, [onGameEvent]);
+
   // ── zap-engine hook ───────────────────────────────────────────────
-  const { canvasRef, sendEvent, isReady, fps, canvasKey } = useZapEngine({
+  const { canvasRef, sendEvent, isReady, fps, timing, canvasKey } = useZapEngine({
     wasmUrl: '/src/wasm/freedom_board_wasm.js',
     assetsUrl: `${ASSETS_URL}/assets_feathered.json`,
     assetBasePath: `${ASSETS_URL}/`,
     gameWidth: GAME_WIDTH,
     gameHeight: GAME_HEIGHT,
     force2D: true, // Canvas2D until WebGPU texture size issue is resolved
-    onGameEvent: onGameEvent,
+    onGameEvent: wrappedGameEvent,
+    onWorkerMessage: handleWorkerMessage,
+    useSabLock,
   });
+
+  // Stable ref for sendEvent (used in timer callback to avoid stale closure)
+  const sendEventRef = useRef(sendEvent);
+  sendEventRef.current = sendEvent;
 
   // ── Projection scale factor ─────────────────────────────────────
   //
@@ -192,14 +262,49 @@ export function InfiniteCanvas({
     }
   }, []);
 
-  // ── Send tile registry to WASM when both engine and manifest are ready ─
+  // ── Send tile registry + character names to WASM, then load saved world ─
   useEffect(() => {
     if (!isReady || tileRegistry.length === 0 || registrySentRef.current) return;
-    const json = JSON.stringify(tileRegistry);
-    sendEvent({ type: 'reload_game_manifest', json });
     registrySentRef.current = true;
-    console.log(`[freedom-board] sent tile registry to WASM: ${tileRegistry.length} tiles`);
-  }, [isReady, tileRegistry, sendEvent]);
+
+    // 1. Send tile/character registry to WASM
+    const payload = { tiles: tileRegistry, characters: characterNames };
+    sendEvent({ type: 'reload_game_manifest', json: JSON.stringify(payload) });
+    console.log(`[freedom-board] sent manifest to WASM: ${tileRegistry.length} tiles, ${characterNames.length} characters`);
+
+    // 2. Load saved world from IndexedDB (if any)
+    //    Messages are ordered in the worker queue — registry is processed before import.
+    worldStore.load('autosave').then((data) => {
+      if (data && data.tiles.length > 0) {
+        sendEvent({ type: 'import_world', json: JSON.stringify(data) });
+        // Suppress save for 5 seconds to avoid immediately re-saving what we just loaded
+        suppressSaveUntilRef.current = Date.now() + 5000;
+        console.log(`[freedom-board] loaded autosave: ${data.tiles.length} tiles, ${data.characters.length} characters`);
+      }
+    }).catch(err => {
+      console.error('[freedom-board] auto-load failed:', err);
+    });
+  }, [isReady, tileRegistry, characterNames, sendEvent]);
+
+  // ── Dispatch pending stamp (map import) to WASM ────────────────────
+  useEffect(() => {
+    if (!isReady || !pendingStamp) return;
+    sendEvent({ type: 'load_level', json: pendingStamp });
+    console.log('[freedom-board] stamp dispatched to WASM');
+    onStampComplete();
+  }, [isReady, pendingStamp, sendEvent, onStampComplete]);
+
+  // ── Send debug flags to WASM when they change ──────────────────────
+  useEffect(() => {
+    if (!isReady) return;
+    sendEvent({
+      type: 'custom',
+      kind: EVENTS.DEBUG_FLAGS,
+      a: debugFlags.showGrid ? 1 : 0,
+      b: debugFlags.showCrosshair ? 1 : 0,
+      c: debugFlags.showQuadtree ? 1 : 0,
+    });
+  }, [isReady, debugFlags, sendEvent]);
 
   // ── Send camera state to WASM ─────────────────────────────────────
   const syncCamera = useCallback(() => {
@@ -278,6 +383,13 @@ export function InfiniteCanvas({
     return () => observer.disconnect();
   }, [isReady, syncViewport]);
 
+  // ── Cleanup save timer on unmount ─────────────────────────────────
+  useEffect(() => {
+    return () => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    };
+  }, []);
+
   // ── Screen-to-tile conversion (CSS pixels → tile coords) ─────────
   //
   // Converts CSS pixel position (relative to container) to tile
@@ -345,18 +457,13 @@ export function InfiniteCanvas({
         sendEvent({ type: 'custom', kind: EVENTS.DRAG_START, a: tile.x, b: tile.y, c: 0 });
         setPreview({ startX: tile.x, startY: tile.y, endX: tile.x, endY: tile.y, tool });
       } else if (tool === 'character') {
-        // Left click: try to select existing character, or place new one
-        // Right click handled by context menu prevention
-        // Shift+click: place character; plain click: select, then click elsewhere to move
-        if (e.shiftKey) {
-          sendEvent({ type: 'custom', kind: EVENTS.PLACE_CHARACTER, a: tile.x, b: tile.y, c: 0 });
-        } else {
-          // First try select; if nothing selected, this is a no-op on WASM side
-          sendEvent({ type: 'custom', kind: EVENTS.SELECT_CHARACTER, a: tile.x, b: tile.y, c: 0 });
-        }
+        // Left click: place character at tile (WASM auto-selects if one already there).
+        // Right click: move selected character (handled by onContextMenu below).
+        // Delete/Backspace: remove selected character (handled by keydown listener).
+        sendEvent({ type: 'custom', kind: EVENTS.PLACE_CHARACTER, a: tile.x, b: tile.y, c: activeCharacterId });
       }
     }
-  }, [tool, activeAssetId, activeLayer, isReady, sendEvent, screenToTile]);
+  }, [tool, activeAssetId, activeCharacterId, activeLayer, isReady, sendEvent, screenToTile]);
 
   const handlePointerMove = useCallback((e: React.PointerEvent) => {
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
@@ -518,13 +625,15 @@ export function InfiniteCanvas({
         return null;
       })()}
 
-      {/* FPS counter — UI chrome, not coordinate-dependent */}
-      <div style={{
-        position: 'absolute', top: 4, right: 8,
-        fontSize: 10, color: '#556677', fontFamily: 'monospace', pointerEvents: 'none',
-      }}>
-        {fps} FPS
-      </div>
+      {/* Debug/profiling panel — collapsed shows FPS, expanded shows timing + toggles */}
+      <DebugPanel
+        fps={fps}
+        timing={timing}
+        debugFlags={debugFlags}
+        onDebugFlagsChange={setDebugFlags}
+        useSabLock={useSabLock}
+        onSabLockChange={setUseSabLock}
+      />
 
       {!isReady && (
         <div style={{

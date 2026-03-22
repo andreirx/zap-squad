@@ -3,6 +3,7 @@ import type { Tool } from '../App';
 interface ToolbarProps {
   tool: Tool;
   onToolChange: (tool: Tool) => void;
+  onImport: () => void;
 }
 
 const TOOLS: { id: Tool; label: string; key: string }[] = [
@@ -15,7 +16,7 @@ const TOOLS: { id: Tool; label: string; key: string }[] = [
   { id: 'character', label: 'Char', key: 'C' },
 ];
 
-export function Toolbar({ tool, onToolChange }: ToolbarProps) {
+export function Toolbar({ tool, onToolChange, onImport }: ToolbarProps) {
   return (
     <div style={{
       display: 'flex',
@@ -47,6 +48,25 @@ export function Toolbar({ tool, onToolChange }: ToolbarProps) {
           {t.label}
         </button>
       ))}
+
+      {/* Separator */}
+      <div style={{ width: 1, height: 20, background: '#0f3460', marginLeft: 4, marginRight: 4 }} />
+
+      <button
+        onClick={onImport}
+        style={{
+          padding: '4px 10px',
+          background: '#1a2a4a',
+          color: '#60a0e0',
+          border: '1px solid #2a4a6a',
+          borderRadius: 4,
+          cursor: 'pointer',
+          fontSize: 12,
+        }}
+        title="Import LDtk map file (stamps at viewport position)"
+      >
+        Import Map
+      </button>
 
       <span style={{ marginLeft: 'auto', color: '#445566', fontSize: 10 }}>
         Ctrl+Z undo | Ctrl+Shift+Z redo

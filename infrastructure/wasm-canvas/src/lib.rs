@@ -46,6 +46,7 @@
 //! | 33   | tile_x (i32) | tile_y (i32) | —              | Move character      |
 //! | 100  | camera_x     | camera_y     | zoom (px/tile) | Camera state update |
 //! | 101  | width_px     | height_px    | —              | Viewport resize     |
+//! | 102  | grid (0/1)   | crosshair    | quadtree (0/1) | Debug flags toggle  |
 //!
 //! # Game Events (WASM -> React)
 //!
@@ -64,7 +65,7 @@ use zapsquad_core::entities::freedom_board::{
 use zapsquad_core::entities::{ActorId, CompositeActor, Direction};
 use zapsquad_core::use_cases::freedom_board::{
     connectivity_bitmask, draw_line, erase_rect, erase_tile, fill_rect, flood_fill, place_tile,
-    query_viewport, EditResult,
+    query_viewport, stamp_tiles, EditResult,
 };
 
 /// Feathered sprite geometry.
@@ -96,6 +97,8 @@ mod events {
     pub const MOVE_CHARACTER: u32 = 33;
     pub const CAMERA_UPDATE: u32 = 100;
     pub const VIEWPORT_SIZE: u32 = 101;
+    /// Debug flags: a = grid (0/1), b = crosshair (0/1), c = quadtree (0/1)
+    pub const DEBUG_FLAGS: u32 = 102;
 }
 
 /// Game event kinds: WASM -> React
@@ -196,6 +199,10 @@ pub struct FreedomBoardGame {
     character_entities: Vec<EntityId>,
     /// True when character state changed and entities need rebuild.
     characters_dirty: bool,
+    /// Character name registry — maps body_idx (u16) to character ID string.
+    /// Populated from manifest.json alongside the tile registry.
+    /// Index order matches React's sorted character array.
+    character_names: Vec<String>,
 
     // ── Rendering state ─────────────────────────────────────────────────
     /// Engine entity IDs currently spawned for visible tiles.
@@ -213,6 +220,11 @@ pub struct FreedomBoardGame {
     /// Start coordinate for two-point operations (line, rect).
     /// Set by DRAG_START event, consumed by DRAW_LINE / FILL_RECT / ERASE_RECT.
     drag_start: Option<TileCoord>,
+
+    // ── Debug flags (toggled by React via custom event) ────────────────
+    debug_show_grid: bool,
+    debug_show_crosshair: bool,
+    debug_show_quadtree: bool,
 
     // ── Stats tracking ──────────────────────────────────────────────────
     /// Last tile_count sent to React, to avoid spamming events.
@@ -238,6 +250,7 @@ impl FreedomBoardGame {
             selected_character: None,
             character_entities: Vec::new(),
             characters_dirty: false,
+            character_names: Vec::new(),
 
             tile_entities: Vec::new(),
             last_rendered_generation: u64::MAX, // force initial render
@@ -248,6 +261,10 @@ impl FreedomBoardGame {
             active_variant: 0,
             tool: Tool::Draw,
             drag_start: None,
+
+            debug_show_grid: true,
+            debug_show_crosshair: true,
+            debug_show_quadtree: false,
 
             last_reported_tile_count: u64::MAX,
         }
@@ -349,20 +366,40 @@ impl FreedomBoardGame {
             }
             events::PLACE_CHARACTER => {
                 // a=tile_x, b=tile_y, c=body_def_index (from character selector)
+                // Smart behavior: if a character already occupies this tile,
+                // select it instead of stacking another on top.
                 let tx = a as i32;
                 let ty = b as i32;
-                let body_idx = c as usize;
-                // For now, use a placeholder body_def_id based on index
-                // TODO: Wire character asset registry from React
-                let body_id = format!("character_{}", body_idx);
-                let id = ActorId(self.next_actor_id);
-                self.next_actor_id += 1;
-                let actor = CompositeActor::new(
-                    id,
-                    glam::Vec2::new(tx as f32 + 0.5, ty as f32 + 0.5),
-                    body_id,
-                );
-                self.characters.insert(id, actor);
+                let center_x = tx as f32 + 0.5;
+                let center_y = ty as f32 + 0.5;
+
+                let existing = self.characters.iter()
+                    .find(|(_, ch)| {
+                        (ch.position.x - center_x).abs() < 0.5
+                            && (ch.position.y - center_y).abs() < 0.5
+                    })
+                    .map(|(id, _)| *id);
+
+                if let Some(id) = existing {
+                    // Tile occupied — select the existing character
+                    self.selected_character = Some(id);
+                } else {
+                    // Empty tile — place a new character
+                    let body_idx = c as usize;
+                    let body_id = self.character_names
+                        .get(body_idx)
+                        .cloned()
+                        .unwrap_or_else(|| format!("character_{}", body_idx));
+                    let id = ActorId(self.next_actor_id);
+                    self.next_actor_id += 1;
+                    let actor = CompositeActor::new(
+                        id,
+                        glam::Vec2::new(center_x, center_y),
+                        body_id,
+                    );
+                    self.characters.insert(id, actor);
+                    self.selected_character = Some(id); // auto-select newly placed
+                }
                 self.characters_dirty = true;
             }
             events::REMOVE_CHARACTER => {
@@ -451,6 +488,11 @@ impl FreedomBoardGame {
                     self.viewport_height = new_h;
                     self.camera_dirty = true;
                 }
+            }
+            events::DEBUG_FLAGS => {
+                self.debug_show_grid = a != 0.0;
+                self.debug_show_crosshair = b != 0.0;
+                self.debug_show_quadtree = c != 0.0;
             }
             _ => {}
         }
@@ -597,11 +639,17 @@ impl FreedomBoardGame {
         false
     }
 
-    /// Rebuild character entities as colored rectangles on the UI layer.
+    /// Rebuild character entities as sprite-based entities on the UI layer.
     ///
-    /// Characters are rendered as vector rectangles (not sprites) for now.
-    /// This decouples character placement/movement from the character sprite pipeline.
-    /// TODO: Replace with proper sprite rendering once character atlases are integrated.
+    /// Uses the same spawn/despawn pattern as tiles. Each character is an
+    /// Entity with a sprite looked up from the engine's asset registry using
+    /// the character's body_def_id and direction:
+    ///   sprite key = "{body_def_id}/idle_{direction}/0"
+    ///
+    /// Characters render at scale = zoom (128px sprites fill one tile).
+    /// No feathering — character atlases are 128x128, not 160x160.
+    ///
+    /// Selection ring and health bar remain as vector overlays on top.
     fn rebuild_character_entities(&mut self, ctx: &mut EngineContext) {
         // Despawn old character entities
         for eid in self.character_entities.drain(..) {
@@ -609,6 +657,7 @@ impl FreedomBoardGame {
         }
 
         let (vp_min, vp_max) = self.visible_bounds();
+        let scale = Vec2::splat(self.zoom); // 128px sprites, no feathering
 
         for (id, actor) in &self.characters {
             // Frustum cull — skip characters outside viewport
@@ -620,72 +669,65 @@ impl FreedomBoardGame {
             }
 
             let screen = self.tile_to_screen(actor.position.x, actor.position.y);
-
-            // Draw character as a colored rectangle on UI layer
             let is_selected = self.selected_character == Some(*id);
-            let size = self.zoom * 0.7; // slightly smaller than a tile
-            let half = size / 2.0;
 
-            // Body color: green for player, red for enemy, blue for selected
-            let color = if is_selected {
-                VectorColor::new(0.3, 0.6, 1.0, 0.9) // blue
-            } else if actor.tag == "enemy" {
-                VectorColor::new(0.9, 0.2, 0.2, 0.8) // red
+            // Build sprite key: "{char_id}/idle_{direction}/0"
+            let dir_name = match actor.direction {
+                Direction::North => "north",
+                Direction::East => "east",
+                Direction::South => "south",
+                Direction::West => "west",
+            };
+            let sprite_key = format!("{}/idle_{}/0", actor.body_def_id, dir_name);
+
+            // Spawn character entity with sprite
+            let eid = ctx.next_id();
+            let mut entity = Entity::new(eid)
+                .with_pos(screen)
+                .with_scale(scale)
+                .with_layer(RenderLayer::UI);
+
+            if let Some(sprite) = ctx.sprite(&sprite_key) {
+                entity.sprite = Some(sprite);
             } else {
-                VectorColor::new(0.2, 0.8, 0.3, 0.8) // green
-            };
+                // Fallback: try without frame index
+                let fallback_key = format!("{}/idle_{}", actor.body_def_id, dir_name);
+                if let Some(sprite) = ctx.sprite(&fallback_key) {
+                    entity.sprite = Some(sprite);
+                }
+            }
 
-            ctx.vectors.fill_rect(
-                Vec2::new(screen.x - half, screen.y - half),
-                size,
-                size,
-                color,
-            );
+            ctx.scene.spawn(entity);
+            self.character_entities.push(eid);
 
-            // Direction indicator: small triangle pointing in facing direction
-            let indicator_color = VectorColor::new(1.0, 1.0, 1.0, 0.9);
-            let dir_offset = match actor.direction {
-                Direction::North => Vec2::new(0.0, -half),
-                Direction::East => Vec2::new(half, 0.0),
-                Direction::South => Vec2::new(0.0, half),
-                Direction::West => Vec2::new(-half, 0.0),
-            };
-            let tip = screen + dir_offset;
-            let indicator_size = self.zoom * 0.12;
-            ctx.vectors.fill_rect(
-                Vec2::new(tip.x - indicator_size / 2.0, tip.y - indicator_size / 2.0),
-                indicator_size,
-                indicator_size,
-                indicator_color,
-            );
-
-            // Selection ring
+            // Selection ring (vector overlay on top of sprite)
             if is_selected {
-                let ring_color = VectorColor::new(1.0, 1.0, 0.3, 0.6);
+                let half = self.zoom / 2.0;
+                let ring_color = VectorColor::new(1.0, 1.0, 0.3, 0.7);
                 ctx.vectors.stroke_rect(
                     Vec2::new(screen.x - half - 2.0, screen.y - half - 2.0),
-                    size + 4.0,
-                    size + 4.0,
+                    self.zoom + 4.0,
+                    self.zoom + 4.0,
                     2.0,
                     ring_color,
                 );
             }
 
-            // Health bar (if damaged)
+            // Health bar (vector overlay, only if damaged)
             if actor.health < actor.max_health {
-                let bar_width = size;
+                let half = self.zoom / 2.0;
+                let bar_width = self.zoom * 0.8;
                 let bar_height = self.zoom * 0.08;
-                let bar_y = screen.y - half - bar_height - 2.0;
+                let bar_x = screen.x - bar_width / 2.0;
+                let bar_y = screen.y - half - bar_height - 3.0;
                 let hp_pct = actor.health as f32 / actor.max_health as f32;
 
-                // Background
                 ctx.vectors.fill_rect(
-                    Vec2::new(screen.x - half, bar_y),
+                    Vec2::new(bar_x, bar_y),
                     bar_width,
                     bar_height,
                     VectorColor::new(0.2, 0.2, 0.2, 0.8),
                 );
-                // Health fill
                 let hp_color = if hp_pct > 0.5 {
                     VectorColor::new(0.2, 0.8, 0.2, 0.9)
                 } else if hp_pct > 0.25 {
@@ -694,7 +736,7 @@ impl FreedomBoardGame {
                     VectorColor::new(0.9, 0.1, 0.1, 0.9)
                 };
                 ctx.vectors.fill_rect(
-                    Vec2::new(screen.x - half, bar_y),
+                    Vec2::new(bar_x, bar_y),
                     bar_width * hp_pct,
                     bar_height,
                     hp_color,
@@ -715,6 +757,269 @@ impl FreedomBoardGame {
                 c: 0.0,
             });
         }
+    }
+
+    // ── World serialization / deserialization ─────────────────────────────
+    //
+    // These methods convert between the runtime SparseWorld (compact u16 asset_ids)
+    // and the portable JSON format stored in IndexedDB (string-based identifiers).
+    //
+    // TECH DEBT: The `uuid` field currently contains the tile name (e.g. "iarba"),
+    // not a true UUID4. This is correct for seed assets with stable, deterministic
+    // names. When user-created assets arrive (Phase 4 of the persistence ADR),
+    // the UUID intern table refactor will replace name strings with proper UUIDs.
+
+    /// Serialize the entire world state to a JSON string.
+    ///
+    /// Resolves u16 asset_ids to name strings via tile_registry.
+    /// Tiles with unresolvable asset_ids are skipped (logged as warning).
+    /// Output is sorted by (x, y, layer) for deterministic serialization.
+    fn serialize_world(&self) -> String {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct WorldExport {
+            version: u32,
+            tiles: Vec<TileExport>,
+            characters: Vec<CharExport>,
+            camera: CameraExport,
+        }
+
+        #[derive(serde::Serialize)]
+        struct TileExport {
+            x: i32,
+            y: i32,
+            uuid: String,
+            variant: u8,
+            layer: u8,
+            flags: u8,
+        }
+
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct CharExport {
+            x: f32,
+            y: f32,
+            body_def_id: String,
+            direction: String,
+            health: i32,
+            max_health: i32,
+        }
+
+        #[derive(serde::Serialize)]
+        struct CameraExport {
+            x: f32,
+            y: f32,
+            zoom: f32,
+        }
+
+        // Walk all tiles, resolve asset_id → name
+        let mut tiles = Vec::new();
+        let mut skipped = 0u32;
+
+        for (coord, placement) in self.world.iter_all() {
+            if let Some(name) = self.tile_name(placement.asset_id) {
+                tiles.push(TileExport {
+                    x: coord.x,
+                    y: coord.y,
+                    uuid: name.to_string(),
+                    variant: placement.variant,
+                    layer: placement.layer,
+                    flags: placement.flags,
+                });
+            } else {
+                skipped += 1;
+            }
+        }
+
+        if skipped > 0 {
+            web_sys::console::warn_1(
+                &format!(
+                    "[freedom-board] export: skipped {} tiles with unresolvable asset_ids",
+                    skipped
+                )
+                .into(),
+            );
+        }
+
+        // Deterministic output: sort by (x, y, layer)
+        tiles.sort_by(|a, b| a.x.cmp(&b.x).then(a.y.cmp(&b.y)).then(a.layer.cmp(&b.layer)));
+
+        // Serialize characters
+        let characters: Vec<CharExport> = self
+            .characters
+            .values()
+            .map(|actor| {
+                let dir_str = match actor.direction {
+                    Direction::North => "north",
+                    Direction::East => "east",
+                    Direction::South => "south",
+                    Direction::West => "west",
+                };
+                CharExport {
+                    x: actor.position.x,
+                    y: actor.position.y,
+                    body_def_id: actor.body_def_id.clone(),
+                    direction: dir_str.to_string(),
+                    health: actor.health,
+                    max_health: actor.max_health,
+                }
+            })
+            .collect();
+
+        let export = WorldExport {
+            version: 1,
+            tiles,
+            characters,
+            camera: CameraExport {
+                x: self.camera_x,
+                y: self.camera_y,
+                zoom: self.zoom,
+            },
+        };
+
+        serde_json::to_string(&export).unwrap_or_else(|e| {
+            web_sys::console::error_1(
+                &format!("[freedom-board] serialization error: {}", e).into(),
+            );
+            "{}".to_string()
+        })
+    }
+
+    /// Replace the current world state from a JSON string.
+    ///
+    /// Clears all tiles, undo/redo stacks, and characters before importing.
+    /// Resolves name strings back to u16 asset_ids via tile_registry.
+    /// Tiles with unresolvable names are skipped (logged as warning).
+    fn import_world_from_json(&mut self, json: &str) {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct WorldImport {
+            version: u32,
+            tiles: Vec<TileImport>,
+            #[serde(default)]
+            characters: Vec<CharImport>,
+            #[serde(default)]
+            camera: Option<CameraImport>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct TileImport {
+            x: i32,
+            y: i32,
+            uuid: String,
+            variant: u8,
+            layer: u8,
+            #[serde(default)]
+            flags: u8,
+        }
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct CharImport {
+            x: f32,
+            y: f32,
+            body_def_id: String,
+            direction: String,
+            health: i32,
+            max_health: i32,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct CameraImport {
+            x: f32,
+            y: f32,
+            zoom: f32,
+        }
+
+        let import: WorldImport = match serde_json::from_str(json) {
+            Ok(data) => data,
+            Err(e) => {
+                web_sys::console::error_1(
+                    &format!("[freedom-board] import parse error: {}", e).into(),
+                );
+                return;
+            }
+        };
+
+        if import.version != 1 {
+            web_sys::console::error_1(
+                &format!(
+                    "[freedom-board] unsupported world version: {} (expected 1)",
+                    import.version
+                )
+                .into(),
+            );
+            return;
+        }
+
+        // Build reverse lookup: tile name → u16 asset_id
+        let name_to_id: std::collections::HashMap<&str, u16> = self
+            .tile_registry
+            .iter()
+            .enumerate()
+            .map(|(i, info)| (info.name.as_str(), i as u16))
+            .collect();
+
+        // Clear current state — imported state becomes the new baseline
+        self.world.clear();
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.characters.clear();
+        self.selected_character = None;
+
+        // Import tiles
+        let mut imported = 0u32;
+        let mut skipped = 0u32;
+        for tile in &import.tiles {
+            if let Some(&asset_id) = name_to_id.get(tile.uuid.as_str()) {
+                let coord = TileCoord::new(tile.x, tile.y);
+                let placement =
+                    TilePlacement::new(asset_id, tile.variant, tile.layer).with_flags(tile.flags);
+                self.world.set(coord, placement);
+                imported += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+
+        // Import characters
+        for ch in &import.characters {
+            let direction = match ch.direction.as_str() {
+                "north" => Direction::North,
+                "east" => Direction::East,
+                "west" => Direction::West,
+                _ => Direction::South,
+            };
+            let id = ActorId(self.next_actor_id);
+            self.next_actor_id += 1;
+            let mut actor = CompositeActor::new(
+                id,
+                glam::Vec2::new(ch.x, ch.y),
+                ch.body_def_id.clone(),
+            );
+            actor.direction = direction;
+            actor.health = ch.health;
+            actor.max_health = ch.max_health;
+            self.characters.insert(id, actor);
+        }
+
+        // Restore camera if provided
+        if let Some(cam) = import.camera {
+            self.camera_x = cam.x;
+            self.camera_y = cam.y;
+            self.zoom = cam.zoom;
+        }
+
+        self.camera_dirty = true;
+        self.characters_dirty = true;
+
+        web_sys::console::log_1(
+            &format!(
+                "[freedom-board] imported world: {} tiles ({} skipped), {} characters",
+                imported, skipped, import.characters.len()
+            )
+            .into(),
+        );
     }
 
     // ── Vector overlay rendering ──────────────────────────────────────────
@@ -902,6 +1207,56 @@ impl Game for FreedomBoardGame {
             }
         });
 
+        // 0b. Check for pending character name registry
+        PENDING_CHARACTER_NAMES.with(|p| {
+            if let Some(names) = p.borrow_mut().take() {
+                web_sys::console::log_1(
+                    &format!("[freedom-board] character names updated: {} entries", names.len()).into(),
+                );
+                self.character_names = names;
+                self.characters_dirty = true;
+            }
+        });
+
+        // 0c. Check for pending stamp (map import)
+        PENDING_STAMP.with(|p| {
+            if let Some((origin, tiles)) = p.borrow_mut().take() {
+                let count = tiles.len();
+                let edits = stamp_tiles(&mut self.world, origin, &tiles);
+                if !edits.is_empty() {
+                    web_sys::console::log_1(
+                        &format!(
+                            "[freedom-board] stamped {} tiles at ({}, {})",
+                            count, origin.x, origin.y
+                        )
+                        .into(),
+                    );
+                    self.undo_stack.push(edits);
+                    self.redo_stack.clear();
+                }
+            }
+        });
+
+        // 0d. Check for pending world export request
+        EXPORT_REQUESTED.with(|r| {
+            if *r.borrow() {
+                *r.borrow_mut() = false;
+                let json = self.serialize_world();
+                let len = json.len();
+                EXPORT_RESULT.with(|res| *res.borrow_mut() = Some(json));
+                web_sys::console::log_1(
+                    &format!("[freedom-board] world exported: {} bytes", len).into(),
+                );
+            }
+        });
+
+        // 0e. Check for pending world import
+        PENDING_IMPORT.with(|p| {
+            if let Some(json) = p.borrow_mut().take() {
+                self.import_world_from_json(&json);
+            }
+        });
+
         // 1. Process all custom events from React
         for event in input.iter() {
             if let InputEvent::Custom { kind, a, b, c } = event {
@@ -919,9 +1274,15 @@ impl Game for FreedomBoardGame {
         }
 
         // 3. Draw vector overlays (cleared each frame, must redraw every update)
-        self.draw_grid(ctx);
-        self.draw_origin_crosshair(ctx);
-        self.draw_quadtree_debug(ctx);
+        if self.debug_show_grid {
+            self.draw_grid(ctx);
+        }
+        if self.debug_show_crosshair {
+            self.draw_origin_crosshair(ctx);
+        }
+        if self.debug_show_quadtree {
+            self.draw_quadtree_debug(ctx);
+        }
 
         // 4. Characters are drawn as vectors (cleared each frame), so always redraw
         if !self.characters.is_empty() {
@@ -942,6 +1303,22 @@ impl Game for FreedomBoardGame {
 
 thread_local! {
     static PENDING_TILE_REGISTRY: std::cell::RefCell<Option<Vec<TileAssetInfo>>> =
+        std::cell::RefCell::new(None);
+    static PENDING_CHARACTER_NAMES: std::cell::RefCell<Option<Vec<String>>> =
+        std::cell::RefCell::new(None);
+    static PENDING_STAMP: std::cell::RefCell<Option<(TileCoord, Vec<(TileCoord, TilePlacement)>)>> =
+        std::cell::RefCell::new(None);
+
+    /// Flag set by `request_world_export()`. Consumed by update(), which serializes
+    /// the world and writes the result to EXPORT_RESULT.
+    static EXPORT_REQUESTED: std::cell::RefCell<bool> =
+        std::cell::RefCell::new(false);
+    /// Serialized world JSON, written by update() when EXPORT_REQUESTED is true.
+    /// Read and cleared by `take_world_export()`.
+    static EXPORT_RESULT: std::cell::RefCell<Option<String>> =
+        std::cell::RefCell::new(None);
+    /// Queued world JSON for import. Set by `import_world()`, consumed by update().
+    static PENDING_IMPORT: std::cell::RefCell<Option<String>> =
         std::cell::RefCell::new(None);
 }
 
@@ -976,61 +1353,210 @@ pub fn reload_game_manifest(json: &str) {
         bridge_asset_id: Option<String>,
     }
 
+    /// Extended manifest payload: tiles + character names.
+    /// Falls back to parsing as flat Vec<TileEntry> for backward compat.
+    #[derive(serde::Deserialize)]
+    struct ManifestPayload {
+        tiles: Vec<TileEntry>,
+        #[serde(default)]
+        characters: Vec<String>,
+    }
+
     fn default_variations() -> u8 {
         1
     }
 
-    match serde_json::from_str::<Vec<TileEntry>>(json) {
-        Ok(entries) => {
-            // First pass: build name → index lookup for bridge_asset_id resolution
-            let name_to_idx: std::collections::HashMap<&str, u16> = entries
-                .iter()
-                .enumerate()
-                .map(|(i, e)| (e.name.as_str(), i as u16))
-                .collect();
+    // Try extended format first: { tiles: [...], characters: [...] }
+    // Fall back to flat array for backward compat: [...]
+    let (entries, char_names) = match serde_json::from_str::<ManifestPayload>(json) {
+        Ok(payload) => (payload.tiles, payload.characters),
+        Err(_) => match serde_json::from_str::<Vec<TileEntry>>(json) {
+            Ok(entries) => (entries, Vec::new()),
+            Err(e) => {
+                web_sys::console::error_1(
+                    &format!("[freedom-board] manifest parse error: {}", e).into(),
+                );
+                return;
+            }
+        },
+    };
 
-            // Second pass: build registry with resolved bridge references
-            let registry: Vec<TileAssetInfo> = entries
-                .iter()
-                .map(|e| {
-                    let tile_type = match e.tile_type.as_deref() {
-                        Some("PATH") => TileType::Path,
-                        Some("BRIDGE") => TileType::Bridge,
-                        _ => TileType::Tile,
-                    };
-                    let terrain_type = match e.terrain_type.as_deref() {
-                        Some("WATER") => TerrainType::Water,
-                        _ => TerrainType::Land,
-                    };
-                    let bridge_asset_id = e
-                        .bridge_asset_id
-                        .as_deref()
-                        .and_then(|name| name_to_idx.get(name).copied());
+    // First pass: build name → index lookup for bridge_asset_id resolution
+    let name_to_idx: std::collections::HashMap<&str, u16> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.name.as_str(), i as u16))
+        .collect();
 
-                    TileAssetInfo {
-                        name: e.name.clone(),
-                        variations: e.variations,
-                        tile_type,
-                        terrain_type,
-                        bridge_asset_id,
-                    }
-                })
-                .collect();
+    // Second pass: build registry with resolved bridge references
+    let registry: Vec<TileAssetInfo> = entries
+        .iter()
+        .map(|e| {
+            let tile_type = match e.tile_type.as_deref() {
+                Some("PATH") => TileType::Path,
+                Some("BRIDGE") => TileType::Bridge,
+                _ => TileType::Tile,
+            };
+            let terrain_type = match e.terrain_type.as_deref() {
+                Some("WATER") => TerrainType::Water,
+                _ => TerrainType::Land,
+            };
+            let bridge_asset_id = e
+                .bridge_asset_id
+                .as_deref()
+                .and_then(|name| name_to_idx.get(name).copied());
 
-            let count = registry.len();
-            PENDING_TILE_REGISTRY.with(|p| *p.borrow_mut() = Some(registry));
-            web_sys::console::log_1(
-                &format!("[freedom-board] tile registry: {} entries queued", count).into(),
-            );
-        }
+            TileAssetInfo {
+                name: e.name.clone(),
+                variations: e.variations,
+                tile_type,
+                terrain_type,
+                bridge_asset_id,
+            }
+        })
+        .collect();
+
+    let tile_count = registry.len();
+    let char_count = char_names.len();
+    PENDING_TILE_REGISTRY.with(|p| *p.borrow_mut() = Some(registry));
+    PENDING_CHARACTER_NAMES.with(|p| *p.borrow_mut() = Some(char_names));
+    web_sys::console::log_1(
+        &format!(
+            "[freedom-board] manifest queued: {} tiles, {} characters",
+            tile_count, char_count
+        )
+        .into(),
+    );
+}
+
+/// Stamp a map (LDtk level) onto the infinite canvas.
+///
+/// Called by the engine worker via `load_level` dispatch.
+/// React pre-resolves tile names to asset_ids and layers before sending.
+///
+/// JSON format:
+/// ```json
+/// {
+///   "originX": 10, "originY": 5,
+///   "tiles": [
+///     {"x": 0, "y": 0, "assetId": 3, "layer": 0, "variant": 2},
+///     ...
+///   ]
+/// }
+/// ```
+///
+/// - `originX/Y`: top-left corner in tile coordinates where the stamp is placed
+/// - `x/y`: offset from origin (not absolute coords)
+/// - `assetId`: u16 tile asset index (resolved by React from tile name)
+/// - `layer`: render/storage layer (derived by React from tileType/terrainType)
+/// - `variant`: sprite variation (for TILE: seed % variations, for PATH: 0)
+#[wasm_bindgen]
+pub fn load_level(json: &str) {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct StampPayload {
+        origin_x: i32,
+        origin_y: i32,
+        tiles: Vec<StampTile>,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct StampTile {
+        x: i32,
+        y: i32,
+        asset_id: u16,
+        layer: u8,
+        variant: u8,
+    }
+
+    let payload: StampPayload = match serde_json::from_str(json) {
+        Ok(p) => p,
         Err(e) => {
             web_sys::console::error_1(
-                &format!("[freedom-board] tile registry parse error: {}", e).into(),
+                &format!("[freedom-board] stamp parse error: {}", e).into(),
             );
+            return;
         }
-    }
+    };
+
+    let origin = TileCoord::new(payload.origin_x, payload.origin_y);
+    let tiles: Vec<(TileCoord, TilePlacement)> = payload
+        .tiles
+        .into_iter()
+        .map(|t| {
+            (
+                TileCoord::new(t.x, t.y),
+                TilePlacement::new(t.asset_id, t.variant, t.layer),
+            )
+        })
+        .collect();
+
+    let count = tiles.len();
+    PENDING_STAMP.with(|p| *p.borrow_mut() = Some((origin, tiles)));
+    web_sys::console::log_1(
+        &format!(
+            "[freedom-board] stamp queued: {} tiles at ({}, {})",
+            count, payload.origin_x, payload.origin_y
+        )
+        .into(),
+    );
+}
+
+// ── World persistence exports ────────────────────────────────────────────────
+//
+// Two-phase export pattern (request → tick → take):
+//   1. Worker calls request_world_export()     → sets flag
+//   2. Worker calls game_tick()                → update() serializes world, writes to EXPORT_RESULT
+//   3. Worker calls take_world_export()        → returns JSON string, clears EXPORT_RESULT
+//
+// Import is single-phase (queue → tick consumes):
+//   1. Worker calls import_world(json)         → queues JSON in PENDING_IMPORT
+//   2. Next game_tick() → update() deserializes and replaces world state
+
+/// Request world serialization. The result will be available after the next game_tick()
+/// via `take_world_export()`.
+///
+/// This two-phase pattern exists because the game instance is owned by the engine
+/// macro and cannot be accessed directly from free functions. The flag is checked
+/// during update() which has &mut self access.
+#[wasm_bindgen]
+pub fn request_world_export() {
+    EXPORT_REQUESTED.with(|r| *r.borrow_mut() = true);
+    web_sys::console::log_1(&"[freedom-board] world export requested".into());
+}
+
+/// Take the serialized world JSON from the last export request.
+/// Returns None if no export has been completed yet.
+/// Clears the result — subsequent calls return None until a new export is requested.
+#[wasm_bindgen]
+pub fn take_world_export() -> Option<String> {
+    EXPORT_RESULT.with(|r| r.borrow_mut().take())
+}
+
+/// Queue a world import from JSON. The world will be replaced on the next game_tick().
+///
+/// JSON format matches the IDB WorldData schema:
+/// ```json
+/// {
+///   "version": 1,
+///   "tiles": [{ "x": 0, "y": 0, "uuid": "iarba", "variant": 2, "layer": 0, "flags": 0 }],
+///   "characters": [{ "x": 5.5, "y": 10.5, "bodyDefId": "warrior", "direction": "south",
+///                     "health": 100, "maxHealth": 100 }],
+///   "camera": { "x": 0.0, "y": 0.0, "zoom": 64.0 }
+/// }
+/// ```
+///
+/// Clears undo/redo stacks — the imported state becomes the new baseline.
+#[wasm_bindgen]
+pub fn import_world(json: &str) {
+    let len = json.len();
+    PENDING_IMPORT.with(|p| *p.borrow_mut() = Some(json.to_string()));
+    web_sys::console::log_1(
+        &format!("[freedom-board] world import queued: {} bytes", len).into(),
+    );
 }
 
 // Export the game using zap-web macro.
 // This generates all wasm-bindgen exports: game_init, game_tick, game_custom_event, etc.
-zap_web::export_game!(FreedomBoardGame, "freedom_board");
+zap_web::export_game!(FreedomBoardGame, "freedom_board", vectors);
