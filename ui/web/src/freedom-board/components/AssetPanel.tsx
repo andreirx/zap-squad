@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type { TileDefinition, CharacterDefinition, WeaponDefinition } from '../lib/manifest';
 import { ASSETS_URL } from '../../lib/config';
+import { exportAsset, pickAndImportAsset } from '../../lib/asset-export';
 
 /** Preview thumbnail size in CSS pixels. */
 const THUMB = 48;
@@ -168,6 +169,25 @@ export function AssetPanel({
       fontSize: 11,
       userSelect: 'none',
     }}>
+      {/* Import asset button */}
+      <div style={{ padding: '6px 8px', borderBottom: '1px solid #0f3460' }}>
+        <button
+          onClick={() => {
+            pickAndImportAsset().then(result => {
+              if (result) {
+                console.log(`[asset-panel] imported ${result.type} "${result.id}" — reload manifest to see it`);
+              }
+            });
+          }}
+          style={{
+            width: '100%', padding: '4px 8px', background: '#1a2a4a', color: '#60a0e0',
+            border: '1px solid #2a4a6a', borderRadius: 4, cursor: 'pointer', fontSize: 11,
+          }}
+        >
+          Import Asset
+        </button>
+      </div>
+
       {/* Tile categories */}
       {grouped.map(({ category, label, items }) => (
         <Section key={category} label={label} count={items.length} defaultOpen>
@@ -210,6 +230,21 @@ export function AssetPanel({
                   <span style={{ fontSize: 9, color: '#556677' }}>{tile.variations}v</span>
                 </div>
               </div>
+              <span
+                onClick={(e) => {
+                  e.stopPropagation();
+                  exportAsset('tile', tile).catch(err =>
+                    console.error('[asset-panel] export failed:', err)
+                  );
+                }}
+                style={{
+                  fontSize: 9, color: '#556677', cursor: 'pointer', padding: '2px 4px',
+                  flexShrink: 0,
+                }}
+                title={`Download ${tile.name} as JSON`}
+              >
+                DL
+              </span>
             </button>
           ))}
         </Section>
@@ -240,9 +275,25 @@ export function AssetPanel({
                 color: activeCharacterId === index ? '#60a0e0' : '#c0c8d0',
                 fontSize: 11,
                 fontWeight: activeCharacterId === index ? 600 : 400,
+                flex: 1,
               }}>
                 {c.name}
               </div>
+              <span
+                onClick={(e) => {
+                  e.stopPropagation();
+                  exportAsset('character', c).catch(err =>
+                    console.error('[asset-panel] export failed:', err)
+                  );
+                }}
+                style={{
+                  fontSize: 9, color: '#556677', cursor: 'pointer', padding: '2px 4px',
+                  flexShrink: 0,
+                }}
+                title={`Download ${c.name} as JSON`}
+              >
+                DL
+              </span>
             </button>
           ))}
           <div style={{ fontSize: 9, color: '#445566', padding: '2px 6px' }}>

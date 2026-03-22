@@ -62,7 +62,9 @@ use zap_engine::*;
 use zapsquad_core::entities::freedom_board::{
     SparseWorld, TileCoord, TilePlacement, VisibleTile, CHUNK_SIZE,
 };
-use zapsquad_core::entities::{ActorId, AnimationState, CompositeActor, Direction};
+use zapsquad_core::entities::{ActorId, AnimationState, CompositeActor, Direction, ScriptId};
+use zapsquad_adapters::script_bindings::{ScriptCommand, ScriptEngine, WorldQuery};
+use zapsquad_core::use_cases::{apply_damage, calculate_damage, find_path_in_radius, InfiniteNavGrid};
 use zapsquad_core::use_cases::freedom_board::{
     connectivity_bitmask, draw_line, erase_rect, erase_tile, fill_rect, flood_fill, place_tile,
     query_viewport, stamp_tiles, EditResult,
@@ -166,6 +168,20 @@ struct TileAssetInfo {
     bridge_asset_id: Option<u16>,
 }
 
+/// Adapter: SparseWorld as InfiniteNavGrid for A* pathfinding.
+///
+/// A tile is walkable if it has any tile placed on layer 0 (ground).
+/// Empty space is not walkable — characters cannot walk off placed terrain.
+struct SparseWorldNav<'a> {
+    world: &'a SparseWorld,
+}
+
+impl<'a> InfiniteNavGrid for SparseWorldNav<'a> {
+    fn is_walkable(&self, x: i32, y: i32) -> bool {
+        self.world.get(TileCoord::new(x, y), 0).is_some()
+    }
+}
+
 /// Main game struct implementing zap-engine's Game trait.
 ///
 /// Owns the SparseWorld and translates between the engine's entity system
@@ -206,6 +222,13 @@ pub struct FreedomBoardGame {
     /// Active movement targets. Characters with an entry here walk toward
     /// their target each frame instead of teleporting.
     movement_targets: std::collections::HashMap<ActorId, glam::Vec2>,
+    /// Queued waypoints from A* pathfinding. When a character arrives at its
+    /// current movement_target, the next waypoint is popped from this queue.
+    waypoint_queues: std::collections::HashMap<ActorId, std::collections::VecDeque<glam::Vec2>>,
+
+    // ── Scripting state ─────────────────────────────────────────────────
+    /// Rhai script engine — compiles and executes .rhai scripts per frame.
+    scripts: ScriptEngine,
 
     // ── Rendering state ─────────────────────────────────────────────────
     /// Engine entity IDs currently spawned for visible tiles.
@@ -232,6 +255,9 @@ pub struct FreedomBoardGame {
     // ── Stats tracking ──────────────────────────────────────────────────
     /// Last tile_count sent to React, to avoid spamming events.
     last_reported_tile_count: u64,
+    /// Last world generation sent to React. Used alongside tile_count to detect
+    /// overwrites (same count, different generation).
+    last_reported_generation: u64,
 }
 
 impl FreedomBoardGame {
@@ -255,6 +281,8 @@ impl FreedomBoardGame {
             characters_dirty: false,
             character_names: Vec::new(),
             movement_targets: std::collections::HashMap::new(),
+            waypoint_queues: std::collections::HashMap::new(),
+            scripts: ScriptEngine::new(),
 
             tile_entities: Vec::new(),
             last_rendered_generation: u64::MAX, // force initial render
@@ -271,6 +299,7 @@ impl FreedomBoardGame {
             debug_show_quadtree: false,
 
             last_reported_tile_count: u64::MAX,
+            last_reported_generation: u64::MAX,
         }
     }
 
@@ -285,22 +314,31 @@ impl FreedomBoardGame {
     }
 
     /// Process a custom event from React.
+    /// Push edits to undo stack, capping at 1000 entries to bound memory usage.
+    fn push_undo(&mut self, edits: Vec<EditResult>) {
+        const MAX_UNDO: usize = 1000;
+        self.undo_stack.push(edits);
+        if self.undo_stack.len() > MAX_UNDO {
+            let excess = self.undo_stack.len() - MAX_UNDO;
+            self.undo_stack.drain(0..excess);
+        }
+        self.redo_stack.clear();
+    }
+
     fn handle_custom_event(&mut self, kind: u32, a: f32, b: f32, c: f32) {
         match kind {
             events::PLACE_TILE => {
                 let coord = TileCoord::new(a as i32, b as i32);
                 let tile = TilePlacement::new(c as u16, self.active_variant, self.active_layer);
                 let edit = place_tile(&mut self.world, coord, tile);
-                self.undo_stack.push(vec![edit]);
-                self.redo_stack.clear();
+                self.push_undo(vec![edit]);
             }
             events::ERASE_TILE => {
                 let coord = TileCoord::new(a as i32, b as i32);
                 let layer = c as u8;
                 if self.world.get(coord, layer).is_some() {
                     let edit = erase_tile(&mut self.world, coord, layer);
-                    self.undo_stack.push(vec![edit]);
-                    self.redo_stack.clear();
+                    self.push_undo(vec![edit]);
                 }
             }
             events::FLOOD_FILL => {
@@ -308,8 +346,7 @@ impl FreedomBoardGame {
                 let tile = TilePlacement::new(c as u16, self.active_variant, self.active_layer);
                 let edits = flood_fill(&mut self.world, coord, tile, 10_000);
                 if !edits.is_empty() {
-                    self.undo_stack.push(edits);
-                    self.redo_stack.clear();
+                    self.push_undo(edits);
                 }
             }
             events::DRAW_LINE => {
@@ -318,8 +355,7 @@ impl FreedomBoardGame {
                     let tile = TilePlacement::new(c as u16, self.active_variant, self.active_layer);
                     let edits = draw_line(&mut self.world, start, end, tile);
                     if !edits.is_empty() {
-                        self.undo_stack.push(edits);
-                        self.redo_stack.clear();
+                        self.push_undo(edits);
                     }
                 }
             }
@@ -331,8 +367,7 @@ impl FreedomBoardGame {
                     let max = TileCoord::new(start.x.max(end.x), start.y.max(end.y));
                     let edits = fill_rect(&mut self.world, min, max, tile);
                     if !edits.is_empty() {
-                        self.undo_stack.push(edits);
-                        self.redo_stack.clear();
+                        self.push_undo(edits);
                     }
                 }
             }
@@ -344,8 +379,7 @@ impl FreedomBoardGame {
                     let max = TileCoord::new(start.x.max(end.x), start.y.max(end.y));
                     let edits = erase_rect(&mut self.world, min, max, layer);
                     if !edits.is_empty() {
-                        self.undo_stack.push(edits);
-                        self.redo_stack.clear();
+                        self.push_undo(edits);
                     }
                 }
             }
@@ -424,6 +458,7 @@ impl FreedomBoardGame {
                 if let Some(id) = target {
                     self.characters.remove(&id);
                     self.movement_targets.remove(&id);
+                    self.waypoint_queues.remove(&id);
                     if self.selected_character == Some(id) {
                         self.selected_character = None;
                     }
@@ -445,14 +480,46 @@ impl FreedomBoardGame {
             }
             events::MOVE_CHARACTER => {
                 // a=tile_x, b=tile_y — command selected character to walk here.
-                // Sets a movement target; the character interpolates toward it
-                // each frame in update_character_movement().
+                // Uses A* pathfinding if ground tiles exist, falls back to straight line.
                 if let Some(sel_id) = self.selected_character {
-                    let target = glam::Vec2::new(a as i32 as f32 + 0.5, b as i32 as f32 + 0.5);
-                    self.movement_targets.insert(sel_id, target);
+                    let goal_tile = glam::IVec2::new(a as i32, b as i32);
+
+                    if let Some(actor) = self.characters.get(&sel_id) {
+                        let start_tile = glam::IVec2::new(
+                            actor.position.x.floor() as i32,
+                            actor.position.y.floor() as i32,
+                        );
+
+                        // Try A* pathfinding on placed ground tiles
+                        let nav = SparseWorldNav { world: &self.world };
+                        let path = find_path_in_radius(&nav, start_tile, goal_tile, 50);
+
+                        if let Some(waypoints) = path {
+                            // Path found — convert tile coords to center positions
+                            let mut queue: std::collections::VecDeque<glam::Vec2> = waypoints
+                                .iter()
+                                .map(|p| glam::Vec2::new(p.x as f32 + 0.5, p.y as f32 + 0.5))
+                                .collect();
+
+                            // Set first waypoint as immediate target
+                            if let Some(first) = queue.pop_front() {
+                                self.movement_targets.insert(sel_id, first);
+                                if !queue.is_empty() {
+                                    self.waypoint_queues.insert(sel_id, queue);
+                                }
+                            }
+                        } else {
+                            // No path (no ground tiles, or goal unreachable) — straight line fallback
+                            let target = glam::Vec2::new(goal_tile.x as f32 + 0.5, goal_tile.y as f32 + 0.5);
+                            self.movement_targets.insert(sel_id, target);
+                            self.waypoint_queues.remove(&sel_id);
+                        }
+                    }
+
                     // Face toward target immediately
                     if let Some(actor) = self.characters.get_mut(&sel_id) {
-                        let delta = target - actor.position;
+                        let goal_center = glam::Vec2::new(goal_tile.x as f32 + 0.5, goal_tile.y as f32 + 0.5);
+                        let delta = goal_center - actor.position;
                         if let Some(dir) = Direction::from_velocity(delta) {
                             actor.direction = dir;
                         }
@@ -549,6 +616,135 @@ impl FreedomBoardGame {
     /// to the target position, switches to Idle animation, and the target is removed.
     ///
     /// Uses a fixed dt of 1/60s (the engine runs at requestAnimationFrame cadence).
+    /// Execute Rhai scripts for all characters that have assigned script_ids.
+    ///
+    /// For each character with a script_id, builds a ScriptContext with the actor's
+    /// position and a WorldQuery of all other actors, then calls the script's update()
+    /// function. Collected ScriptCommands are applied to the actor:
+    ///   - MoveTo → inserts into movement_targets (smooth interpolation)
+    ///   - SetDirection → directly sets actor.direction
+    ///   - SetAnimation → directly sets actor.animation_state
+    ///   - SetVelocity → directly sets actor.velocity (overrides movement_targets)
+    ///   - Attack → placeholder (logs, does not apply damage yet — see T3)
+    ///   - PlaySound → placeholder (no audio system wired yet)
+    fn run_scripts(&mut self) {
+        const DT: f32 = 1.0 / 60.0;
+
+        // Collect actor IDs that have scripts (can't borrow self mutably during iteration)
+        let scripted: Vec<(ActorId, ScriptId)> = self
+            .characters
+            .values()
+            .filter_map(|a| a.script_id.map(|sid| (a.id, sid)))
+            .collect();
+
+        if scripted.is_empty() {
+            return;
+        }
+
+        // Build world query from all characters (read-only snapshot)
+        let mut query = WorldQuery::new();
+        for actor in self.characters.values() {
+            query.add_actor(actor.id, actor.position, actor.tag.clone());
+        }
+
+        // Run each script and collect commands
+        let mut all_commands: Vec<(ActorId, Vec<ScriptCommand>)> = Vec::new();
+
+        for (actor_id, script_id) in &scripted {
+            let actor = match self.characters.get(actor_id) {
+                Some(a) => a,
+                None => continue,
+            };
+
+            let script_name = format!("script_{}", script_id.0);
+            let ctx = zapsquad_adapters::script_bindings::ScriptContext::new(
+                *actor_id,
+                actor.position,
+                DT,
+                query.clone(),
+            );
+
+            match self.scripts.run_update_with_context(&script_name, ctx) {
+                Ok(commands) => {
+                    if !commands.is_empty() {
+                        all_commands.push((*actor_id, commands));
+                    }
+                }
+                Err(_) => {
+                    // Script execution error — silently skip.
+                    // Compilation errors are already logged during reload.
+                }
+            }
+        }
+
+        // Apply commands
+        let mut kills: Vec<ActorId> = Vec::new();
+        for (actor_id, commands) in all_commands {
+            for cmd in commands {
+                match cmd {
+                    ScriptCommand::MoveTo(target) => {
+                        // Use the smooth movement system (movement_targets)
+                        self.movement_targets.insert(actor_id, target);
+                        if let Some(actor) = self.characters.get_mut(&actor_id) {
+                            let delta = target - actor.position;
+                            if let Some(dir) = Direction::from_velocity(delta) {
+                                actor.direction = dir;
+                            }
+                            actor.animation_state = AnimationState::Walk;
+                        }
+                    }
+                    ScriptCommand::SetDirection(dir) => {
+                        if let Some(actor) = self.characters.get_mut(&actor_id) {
+                            actor.direction = dir;
+                        }
+                    }
+                    ScriptCommand::SetAnimation(anim) => {
+                        if let Some(actor) = self.characters.get_mut(&actor_id) {
+                            actor.animation_state = anim;
+                        }
+                    }
+                    ScriptCommand::SetVelocity(vel) => {
+                        if let Some(actor) = self.characters.get_mut(&actor_id) {
+                            actor.velocity = vel;
+                            if vel.length_squared() > 0.1 {
+                                actor.update_direction_from_velocity();
+                            }
+                        }
+                    }
+                    ScriptCommand::Attack(target_id) => {
+                        // Set attacker animation
+                        if let Some(actor) = self.characters.get_mut(&actor_id) {
+                            actor.animation_state = AnimationState::MeleeAttack;
+                        }
+                        // Apply damage to target
+                        let base = calculate_damage(10); // TODO: get from weapon definition
+                        if let Some(target) = self.characters.get_mut(&target_id) {
+                            let result = apply_damage(target, base);
+                            if result.is_kill {
+                                kills.push(target_id);
+                            }
+                        }
+                    }
+                    ScriptCommand::PlaySound(_name) => {
+                        // TODO: Wire audio system
+                    }
+                }
+            }
+            self.characters_dirty = true;
+        }
+
+        // Remove killed actors
+        for dead_id in &kills {
+            self.characters.remove(dead_id);
+            self.movement_targets.remove(dead_id);
+            self.waypoint_queues.remove(dead_id);
+            if self.selected_character == Some(*dead_id) {
+                self.selected_character = None;
+            }
+            self.characters_dirty = true;
+        }
+    }
+
     fn update_character_movement(&mut self) {
         const MOVE_SPEED: f32 = 4.0;           // tiles per second
         const ARRIVAL_THRESHOLD: f32 = 0.05;   // snap when this close
@@ -595,7 +791,27 @@ impl FreedomBoardGame {
         }
 
         for id in arrived {
-            self.movement_targets.remove(&id);
+            // Check if there are more waypoints in the queue
+            let next_waypoint = self.waypoint_queues.get_mut(&id).and_then(|q| q.pop_front());
+            if let Some(next) = next_waypoint {
+                // More waypoints — set next as movement target, update direction
+                self.movement_targets.insert(id, next);
+                if let Some(actor) = self.characters.get_mut(&id) {
+                    let delta = next - actor.position;
+                    if let Some(dir) = Direction::from_velocity(delta) {
+                        actor.direction = dir;
+                    }
+                    actor.animation_state = AnimationState::Walk;
+                }
+                // Clean up empty queue
+                if self.waypoint_queues.get(&id).map_or(false, |q| q.is_empty()) {
+                    self.waypoint_queues.remove(&id);
+                }
+            } else {
+                // No more waypoints — stop
+                self.movement_targets.remove(&id);
+                self.waypoint_queues.remove(&id);
+            }
             self.characters_dirty = true;
         }
     }
@@ -851,10 +1067,15 @@ impl FreedomBoardGame {
     }
 
     /// Emit world stats to React if they changed.
+    ///
+    /// Checks both tile count AND world generation. This ensures that overwriting
+    /// existing tiles (same count, different generation) still triggers auto-save.
     fn emit_stats_if_changed(&mut self, ctx: &mut EngineContext) {
         let tc = self.world.tile_count();
-        if tc != self.last_reported_tile_count {
+        let gen = self.world.generation();
+        if tc != self.last_reported_tile_count || gen != self.last_reported_generation {
             self.last_reported_tile_count = tc;
+            self.last_reported_generation = gen;
             ctx.events.push(GameEvent {
                 kind: game_events::WORLD_STATS as f32,
                 a: tc as f32,
@@ -1071,6 +1292,7 @@ impl FreedomBoardGame {
         self.redo_stack.clear();
         self.characters.clear();
         self.movement_targets.clear();
+        self.waypoint_queues.clear();
         self.selected_character = None;
 
         // Import tiles
@@ -1337,8 +1559,7 @@ impl Game for FreedomBoardGame {
                         )
                         .into(),
                     );
-                    self.undo_stack.push(edits);
-                    self.redo_stack.clear();
+                    self.push_undo(edits);
                 }
             }
         });
@@ -1363,6 +1584,29 @@ impl Game for FreedomBoardGame {
             }
         });
 
+        // 0f. Check for pending script reload
+        PENDING_SCRIPTS.with(|p| {
+            if let Some(scripts) = p.borrow_mut().take() {
+                self.scripts.clear_scripts();
+                let mut ok = 0u32;
+                let mut fail = 0u32;
+                for (name, source) in &scripts {
+                    match self.scripts.compile_script(name, source) {
+                        Ok(_) => ok += 1,
+                        Err(e) => {
+                            web_sys::console::error_1(
+                                &format!("[freedom-board] script '{}' compile error: {:?}", name, e).into(),
+                            );
+                            fail += 1;
+                        }
+                    }
+                }
+                web_sys::console::log_1(
+                    &format!("[freedom-board] scripts reloaded: {} ok, {} failed", ok, fail).into(),
+                );
+            }
+        });
+
         // 1. Process all custom events from React
         for event in input.iter() {
             if let InputEvent::Custom { kind, a, b, c } = event {
@@ -1370,10 +1614,13 @@ impl Game for FreedomBoardGame {
             }
         }
 
-        // 1b. Update character movement (smooth interpolation toward targets)
+        // 1b. Run Rhai scripts for characters with assigned script_ids
+        self.run_scripts();
+
+        // 1c. Update character movement (smooth interpolation toward targets)
         self.update_character_movement();
 
-        // 1c. Update character animation frames (walk cycle, idle cycle)
+        // 1d. Update character animation frames (walk cycle, idle cycle)
         self.update_animation_frames();
 
         // 2. Rebuild visible entities if world or camera changed
@@ -1431,6 +1678,10 @@ thread_local! {
         std::cell::RefCell::new(None);
     /// Queued world JSON for import. Set by `import_world()`, consumed by update().
     static PENDING_IMPORT: std::cell::RefCell<Option<String>> =
+        std::cell::RefCell::new(None);
+    /// Queued Rhai scripts for hot-reload. Set by `reload_scripts()`, consumed by update().
+    /// Map of script name → source code.
+    static PENDING_SCRIPTS: std::cell::RefCell<Option<std::collections::HashMap<String, String>>> =
         std::cell::RefCell::new(None);
 }
 
@@ -1667,6 +1918,30 @@ pub fn import_world(json: &str) {
     web_sys::console::log_1(
         &format!("[freedom-board] world import queued: {} bytes", len).into(),
     );
+}
+
+/// Reload Rhai scripts. Called from React when scripts change.
+///
+/// JSON format: `{ "script_name": "fn update(ctx) { ... }", ... }`
+///
+/// Scripts are compiled on the next game tick. Compilation errors are
+/// logged to the browser console but do not crash the game.
+#[wasm_bindgen]
+pub fn reload_scripts(scripts_json: &str) {
+    match serde_json::from_str::<std::collections::HashMap<String, String>>(scripts_json) {
+        Ok(scripts) => {
+            let count = scripts.len();
+            PENDING_SCRIPTS.with(|p| *p.borrow_mut() = Some(scripts));
+            web_sys::console::log_1(
+                &format!("[freedom-board] {} scripts queued for reload", count).into(),
+            );
+        }
+        Err(e) => {
+            web_sys::console::error_1(
+                &format!("[freedom-board] failed to parse scripts JSON: {}", e).into(),
+            );
+        }
+    }
 }
 
 // Export the game using zap-web macro.

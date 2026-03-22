@@ -11,7 +11,7 @@ import {
   CharacterDefinition,
   WeaponDefinition,
 } from './lib/manifest';
-import type { Tool, WorldStats } from './types';
+import type { Tool, WorldStats, PendingPlacement, StampTile } from './types';
 import { worldStore } from '../lib/idb';
 import type { WorldData } from '../lib/idb';
 
@@ -51,12 +51,14 @@ interface LdtkLevel {
  *
  * Returns JSON string ready for WASM load_level(), or null on parse failure.
  */
-function parseLdtkToStamp(
+/**
+ * Parse an LDtk JSON file into a PendingPlacement (tiles with relative coords + dimensions).
+ * Does NOT bake an origin — the user picks the placement position interactively.
+ */
+function parseLdtkFile(
   fileContent: string,
   registry: TileRegistryEntry[],
-  originX: number,
-  originY: number,
-): string | null {
+): PendingPlacement | null {
   let ldtk: LdtkLevel;
   try {
     ldtk = JSON.parse(fileContent);
@@ -77,7 +79,7 @@ function parseLdtkToStamp(
   });
 
   const level = ldtk.levels[0];
-  const tiles: Array<{ x: number; y: number; assetId: number; layer: number; variant: number }> = [];
+  const tiles: StampTile[] = [];
   let skipped = 0;
 
   for (const layerInst of level.layerInstances) {
@@ -95,7 +97,6 @@ function parseLdtkToStamp(
       const entry = registry[assetId];
       const layer = tileTypeToLayer(entry);
 
-      // Variant: for terrain TILE, use seed mod variations. For PATH/BRIDGE, 0 (renderer recomputes).
       let variant = 0;
       if (entry.tileType === 'TILE' && gt.t != null && entry.variations > 1) {
         variant = Math.abs(gt.t) % entry.variations;
@@ -112,9 +113,22 @@ function parseLdtkToStamp(
     console.warn(`[freedom-board] stamp: skipped ${skipped} tiles with unknown asset names`);
   }
 
-  console.log(`[freedom-board] parsed LDtk level "${level.identifier}": ${tiles.length} tiles`);
+  // Compute map dimensions from tile extents
+  let maxX = 0, maxY = 0;
+  for (const t of tiles) {
+    if (t.x > maxX) maxX = t.x;
+    if (t.y > maxY) maxY = t.y;
+  }
 
-  return JSON.stringify({ originX, originY, tiles });
+  const result: PendingPlacement = {
+    tiles,
+    widthTiles: maxX + 1,
+    heightTiles: maxY + 1,
+    levelName: level.identifier,
+  };
+
+  console.log(`[freedom-board] parsed LDtk level "${level.identifier}": ${tiles.length} tiles, ${result.widthTiles}x${result.heightTiles}`);
+  return result;
 }
 
 /**
@@ -148,6 +162,8 @@ export function FreedomBoardPage() {
 
   // Stamp state — set when user imports a map file, cleared after dispatch to WASM
   const [pendingStamp, setPendingStamp] = useState<string | null>(null);
+  // Placement mode — parsed map waiting for user to pick a position
+  const [pendingPlacement, setPendingPlacement] = useState<PendingPlacement | null>(null);
   // World import state — set when user loads a world file from disk
   const [pendingWorldImport, setPendingWorldImport] = useState<string | null>(null);
   const [showWorldList, setShowWorldList] = useState(false);
@@ -207,21 +223,19 @@ export function FreedomBoardPage() {
   }, []);
 
   // ── Map import handler ─────────────────────────────────────────────
-  // Reads the selected LDtk JSON file, resolves tiles, stamps at viewport center.
+  // Reads the LDtk JSON file, parses it, and enters placement mode.
+  // The user then clicks on the canvas to choose where to place the map.
   const handleImportFile = useCallback((file: File) => {
     const reader = new FileReader();
     reader.onload = () => {
       const text = reader.result as string;
-      // Stamp origin = current viewport top-left (integer tile coords)
-      const originX = Math.floor(cameraState.x);
-      const originY = Math.floor(cameraState.y);
-      const json = parseLdtkToStamp(text, tileRegistry, originX, originY);
-      if (json) {
-        setPendingStamp(json);
+      const placement = parseLdtkFile(text, tileRegistry);
+      if (placement) {
+        setPendingPlacement(placement);
       }
     };
     reader.readAsText(file);
-  }, [cameraState, tileRegistry]);
+  }, [tileRegistry]);
 
   const handleImportClick = useCallback(() => {
     mapFileInputRef.current?.click();
@@ -238,6 +252,24 @@ export function FreedomBoardPage() {
 
   const handleStampComplete = useCallback(() => {
     setPendingStamp(null);
+  }, []);
+
+  // Called by InfiniteCanvas when user clicks to deploy the placement
+  const handlePlacementDeploy = useCallback((originX: number, originY: number) => {
+    if (!pendingPlacement) return;
+    const json = JSON.stringify({
+      originX,
+      originY,
+      tiles: pendingPlacement.tiles,
+    });
+    setPendingStamp(json);
+    setPendingPlacement(null);
+    console.log(`[freedom-board] deploying "${pendingPlacement.levelName}" at (${originX}, ${originY})`);
+  }, [pendingPlacement]);
+
+  const handlePlacementCancel = useCallback(() => {
+    setPendingPlacement(null);
+    console.log('[freedom-board] placement cancelled');
   }, []);
 
   // ── Save to disk (download world JSON) ─────────────────────────────
@@ -354,6 +386,9 @@ export function FreedomBoardPage() {
             characterNames={characters.map(c => c.id)}
             pendingStamp={pendingStamp}
             onStampComplete={handleStampComplete}
+            pendingPlacement={pendingPlacement}
+            onPlacementDeploy={handlePlacementDeploy}
+            onPlacementCancel={handlePlacementCancel}
             pendingWorldImport={pendingWorldImport}
             onWorldImportComplete={useCallback(() => setPendingWorldImport(null), [])}
             onCursorTileChange={setCursorTile}

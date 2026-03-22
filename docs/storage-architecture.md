@@ -426,7 +426,7 @@ Single React app (`ui/web/`) with freedom-board as the home route. `ui/canvas/` 
 | Sorted-index convention still in use | 2 | Medium | React and WASM still agree on asset ordering via alphabetical sort. The UUID intern table refactor (Phase 8) will replace this with explicit UUID ↔ handle mapping. |
 | No chunk-level serialization | 4 | High | Large worlds (10M+ tiles) will need chunk-level streaming rather than monolithic JSON. Current approach loads entire world into memory. WASM memory ceiling is ~4GB. |
 | Auto-save implemented | 4 | RESOLVED | Auto-save with 2-second debounce. Save suppressed for 5 seconds after load to prevent re-save loops. |
-| SAB lock flag not checked | N/A | Medium | SharedArrayBuffer has HEADER_LOCK field but frame reader never checks it. Causes occasional tile glitches. Not storage-related but affects user experience during save/load transitions. |
+| SAB lock wired | N/A | RESOLVED | zap-engine's useZapEngine hook checks Atomics.load(i32, 0) when useSabLock=true. Toggle in debug panel persists to IDB. Lock prevents tearing; without lock, frames may tear but render every rAF. |
 | Base64 PNG in export | 6 | Low | ~33% overhead vs raw binary. Acceptable for current asset sizes. ZIP deferred. |
 | No cross-device sync | 7+ | Low | Users must manually export/import between devices. Acceptable for single-user creative tool. |
 | StorageGateway write path unused in user mode | 6 | Low | Once editors use IDB, the StorageGateway write path is only needed for curator/admin S3 uploads. Could add confusion. Document clearly. |

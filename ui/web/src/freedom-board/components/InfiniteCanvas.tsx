@@ -1,6 +1,6 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
 import { useZapEngine } from '@zap/web/react';
-import type { Tool } from '../types';
+import type { Tool, PendingPlacement } from '../types';
 import type { TileRegistryEntry } from '../lib/manifest';
 import { DebugPanel } from './DebugPanel';
 import type { DebugFlags } from './DebugPanel';
@@ -102,6 +102,12 @@ interface InfiniteCanvasProps {
   pendingStamp: string | null;
   /** Called after the stamp is dispatched to WASM so parent can clear pendingStamp. */
   onStampComplete: () => void;
+  /** Parsed map waiting for user to click a placement position. */
+  pendingPlacement: PendingPlacement | null;
+  /** Called when user clicks to deploy the placement at (tileX, tileY). */
+  onPlacementDeploy: (originX: number, originY: number) => void;
+  /** Called when user cancels placement (Escape or right-click). */
+  onPlacementCancel: () => void;
   /** JSON string of a full world to import, or null. Set by parent on load-from-disk. */
   pendingWorldImport: string | null;
   /** Called after the world import is dispatched to WASM. */
@@ -147,6 +153,9 @@ export function InfiniteCanvas({
   characterNames,
   pendingStamp,
   onStampComplete,
+  pendingPlacement,
+  onPlacementDeploy,
+  onPlacementCancel,
   pendingWorldImport,
   onWorldImportComplete,
   onCursorTileChange,
@@ -172,6 +181,9 @@ export function InfiniteCanvas({
 
   // ── Track whether we've sent the tile registry to WASM ────────────
   const registrySentRef = useRef(false);
+
+  // ── Cursor tile for placement preview (state-based so it triggers re-render) ──
+  const [placementCursor, setPlacementCursor] = useState<{ x: number; y: number } | null>(null);
 
   // ── Two-point tool preview (line/rect drag overlay) ─────────────
   const [preview, setPreview] = useState<{
@@ -232,7 +244,8 @@ export function InfiniteCanvas({
   // Auto-save: debounce 2 seconds after last world change.
   // Auto-load: on startup after registry is sent to WASM.
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastTileCountRef = useRef<number>(-1);
+  /** Incremented each time WASM reports world stats. Used to detect ANY world change. */
+  const statsSeqRef = useRef<number>(0);
   const suppressSaveUntilRef = useRef<number>(0); // suppress save right after load
 
   // Handle worker messages (world_export response → save to IDB)
@@ -255,8 +268,10 @@ export function InfiniteCanvas({
   const wrappedGameEvent = useCallback((events: Array<{ kind: number; a: number; b: number; c: number }>) => {
     onGameEvent(events);
     for (const e of events) {
-      if (e.kind === 1 && e.a !== lastTileCountRef.current) {
-        lastTileCountRef.current = e.a;
+      if (e.kind === 1) {
+        // WASM emits WORLD_STATS on any world change (tile count OR generation).
+        // Every emission means something changed — schedule a save.
+        statsSeqRef.current++;
         // Don't save right after loading
         if (Date.now() < suppressSaveUntilRef.current) continue;
         // Debounce: save 2 seconds after last change
@@ -426,6 +441,12 @@ export function InfiniteCanvas({
         e.preventDefault();
         sendEvent({ type: 'custom', kind: EVENTS.REDO, a: 0, b: 0, c: 0 });
       }
+      // Escape: cancel placement mode
+      if (e.key === 'Escape' && pendingPlacement) {
+        e.preventDefault();
+        onPlacementCancel();
+        return;
+      }
       // Delete/Backspace: remove character at selection (when in character tool)
       if (e.key === 'Delete' || e.key === 'Backspace') {
         if (tool === 'character') {
@@ -435,7 +456,7 @@ export function InfiniteCanvas({
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [isReady, sendEvent, tool]);
+  }, [isReady, sendEvent, tool, pendingPlacement, onPlacementCancel]);
 
   // ── Resize observer ───────────────────────────────────────────────
   useEffect(() => {
@@ -495,6 +516,17 @@ export function InfiniteCanvas({
     const sy = e.clientY - rect.top;
     const tile = screenToTile(sx, sy);
 
+    // ── Placement mode: left-click deploys, right-click/middle cancels ──
+    if (pendingPlacement) {
+      if (e.button === 0) {
+        onPlacementDeploy(tile.x, tile.y);
+      } else {
+        onPlacementCancel();
+      }
+      setPlacementCursor(null);
+      return; // consume the click, don't start a drag
+    }
+
     const isPan = e.button === 1 || (e.button === 0 && tool === 'pan');
 
     dragRef.current = {
@@ -528,7 +560,7 @@ export function InfiniteCanvas({
         sendEvent({ type: 'custom', kind: EVENTS.PLACE_CHARACTER, a: tile.x, b: tile.y, c: activeCharacterId });
       }
     }
-  }, [tool, activeAssetId, activeCharacterId, activeLayer, isReady, sendEvent, screenToTile]);
+  }, [tool, activeAssetId, activeCharacterId, activeLayer, isReady, sendEvent, screenToTile, pendingPlacement, onPlacementDeploy, onPlacementCancel]);
 
   const handlePointerMove = useCallback((e: React.PointerEvent) => {
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
@@ -537,6 +569,13 @@ export function InfiniteCanvas({
     const tile = screenToTile(sx, sy);
 
     onCursorTileChange(tile);
+
+    // Update placement cursor (triggers re-render to move the preview rectangle)
+    if (pendingPlacement) {
+      setPlacementCursor(prev =>
+        (prev && prev.x === tile.x && prev.y === tile.y) ? prev : tile
+      );
+    }
 
     const drag = dragRef.current;
     if (!drag?.active) return;
@@ -566,7 +605,7 @@ export function InfiniteCanvas({
         }
       }
     }
-  }, [tool, activeAssetId, activeLayer, isReady, sendEvent, screenToTile, syncCamera, onCursorTileChange, getProjection]);
+  }, [tool, activeAssetId, activeLayer, isReady, sendEvent, screenToTile, syncCamera, onCursorTileChange, getProjection, pendingPlacement]);
 
   const handlePointerUp = useCallback((e: React.PointerEvent) => {
     const drag = dragRef.current;
@@ -688,6 +727,35 @@ export function InfiniteCanvas({
         }
 
         return null;
+      })()}
+
+      {/* ── Map placement preview (follows cursor) ────────────────── */}
+      {pendingPlacement && placementCursor && (() => {
+        const cam = cameraRef.current;
+        const { scale } = getProjection();
+        const tilePx = cam.zoom / scale;
+        const cx = placementCursor.x;
+        const cy = placementCursor.y;
+        const tl = tileToScreen(cx, cy);
+        const w = pendingPlacement.widthTiles * tilePx;
+        const h = pendingPlacement.heightTiles * tilePx;
+        return (
+          <>
+            <svg style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none' }}>
+              <rect x={tl.x} y={tl.y} width={w} height={h}
+                fill="rgba(96, 160, 224, 0.12)" stroke="rgba(96, 160, 224, 0.7)" strokeWidth={2}
+                strokeDasharray="6 3" />
+            </svg>
+            <div style={{
+              position: 'absolute', bottom: 40, left: '50%', transform: 'translateX(-50%)',
+              background: 'rgba(13, 21, 37, 0.9)', border: '1px solid #2a4a6a',
+              borderRadius: 6, padding: '6px 14px', color: '#60a0e0',
+              fontSize: 12, pointerEvents: 'none', whiteSpace: 'nowrap',
+            }}>
+              {pendingPlacement.levelName} ({pendingPlacement.widthTiles}x{pendingPlacement.heightTiles}) — click to place, Esc to cancel
+            </div>
+          </>
+        );
       })()}
 
       {/* Debug/profiling panel — collapsed shows FPS, expanded shows timing + toggles */}

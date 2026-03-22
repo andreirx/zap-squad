@@ -4,9 +4,11 @@
 
 mod pathfinding;
 mod group_movement;
+mod combat;
 
 /// Freedom Board use cases — edit and query operations on the infinite canvas.
 pub mod freedom_board;
 
 pub use pathfinding::{find_path, find_path_in_radius, InfiniteNavGrid, NavGrid, PathResult};
 pub use group_movement::{FollowState, update_followers};
+pub use combat::{apply_damage, calculate_damage, DamageResult};
