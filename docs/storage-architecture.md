@@ -232,63 +232,117 @@ Existing StorageGateway write functionality remains for the curator/admin workfl
 
 ## Freedom-Board Persistence Pipeline
 
-### Data Flow: Save
+### Complete Persistence Call Flow
+
+The save/load pipeline crosses 4 boundaries with async handoffs at each step.
+This diagram documents all participants and the exact message types to prevent
+the class of "stale export" bugs that arise when any step is skipped or misordered.
+
+#### Save (auto-save or explicit)
 
 ```
-1. React: user clicks "Save" (or auto-save timer fires)
-2. React: sends { type: 'export_world' } to engine worker
-3. Worker: calls request_world_export()        → sets EXPORT_REQUESTED flag
-4. Worker: calls game_tick(0)                  → update() runs:
-   a. Checks EXPORT_REQUESTED flag
-   b. Calls serialize_world():
-      - SparseWorld::iter_all() yields all (TileCoord, &TilePlacement)
-      - Each tile's u16 asset_id resolved to name string via tile_registry
-      - Characters serialized with body_def_id string
-      - Camera state included
-      - JSON sorted by (x, y, layer) for determinism
-   c. Writes JSON to EXPORT_RESULT thread_local
-5. Worker: calls take_world_export()           → returns JSON string
-6. Worker: posts { type: 'world_export', json } back to React
-7. React: calls worldStore.save(name, worldData) → IDB write
+React (InfiniteCanvas.tsx)              Engine Worker                    WASM (lib.rs)
+─────────────────────────               ─────────────                   ─────────────
+1. WASM emits GameEvent
+   kind=WORLD_STATS when
+   tile count, world generation,
+   OR character generation changes
+                                                                        emit_stats_if_changed()
+                                                                         ↓ GameEvent via ctx.events
+                                        worker reads events from SAB
+                                        posts { type: 'event', events }
+                                         ↓
+2. wrappedGameEvent() receives
+   stats event (e.kind === 1)
+   Sets dirtyRef = true
+   Sends { type: 'export_world' }
+   immediately (no debounce on
+   the export request itself)
+                                         ↓
+                                        3. Worker receives 'export_world':
+                                           calls request_world_export()     → sets EXPORT_REQUESTED flag
+                                           calls game_tick(1/60)            → update() runs:
+                                             CRITICAL: dt MUST be > 0         a. checks EXPORT_REQUESTED
+                                             dt=0 causes FixedTimestep        b. serialize_world()
+                                             to skip update() entirely!       c. writes to EXPORT_RESULT
+                                           calls take_world_export()        → returns JSON string
+                                           posts { type: 'world_export', json } back
+                                         ↓
+4. handleWorkerMessage() receives
+   'world_export' with JSON string
+   Stores in latestExportRef
+   (always fresh — every export
+   overwrites the ref)
+
+5. 2-second debounce timer fires:
+   Reads latestExportRef.current
+   (guaranteed fresh from step 4)
+   Calls worldStore.save('autosave', data)
+   Clears dirtyRef
+
+6. On beforeunload / visibilitychange:
+   If dirtyRef is true, saves
+   latestExportRef.current to IDB
+   immediately (flush safety net)
 ```
 
-### Data Flow: Load
+#### Key Invariants
+
+| Invariant | Violation consequence | Guard |
+|-----------|----------------------|-------|
+| `game_tick(dt)` must use dt > 0 | `update()` never runs, export flag never consumed, `take_world_export()` returns null | Worker uses `dt = 1/60` for export ticks |
+| Export result arrives BEFORE debounce timer fires | `latestExportRef` is null when timer reads it | Export requested immediately on change; 2s debounce only on IDB write |
+| No save during suppress window | Stale pre-import data overwrites fresh import in IDB | `handleWorkerMessage` and `wrappedGameEvent` both check `suppressSaveUntilRef` |
+| Pending save cancelled on import | Timer from before import fires and saves pre-import state | `cancelPendingSave()` called before every `import_world` dispatch |
+| `character_generation` tracked | Character-only edits (no tile changes) never trigger save | `emit_stats_if_changed` checks tile count + world generation + character generation |
+
+#### Load (startup or explicit)
 
 ```
-1. React: user selects world from list (or auto-load on startup)
-2. React: calls worldStore.load(name) → reads WorldData from IDB
-3. React: sends { type: 'import_world', json } to engine worker
-4. Worker: calls import_world(json)            → queues in PENDING_IMPORT
-5. Next game_tick() → update() runs:
-   a. Consumes PENDING_IMPORT
-   b. Calls import_world_from_json():
-      - Parses JSON
-      - Validates version field
-      - Builds reverse lookup: tile name → u16 asset_id
-      - Clears world, undo/redo stacks, characters
-      - Imports tiles (resolving names to handles)
-      - Imports characters
-      - Restores camera
-   c. Sets camera_dirty + characters_dirty → triggers re-render
+React (InfiniteCanvas.tsx)              Engine Worker                    WASM (lib.rs)
+─────────────────────────               ─────────────                   ─────────────
+1. worldStore.load('autosave')
+   reads WorldData from IDB
+   cancelPendingSave()
+   Sets suppressSaveUntilRef
+   Sends { type: 'import_world', json }
+                                         ↓
+                                        2. Worker receives 'import_world':
+                                           calls import_world(json)         → queues in PENDING_IMPORT
+                                         ↓
+                                        3. Next regular game_tick():
+                                           update() runs:
+                                             a. Consumes PENDING_IMPORT
+                                             b. import_world_from_json():
+                                                - Parses JSON
+                                                - Validates version
+                                                - Builds name → u16 lookup
+                                                - Clears world, undo/redo,
+                                                  characters, movement targets
+                                                - Imports tiles + characters
+                                                - Restores camera
+                                             c. Bumps character_generation
+                                             d. Sets camera_dirty
 ```
 
-### Two-Phase Export Pattern
+#### Two-Phase Export Pattern
 
 The game instance is owned by the `zap_web::export_game!` macro. Free WASM functions cannot access it directly. The two-phase pattern (request → tick → take) works around this:
 
-1. `request_world_export()` — sets a thread_local flag
-2. `game_tick()` — `update()` has `&mut self`, checks flag, serializes, writes result to thread_local
+1. `request_world_export()` — sets a thread_local flag (EXPORT_REQUESTED)
+2. `game_tick(1/60)` — `update()` has `&mut self`, checks flag, serializes, writes result to EXPORT_RESULT thread_local
 3. `take_world_export()` — reads and clears the result from thread_local
 
-This is single-threaded WASM — no race conditions. The worker orchestrates all three calls synchronously.
+This is single-threaded WASM — no race conditions. The worker orchestrates all three calls synchronously. The dt value MUST be >= the fixed_dt (1/60) or the FixedTimestep accumulator will return 0 steps and update() will not run.
 
-### Auto-Save Strategy (not yet implemented)
+#### Auto-Save Strategy
 
-- Debounced: save 5 seconds after last edit (not on every tile placement)
-- Trigger: `SparseWorld.generation()` change detection
-- Storage: IDB worldStore with fixed key (e.g., `"autosave"`)
-- Manual saves use user-chosen names
-- Auto-save does NOT create undo history entries
+- **Trigger**: WASM emits WORLD_STATS on any change (tiles, characters, or generation)
+- **Export**: Requested immediately on every change (latestExportRef always fresh)
+- **IDB write**: Debounced 2 seconds after last change
+- **Flush**: On beforeunload/visibilitychange, saves latestExportRef if dirty
+- **Suppress**: 3s on mount, 2.5s after any import (prevents saving stale data)
+- **Includes**: Tiles, characters (position, body, direction, health), camera state
 
 ---
 

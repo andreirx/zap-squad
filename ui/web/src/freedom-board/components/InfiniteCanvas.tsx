@@ -246,6 +246,10 @@ export function InfiniteCanvas({
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** Suppress auto-save until this timestamp. Set after load/import to avoid saving stale data. */
   const suppressSaveUntilRef = useRef<number>(Date.now() + 3000); // suppress during initial startup
+  /** True when there are unsaved changes (set on change detection, cleared on save completion). */
+  const dirtyRef = useRef(false);
+  /** Latest exported world data. Used as fallback for beforeunload save. */
+  const latestExportRef = useRef<WorldData | null>(null);
 
   /** Cancel any pending save timer. Call before any world import/load. */
   const cancelPendingSave = useCallback(() => {
@@ -255,23 +259,17 @@ export function InfiniteCanvas({
     }
   }, []);
 
-  // Handle worker messages (world_export response → save to IDB)
+  // Handle worker messages (world_export response → capture latest state)
   const handleWorkerMessage = useCallback((data: Record<string, unknown>) => {
+    console.log('[freedom-board] worker message received:', data.type, typeof data.json === 'string' ? `(${(data.json as string).length} bytes)` : '');
     if (data.type === 'world_export' && typeof data.json === 'string') {
-      // Guard: don't save if we're in the suppress window (stale export from before import)
-      if (Date.now() < suppressSaveUntilRef.current) {
-        console.log('[freedom-board] export received but save suppressed (recent load/import)');
-        return;
-      }
       try {
         const worldData = JSON.parse(data.json) as WorldData;
-        worldStore.save('autosave', worldData).then(() => {
-          console.log(`[freedom-board] auto-saved: ${worldData.tiles.length} tiles, ${worldData.characters.length} characters`);
-        });
-        // Also notify parent (for save-to-disk flow)
+        latestExportRef.current = worldData;
+        // Notify parent (for save-to-disk flow)
         onWorldExport?.(worldData);
       } catch (err) {
-        console.error('[freedom-board] auto-save parse error:', err);
+        console.error('[freedom-board] export parse error:', err);
       }
     }
   }, [onWorldExport]);
@@ -281,12 +279,25 @@ export function InfiniteCanvas({
     onGameEvent(events);
     for (const e of events) {
       if (e.kind === 1) {
+        dirtyRef.current = true;
         // Don't schedule saves during suppress window
         if (Date.now() < suppressSaveUntilRef.current) continue;
-        // Debounce: save 2 seconds after last change
+        // Request export immediately so latestExportRef is always fresh.
+        // The IDB write is debounced (2s) to avoid hammering storage during rapid edits.
+        sendEventRef.current({ type: 'export_world' });
         cancelPendingSave();
+        console.log('[freedom-board] export requested, IDB write scheduled in 2s');
         saveTimerRef.current = setTimeout(() => {
-          sendEventRef.current({ type: 'export_world' });
+          const data = latestExportRef.current;
+          if (data) {
+            console.log(`[freedom-board] debounce fired, saving: ${data.tiles.length} tiles, ${data.characters.length} characters`);
+            worldStore.save('autosave', data).then(() => {
+              dirtyRef.current = false;
+              console.log('[freedom-board] IDB write complete');
+            });
+          } else {
+            console.warn('[freedom-board] debounce fired but latestExportRef is null — export result not received yet');
+          }
         }, 2000);
       }
     }
@@ -356,9 +367,15 @@ export function InfiniteCanvas({
     worldStore.load('autosave').then((data) => {
       if (data && data.tiles.length > 0) {
         cancelPendingSave();
-        sendEvent({ type: 'import_world', json: JSON.stringify(data) });
+        const json = JSON.stringify(data);
+        // Diagnostic: verify characters are in the JSON being sent to WASM
+        const charCount = data.characters?.length ?? 0;
+        console.log(`[freedom-board] loaded autosave: ${data.tiles.length} tiles, ${charCount} characters, JSON keys: ${Object.keys(data).join(',')}`);
+        if (charCount > 0) {
+          console.log(`[freedom-board] first character:`, JSON.stringify(data.characters[0]));
+        }
+        sendEvent({ type: 'import_world', json });
         suppressSaveUntilRef.current = Date.now() + 2500;
-        console.log(`[freedom-board] loaded autosave: ${data.tiles.length} tiles, ${data.characters.length} characters`);
       }
     }).catch(err => {
       console.error('[freedom-board] auto-load failed:', err);
@@ -478,12 +495,42 @@ export function InfiniteCanvas({
     return () => observer.disconnect();
   }, [isReady, syncViewport]);
 
-  // ── Cleanup save timer on unmount ─────────────────────────────────
+  // ── Flush save on page unload / tab hidden ──────────────────────────
+  //
+  // Problem: the 2s debounce means the last edit before reload is lost.
+  // Solution: on beforeunload, if dirty, request immediate export.
+  //           on visibilitychange (tab hidden), do the same.
+  //
+  // The export is async (two-phase), so for beforeunload we also save
+  // the latest known export as a fallback — it may be 1 edit behind,
+  // but that's better than losing everything since last debounce.
   useEffect(() => {
+    const flushSave = () => {
+      if (!dirtyRef.current) return;
+      // Cancel debounce timer — we're saving now
+      cancelPendingSave();
+      // Request immediate export from WASM (will complete next tick if page survives)
+      sendEventRef.current({ type: 'export_world' });
+      // Also save the latest known export as fallback (may be 1 edit stale)
+      if (latestExportRef.current) {
+        worldStore.save('autosave', latestExportRef.current).catch(() => {});
+        console.log('[freedom-board] flush save on unload/hide');
+      }
+    };
+
+    const handleBeforeUnload = () => flushSave();
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') flushSave();
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     };
-  }, []);
+  }, [cancelPendingSave]);
 
   // ── Screen-to-tile conversion (CSS pixels → tile coords) ─────────
   //
