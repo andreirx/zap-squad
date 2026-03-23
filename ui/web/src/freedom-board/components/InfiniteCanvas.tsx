@@ -1,7 +1,7 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
 import { useZapEngine } from '@zap/web/react';
 import type { Tool, PendingPlacement } from '../types';
-import type { TileRegistryEntry } from '../lib/manifest';
+import type { TileRegistryEntry, CharacterDefinition as ManifestCharDef } from '../lib/manifest';
 import { DebugPanel } from './DebugPanel';
 import type { DebugFlags } from './DebugPanel';
 import { ASSETS_URL } from '../../lib/config';
@@ -73,23 +73,9 @@ function bresenhamTiles(x0: number, y0: number, x1: number, y1: number): { x: nu
   return tiles;
 }
 
-/** Derive storage layer from tile type metadata.
- *
- * | tileType | terrainType | Layer | Semantic |
- * |----------|-------------|-------|----------|
- * | TILE     | *           | 0     | Ground   |
- * | PATH     | WATER       | 1     | Rivers   |
- * | BRIDGE   | *           | 2     | Bridges  |
- * | PATH     | LAND        | 3     | Roads    |
- */
-export function tileTypeToLayer(entry: TileRegistryEntry | undefined): number {
-  if (!entry) return 0;
-  if (entry.tileType === 'BRIDGE') return 2;
-  if (entry.tileType === 'PATH') {
-    return entry.terrainType === 'WATER' ? 1 : 3;
-  }
-  return 0;
-}
+// Import and re-export from shared module — single source of truth for layer assignment.
+import { tileTypeToLayer } from '../../lib/tile-layers';
+export { tileTypeToLayer };
 
 interface InfiniteCanvasProps {
   tool: Tool;
@@ -98,6 +84,8 @@ interface InfiniteCanvasProps {
   tileRegistry: TileRegistryEntry[];
   /** Character ID strings in index order (matches WASM body_def_index). */
   characterNames: string[];
+  /** Full character definitions with equipment data. */
+  characterDefs: ManifestCharDef[];
   /** JSON string of a resolved stamp payload, or null. Set by parent when user imports a map. */
   pendingStamp: string | null;
   /** Called after the stamp is dispatched to WASM so parent can clear pendingStamp. */
@@ -151,6 +139,7 @@ export function InfiniteCanvas({
   activeCharacterId,
   tileRegistry,
   characterNames,
+  characterDefs,
   pendingStamp,
   onStampComplete,
   pendingPlacement,
@@ -358,9 +347,15 @@ export function InfiniteCanvas({
     registrySentRef.current = true;
 
     // 1. Send tile/character registry to WASM
-    const payload = { tiles: tileRegistry, characters: characterNames };
+    // Build character entries with only the fields WASM expects: name + optional equipment
+    const charEntries = characterDefs.map(c => ({
+      name: c.id,
+      ...(c.weaponDefId ? { weaponDefId: c.weaponDefId } : {}),
+      ...(c.throwableDefId ? { throwableDefId: c.throwableDefId } : {}),
+    }));
+    const payload = { tiles: tileRegistry, characters: charEntries };
     sendEvent({ type: 'reload_game_manifest', json: JSON.stringify(payload) });
-    console.log(`[freedom-board] sent manifest to WASM: ${tileRegistry.length} tiles, ${characterNames.length} characters`);
+    console.log(`[freedom-board] sent manifest to WASM: ${tileRegistry.length} tiles, ${charEntries.length} characters`);
 
     // 2. Load saved world from IndexedDB (if any)
     //    Messages are ordered in the worker queue — registry is processed before import.
@@ -380,7 +375,7 @@ export function InfiniteCanvas({
     }).catch(err => {
       console.error('[freedom-board] auto-load failed:', err);
     });
-  }, [isReady, tileRegistry, characterNames, sendEvent]);
+  }, [isReady, tileRegistry, characterNames, characterDefs, sendEvent]);
 
   // ── Dispatch pending stamp (map import) to WASM ────────────────────
   useEffect(() => {

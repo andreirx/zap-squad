@@ -15,9 +15,9 @@ Creates character sprites with visual states and animations.
 - **TODO:** Integrate with atlas baking system (Task #25)
 
 ### ObjectEditor
-Creates object sprites with visual states.
+Creates object sprites used for world objects and ranged/throwable visuals.
 - **Visual States:** new, worn, damaged, broken
-- **Animations:** idle, landed (for throwables)
+- **Animations:** primarily idle-based presentation
 - **Output (mods):** `mods/objects/{id}/{id}_{visualState}_{animation}_{frame}.png`
 - **Output (atlas):** `assets/weapons/{id}.png` + updates `assets/manifest.json`
 - **TODO:** Integrate with atlas baking system (Task #25)
@@ -30,10 +30,9 @@ Creates tile definitions with pixel art variations.
   - `BRIDGE` - Bridge tiles rendered under paths crossing water
 - **Terrain Types:** LAND, WATER
 - **Bridge Association:** PATH tiles can reference a BRIDGE tile via `bridgeAssetId`
-- **Transition Auto-Generation (TILE type only):**
-  - On save, generates 8 transition tiles from tile_0: N, NE, E, SE, S, SW, W, NW
-  - Each transition has 32px solid edge + 32px fade toward transparent
-  - Used by MapEditor/GameCanvas for terrain blending
+- **Legacy Transition Auto-Generation (TILE type only):**
+  - On save, can generate 8 transition tiles from tile_0: N, NE, E, SE, S, SW, W, NW
+  - These belong to the older skirt/transition pipeline and are no longer used by MapEditor
   - Output: `tile_0_transition_{dir}.png`
 - **Two-Step Path Generation (PATH/BRIDGE):**
   1. **Fill All Backgrounds** - Fills all 15 variations with terrain colors (no paths)
@@ -52,8 +51,8 @@ Full-featured level editor with layer support.
   - Pan/zoom canvas (scroll to zoom, right-click/middle-click/space+drag to pan)
   - Continuous painting with Bresenham line interpolation
   - Auto-bridge placement when ground paths cross water
-  - Path connectivity auto-calculation (15 variations based on neighbors)
-  - Terrain transitions (edge blending between different terrain types)
+  - Path connectivity auto-calculation (water paths same-type only, land paths target a shared road network)
+  - No terrain skirt/transition overlays; terrain tiles render directly
 - **Output:** `levels/{name}.json` (LDtk-compatible format)
 
 ## Shared Components

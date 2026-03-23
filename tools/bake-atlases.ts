@@ -59,6 +59,8 @@ interface CharacterDefinition {
   name: string;
   frames: number;
   frameDuration: number;
+  weaponDefId?: string;
+  throwableDefId?: string;
 }
 
 interface TileDefinition {
@@ -98,6 +100,8 @@ interface CharacterAtlasInfo {
   atlasHeight: number;
   spriteSize: number;
   animations: Record<string, AnimationInfo>;
+  weaponDefId?: string;
+  throwableDefId?: string;
 }
 
 interface TileAtlasInfo {
@@ -242,6 +246,8 @@ async function bakeCharacterAtlas(id: string, charDir: string): Promise<Characte
     atlasHeight,
     spriteSize,
     animations,
+    ...(def.weaponDefId ? { weaponDefId: def.weaponDefId } : {}),
+    ...(def.throwableDefId ? { throwableDefId: def.throwableDefId } : {}),
   };
 }
 
@@ -371,8 +377,8 @@ async function bakeTileAtlas(id: string, tileDir: string): Promise<TileAtlasInfo
 // Weapon/Object Atlas Baking (no visual states)
 // ============================================================================
 
-async function bakeWeaponAtlas(id: string, weaponDir: string): Promise<WeaponAtlasInfo | null> {
-  const defPath = path.join(weaponDir, 'definition.json');
+async function bakeObjectAtlas(id: string, objectDir: string): Promise<WeaponAtlasInfo | null> {
+  const defPath = path.join(objectDir, 'definition.json');
   if (!fs.existsSync(defPath)) {
     console.log(`  Skipping ${id} (no definition.json)`);
     return null;
@@ -380,16 +386,17 @@ async function bakeWeaponAtlas(id: string, weaponDir: string): Promise<WeaponAtl
 
   const def: WeaponDefinition = JSON.parse(fs.readFileSync(defPath, 'utf-8'));
 
-  // Scan for sprites - only use "new" visual state (primary)
-  const files = fs.readdirSync(weaponDir).filter(f => f.endsWith('.png'));
+  // Scan for sprites: {id}_{animation}_{frame}.png
+  const files = fs.readdirSync(objectDir).filter(f => f.endsWith('.png'));
 
-  // Parse: {visualState}_{state}_{frame}.png
-  // Only take "new" visual state
   const animationFrames: Record<string, number> = {};
+  const prefix = `${id}_`;
 
   for (const file of files) {
     const basename = file.replace('.png', '');
-    const match = basename.match(/^new_(\w+)_(\d+)$/);
+    if (!basename.startsWith(prefix)) continue;
+    const rest = basename.slice(prefix.length); // "idle_0", "landed_0"
+    const match = rest.match(/^(\w+)_(\d+)$/);
     if (match) {
       const [, anim, frameStr] = match;
       const frame = parseInt(frameStr, 10);
@@ -425,8 +432,8 @@ async function bakeWeaponAtlas(id: string, weaponDir: string): Promise<WeaponAtl
 
   for (const [anim, info] of Object.entries(animations)) {
     for (let frame = 0; frame < info.frames; frame++) {
-      const spriteName = `new_${anim}_${frame}.png`;
-      const spritePath = path.join(weaponDir, spriteName);
+      const spriteName = `${id}_${anim}_${frame}.png`;
+      const spritePath = path.join(objectDir, spriteName);
 
       if (fs.existsSync(spritePath)) {
         const spriteBuffer = await sharp(spritePath)
@@ -443,7 +450,7 @@ async function bakeWeaponAtlas(id: string, weaponDir: string): Promise<WeaponAtl
     }
   }
 
-  const atlasPath = path.join(outputDir, 'weapons', `${id}.png`);
+  const atlasPath = path.join(outputDir, 'objects', `${id}.png`);
   fs.mkdirSync(path.dirname(atlasPath), { recursive: true });
 
   await sharp(atlasBuffer)
@@ -456,7 +463,7 @@ async function bakeWeaponAtlas(id: string, weaponDir: string): Promise<WeaponAtl
   return {
     id,
     name: def.name,
-    atlas: `weapons/${id}.png`,
+    atlas: `objects/${id}.png`,
     atlasWidth,
     atlasHeight,
     spriteSize,
@@ -534,15 +541,16 @@ async function main() {
     }
   }
 
-  // Bake weapons
-  const weaponsDir = path.join(inputDir, 'weapons');
-  if (fs.existsSync(weaponsDir)) {
-    console.log('\nBaking weapon atlases (new visual state only)...');
-    const entries = fs.readdirSync(weaponsDir, { withFileTypes: true });
+  // Bake objects (projectiles, decorations — formerly "weapons")
+  const objectsDir = path.join(inputDir, 'objects');
+  if (fs.existsSync(objectsDir)) {
+    console.log('\nBaking object atlases...');
+    const entries = fs.readdirSync(objectsDir, { withFileTypes: true });
     for (const entry of entries) {
       if (entry.isDirectory() && !entry.name.startsWith('.')) {
-        const info = await bakeWeaponAtlas(entry.name, path.join(weaponsDir, entry.name));
+        const info = await bakeObjectAtlas(entry.name, path.join(objectsDir, entry.name));
         if (info) {
+          // Stored under "weapons" key in manifest for backward compat with existing consumers
           manifest.weapons[info.id] = info;
         }
       }
@@ -557,7 +565,7 @@ async function main() {
   console.log('\n=== Summary ===');
   console.log(`Characters: ${Object.keys(manifest.characters).length} atlases`);
   console.log(`Tiles: ${Object.keys(manifest.tiles).length} atlases`);
-  console.log(`Weapons: ${Object.keys(manifest.weapons).length} atlases`);
+  console.log(`Objects: ${Object.keys(manifest.weapons).length} atlases`);
   console.log(`Manifest: ${manifestPath}`);
 }
 

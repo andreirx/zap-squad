@@ -45,6 +45,10 @@ export interface CharacterDefinition {
   name: string;
   frameDuration: number;
   animations: Record<AnimationState, AnimationConfig>;
+  /** Equipped weapon ID (references a weapon definition). */
+  weaponDefId?: string;
+  /** Equipped throwable/ranged object ID (references an object definition). */
+  throwableDefId?: string;
   createdAt: string;
   updatedAt: string;
 }

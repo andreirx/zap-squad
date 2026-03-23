@@ -170,7 +170,7 @@ getUploadUrl(path) / getReadUrl(path)
 
 **Implementations**:
 - `LocalStorage` (dev): Vite middleware, reads/writes to `public/mods/` on disk
-- `S3Storage` (prod): AWS S3 with Cognito auth, presigned URLs
+- `S3Storage` (historical/admin path): S3 upload flow kept for curator-style seed asset management, not the primary user-content path
 
 **What it handles**: The **source asset pipeline** — tile definitions (`tiles/{id}/properties.json`), character definitions (`characters/{id}/definition.json`), level files (`levels/{name}.json`), and sprite PNGs.
 
@@ -203,7 +203,7 @@ All editors save via `StorageGateway`:
 - **Map Editor**: `levels/{name}.json` (LDtk format)
 - **Freedom Board**: No persistence (in-memory only)
 
-This works in dev (local filesystem via Vite) and prod (S3). But it requires a server for writes. Users cannot save work without S3 access.
+This works in dev and in older S3-oriented flows, but it is not the desired long-term user-content model because it requires a write-capable backend path.
 
 ### Target State (IDB-based)
 
@@ -213,7 +213,7 @@ All editors save to IndexedDB:
 - **Map Editor**: Reads tile/character definitions from merged registry. Saves levels to IDB `levels` store.
 - **Freedom Board**: Saves world state (tiles, characters, camera) to IDB `worlds` store.
 
-The editors continue to use `StorageGateway.readText/readBytes` for **fetching seed assets from CDN**. They stop using `StorageGateway.writeText/writeBytes` for user content — IDB replaces that.
+The editors continue to use `StorageGateway.readText/readBytes` for **fetching seed assets from CDN or local source storage**. The long-term direction is for user content to persist through IDB-backed flows rather than direct backend writes.
 
 ### Migration Path
 
@@ -388,9 +388,7 @@ Single React app (`ui/web/`) with freedom-board as the home route. `ui/canvas/` 
 /editor/character     → Character Editor
 /editor/map           → Map Editor
 /editor/object        → Object Editor
-/editor/weapon        → Weapon Editor
-/game/canvas2d        → Legacy Canvas2D game page (retained)
-/game/wasm            → Legacy WebGPU game page (retained)
+/game/*               → Legacy/reference surfaces, not part of the main navigation
 ```
 
 ### Key Facts

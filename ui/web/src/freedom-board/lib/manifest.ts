@@ -27,6 +27,10 @@ export interface CharacterDefinition {
   name: string;
   atlas: string;
   spriteSize: number;
+  /** Equipped weapon ID (from editor). */
+  weaponDefId?: string;
+  /** Equipped throwable/ranged object ID (from editor). */
+  throwableDefId?: string;
 }
 
 /**
@@ -66,6 +70,8 @@ interface Manifest {
     atlasWidth: number;
     atlasHeight: number;
     spriteSize: number;
+    weaponDefId?: string;
+    throwableDefId?: string;
   }>;
   weapons?: Record<string, {
     id: string;
@@ -149,7 +155,14 @@ export async function loadTileManifest(): Promise<{
   // Characters — sorted by id for consistency
   const characters: CharacterDefinition[] = Object.keys(manifest.characters ?? {}).sort().map(id => {
     const c = manifest.characters![id];
-    return { id: c.id, name: c.name, atlas: c.atlas, spriteSize: c.spriteSize };
+    return {
+      id: c.id,
+      name: c.name,
+      atlas: c.atlas,
+      spriteSize: c.spriteSize,
+      ...(c.weaponDefId ? { weaponDefId: c.weaponDefId } : {}),
+      ...(c.throwableDefId ? { throwableDefId: c.throwableDefId } : {}),
+    };
   });
 
   // Weapons — sorted by id for consistency

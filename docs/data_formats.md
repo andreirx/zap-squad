@@ -188,7 +188,7 @@ The WASM renderer uses 6 layers (zap-engine RenderLayer enum):
 | Layer | Value | Contents |
 |-------|-------|----------|
 | Background | 0 | Base terrain (land, water) |
-| Terrain | 1 | Transitions (computed), rivers |
+| Terrain | 1 | Rivers and other terrain-layer path visuals |
 | Objects | 2 | (unused for tiles) |
 | Foreground | 3 | Bridges (auto-generated) |
 | VFX | 4 | Ground paths (roads) |
@@ -196,10 +196,12 @@ The WASM renderer uses 6 layers (zap-engine RenderLayer enum):
 
 ### Computed Tile Features
 
-1. **Transitions**: Auto-generated when different terrain types meet. Dominant tile (higher asset_id) projects its transition onto neighbors.
+1. **Terrain smoothing**: Freedom Board uses feathered terrain rendering instead of transition skirts. Map Editor terrain should render directly without depending on the old generated transition tiles.
 
 2. **Bridges**: Auto-generated when a ground path (terrainType=LAND) crosses water (terrainType=WATER). Uses the path's `bridgeAssetId`.
 
-3. **Path Connectivity**: 4-bit bitmask based on neighboring paths of the same type.
+3. **Path Connectivity**: 4-bit bitmask with asymmetric matching.
+   - WATER paths connect only to same-type water paths
+   - LAND paths connect to any adjacent land path
    - N=8, S=4, W=2, E=1
    - Sprite index = connectivity bits (0-14)

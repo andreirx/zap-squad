@@ -212,8 +212,10 @@ export function TileEditor() {
       setTileId(props.id || id);
       setTileName(props.name || id);
       setTileType(props.tileType || 'TILE');
-      setTerrainType(props.terrainType || 'LAND');
-      setPassable(props.passable ?? true);
+      const terrain = props.terrainType || 'LAND';
+      setTerrainType(terrain);
+      // Passable is derived from terrainType: LAND = passable, WATER = impassable
+      setPassable(terrain === 'LAND');
       setMovementCost(props.movementCost ?? 1);
       setPathWidth(props.pathWidth ?? DEFAULT_PATH_WIDTH);
       setBridgeAssetId((props as TileProperties).bridgeAssetId);
@@ -263,7 +265,6 @@ export function TileEditor() {
     saveCurrentVariation();
 
     setIsSaving(true);
-    setSaveError(null);
     try {
       const storage = createStorage();
       const now = new Date().toISOString();
@@ -319,6 +320,11 @@ export function TileEditor() {
 
       const transitionInfo = tileType === 'TILE' ? ' + 8 transitions' : '';
       console.log(`Saved tile ${tileId} with ${variations.size} variations${transitionInfo}`);
+
+      // Post-save warning for land paths without bridge
+      if (tileType === 'PATH' && terrainType === 'LAND' && !bridgeAssetId) {
+        setSaveError('Saved, but warning: no bridge assigned. Paths crossing impassable terrain will not show bridges.');
+      }
     } catch (e) {
       setSaveError(`Failed to save: ${e}`);
     } finally {
@@ -678,27 +684,25 @@ export function TileEditor() {
             ))}
           </div>
 
-          {/* Terrain Type */}
-          <div style={{ display: 'flex', gap: '2px' }}>
-            {(['LAND', 'WATER'] as TerrainType[]).map(t => (
-              <button
-                key={t}
-                onClick={() => setTerrainType(t)}
-                style={{
-                  padding: '0.25rem 0.5rem', border: 'none', borderRadius: '4px',
-                  background: terrainType === t ? (t === 'WATER' ? '#4169e1' : '#4ecca3') : '#0f0f23',
-                  color: terrainType === t ? '#fff' : '#ccc', cursor: 'pointer', fontSize: '0.75rem',
-                }}
-              >
-                {t}
-              </button>
-            ))}
-          </div>
-
-          <label style={{ display: 'flex', alignItems: 'center', gap: '0.25rem', cursor: 'pointer' }}>
-            <input type="checkbox" checked={passable} onChange={(e) => setPassable(e.target.checked)} />
-            <span style={{ color: '#888', fontSize: '0.75rem' }}>Passable</span>
-          </label>
+          {/* Passable toggle — controls both terrainType and passable in one click.
+              LAND = passable, WATER = impassable. No way to mismatch. */}
+          <button
+            onClick={() => {
+              const newTerrain: TerrainType = terrainType === 'LAND' ? 'WATER' : 'LAND';
+              setTerrainType(newTerrain);
+              setPassable(newTerrain === 'LAND');
+            }}
+            style={{
+              padding: '0.25rem 0.75rem', border: 'none', borderRadius: '4px',
+              background: terrainType === 'LAND' ? '#4ecca3' : '#4169e1',
+              color: '#fff', cursor: 'pointer', fontSize: '0.75rem', fontWeight: 600,
+            }}
+            title={terrainType === 'LAND'
+              ? 'Passable (land) — click to make impassable (water)'
+              : 'Impassable (water) — click to make passable (land)'}
+          >
+            {terrainType === 'LAND' ? 'Passable' : 'Impassable'}
+          </button>
 
           <label style={{ display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
             <span style={{ color: '#888', fontSize: '0.75rem' }}>Cost:</span>

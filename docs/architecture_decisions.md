@@ -56,12 +56,17 @@ Use Rhai (Rust-native, WASM-compatible, sandboxed).
 
 ## ADR-004: Separate Editor and Game Deployments
 **Date:** 2026-02-20
-**Status:** Accepted
+**Status:** Superseded
+
+> Superseded by the unified application direction centered on Freedom Board.
+> See `docs/DECISIONS.md` and `docs/ARCHITECTURE.md` for the current architecture.
 
 ### Context
 The editor requires authentication (Cognito) for asset creation and storage.
 The game should be freely accessible without authentication.
 These have different security requirements and deployment lifecycles.
+
+This ADR has been superseded by the unified-app direction centered on Freedom Board. It is preserved here as project history.
 
 ### Decision
 Split into two separate deployable applications:
@@ -214,6 +219,8 @@ Tile Editor → tile PNGs → `feather_atlases` (Python locally, WASM in AWS) �
 - The existing MapEditor and GameCanvas still use the old transition system; must be migrated
 - Atlas rows 1-8 still exist in the current tile PNGs on disk; can be stripped once all consumers are migrated
 
+Update: Freedom Board is the active feathered-rendering path, and MapEditor terrain no longer depends on transition skirts. Legacy transition PNGs still exist as source artifacts.
+
 ---
 
 ## ADR-007: Multi-Layer Tile Storage (8 Layers per Cell)
@@ -266,5 +273,8 @@ Option 2: Layer-indexed Chunk with `MAX_LAYERS = 8`.
 - Ground is visible underneath rivers, bridges, and paths
 - Tiles on different layers at the same position are independently erasable
 - `tile_count` now counts total occupied layer slots across all cells
-- Connectivity bitmask is layer-specific (paths only connect to same-asset paths on the same layer)
+- Connectivity bitmask is layer-specific
+  Current semantic rule:
+  - water paths connect only to same-type water neighbors on the same layer
+  - land paths connect to adjacent land-path neighbors on the same layer, regardless of exact asset type
 - 64 KB chunk size may cause cache pressure on x86; monitor if cross-platform performance matters

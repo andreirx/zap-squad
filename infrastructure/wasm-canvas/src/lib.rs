@@ -66,7 +66,7 @@ use zapsquad_core::entities::{ActorId, AnimationState, CompositeActor, Direction
 use zapsquad_adapters::script_bindings::{ScriptCommand, ScriptEngine, WorldQuery};
 use zapsquad_core::use_cases::{apply_damage, calculate_damage, find_path_in_radius, InfiniteNavGrid};
 use zapsquad_core::use_cases::freedom_board::{
-    connectivity_bitmask, draw_line, erase_rect, erase_tile, fill_rect, flood_fill, place_tile,
+    connectivity_bitmask_with, draw_line, erase_rect, erase_tile, fill_rect, flood_fill, place_tile,
     query_viewport, stamp_tiles, EditResult,
 };
 
@@ -292,6 +292,9 @@ pub struct FreedomBoardGame {
     /// Populated from manifest.json alongside the tile registry.
     /// Index order matches React's sorted character array.
     character_names: Vec<String>,
+    /// Character equipment registry — weapon and throwable assignments per character index.
+    /// Parallel to character_names: character_equipment[i] is the equipment for character_names[i].
+    character_equipment: Vec<(Option<String>, Option<String>)>, // (weapon_def_id, throwable_def_id)
     /// Active movement targets. Characters with an entry here walk toward
     /// their target each frame instead of teleporting.
     movement_targets: std::collections::HashMap<ActorId, glam::Vec2>,
@@ -358,6 +361,7 @@ impl FreedomBoardGame {
             character_entities: Vec::new(),
             characters_dirty: false,
             character_names: Vec::new(),
+            character_equipment: Vec::new(),
             movement_targets: std::collections::HashMap::new(),
             waypoint_queues: std::collections::HashMap::new(),
             scripts: ScriptEngine::new(),
@@ -510,11 +514,16 @@ impl FreedomBoardGame {
                         .unwrap_or_else(|| format!("character_{}", body_idx));
                     let id = ActorId(self.next_actor_id);
                     self.next_actor_id += 1;
-                    let actor = CompositeActor::new(
+                    let mut actor = CompositeActor::new(
                         id,
                         glam::Vec2::new(center_x, center_y),
                         body_id,
                     );
+                    // Equip weapon/throwable from character registry
+                    if let Some((ref weapon, ref throwable)) = self.character_equipment.get(body_idx) {
+                        actor.weapon_def_id = weapon.clone();
+                        actor.throwable_def_id = throwable.clone();
+                    }
                     self.characters.insert(id, actor);
                     self.selected_character = Some(id); // auto-select newly placed
                     self.character_generation += 1;
@@ -884,6 +893,8 @@ impl FreedomBoardGame {
                 if dist < ARRIVAL_THRESHOLD {
                     actor.position = *target;
                     actor.animation_state = AnimationState::Idle;
+                    actor.animation_frame = 0;
+                    actor.animation_timer = 0.0;
                     arrived.push(*id);
                 } else {
                     // Scale speed by terrain difficulty: cost 5 → 2x speed, cost 20 → 0.5x speed
@@ -894,6 +905,8 @@ impl FreedomBoardGame {
                     if step_dist >= dist {
                         actor.position = *target;
                         actor.animation_state = AnimationState::Idle;
+                        actor.animation_frame = 0;
+                        actor.animation_timer = 0.0;
                         arrived.push(*id);
                     } else {
                         let direction = delta / dist;
@@ -997,10 +1010,31 @@ impl FreedomBoardGame {
             let screen = self.tile_to_screen(vt.x as f32 + 0.5, vt.y as f32 + 0.5);
 
             // Determine sprite variation based on tile type:
-            //   PATH/BRIDGE: connectivity bitmask (same-asset neighbors on same layer)
+            //   PATH/BRIDGE: connectivity bitmask
+            //     - LAND paths: connect to ANY other land path (cross-type connectivity)
+            //     - WATER paths: connect only to same asset_id (no cross-type)
             //   TILE: stored variant from TilePlacement
             let variation = if tile_type == TileType::Path || tile_type == TileType::Bridge {
-                let bits = connectivity_bitmask(&self.world, coord, layer);
+                let registry = &self.tile_registry;
+                let is_land = terrain_type == TerrainType::Land;
+                let bits = connectivity_bitmask_with(
+                    &self.world,
+                    coord,
+                    layer,
+                    |center, neighbor| {
+                        if is_land {
+                            // Land paths connect to any other land path
+                            let neighbor_info = registry.get(neighbor.asset_id as usize);
+                            neighbor_info.map_or(false, |ni| {
+                                (ni.tile_type == TileType::Path || ni.tile_type == TileType::Bridge)
+                                    && ni.terrain_type == TerrainType::Land
+                            })
+                        } else {
+                            // Water paths: same asset only
+                            center.asset_id == neighbor.asset_id
+                        }
+                    },
+                );
                 if bits == 0 { 0 } else { bits - 1 }
             } else {
                 vt.placement.variant
@@ -1012,7 +1046,7 @@ impl FreedomBoardGame {
             // on the bridge render layer (Objects) before spawning the path itself.
             if tile_type == TileType::Path && terrain_type == TerrainType::Land {
                 if let Some(bridge_aid) = bridge_asset_id {
-                    if self.check_water_underneath(coord) {
+                    if self.check_impassable_underneath(coord) {
                         let bridge_name = self.tile_info(bridge_aid).map(|bi| bi.name.clone());
                         if let Some(bname) = bridge_name {
                             let bridge_key = format!("{}_{}", bname, variation);
@@ -1055,11 +1089,15 @@ impl FreedomBoardGame {
     ///
     /// With multi-layer storage, checks layers 0 (ground) and 1 (water)
     /// at the same position for any tile with terrainType=WATER.
-    fn check_water_underneath(&self, coord: TileCoord) -> bool {
+    /// Check if there is an impassable tile underneath this coordinate
+    /// (on layers 0-1). Used to decide whether a land path needs a bridge.
+    ///
+    /// Triggers on: water terrain (ocean, rivers), impassable paths (fences/gard).
+    fn check_impassable_underneath(&self, coord: TileCoord) -> bool {
         for layer in 0..2u8 {
             if let Some(tile) = self.world.get(coord, layer) {
                 if let Some(info) = self.tile_info(tile.asset_id) {
-                    if info.terrain_type == TerrainType::Water {
+                    if !info.passable {
                         return true;
                     }
                 }
@@ -1683,6 +1721,12 @@ impl Game for FreedomBoardGame {
             }
         });
 
+        PENDING_CHARACTER_EQUIPMENT.with(|p| {
+            if let Some(equipment) = p.borrow_mut().take() {
+                self.character_equipment = equipment;
+            }
+        });
+
         // 0c. Check for pending stamp (map import)
         PENDING_STAMP.with(|p| {
             if let Some((origin, tiles)) = p.borrow_mut().take() {
@@ -1802,6 +1846,8 @@ thread_local! {
         std::cell::RefCell::new(None);
     static PENDING_CHARACTER_NAMES: std::cell::RefCell<Option<Vec<String>>> =
         std::cell::RefCell::new(None);
+    static PENDING_CHARACTER_EQUIPMENT: std::cell::RefCell<Option<Vec<(Option<String>, Option<String>)>>> =
+        std::cell::RefCell::new(None);
     static PENDING_STAMP: std::cell::RefCell<Option<(TileCoord, Vec<(TileCoord, TilePlacement)>)>> =
         std::cell::RefCell::new(None);
 
@@ -1859,13 +1905,50 @@ pub fn reload_game_manifest(json: &str) {
     fn default_passable() -> bool { true }
     fn default_movement_cost() -> u8 { 10 }
 
-    /// Extended manifest payload: tiles + character names.
+    /// Character entry from manifest — name + optional equipment.
+    #[derive(serde::Deserialize, Clone)]
+    #[serde(untagged)]
+    enum CharacterEntry {
+        /// New format: { name, weaponDefId?, throwableDefId? }
+        Full {
+            name: String,
+            #[serde(default, rename = "weaponDefId")]
+            weapon_def_id: Option<String>,
+            #[serde(default, rename = "throwableDefId")]
+            throwable_def_id: Option<String>,
+        },
+        /// Legacy format: just the name string
+        NameOnly(String),
+    }
+
+    impl CharacterEntry {
+        fn name(&self) -> &str {
+            match self {
+                CharacterEntry::Full { name, .. } => name,
+                CharacterEntry::NameOnly(n) => n,
+            }
+        }
+        fn weapon(&self) -> Option<&str> {
+            match self {
+                CharacterEntry::Full { weapon_def_id, .. } => weapon_def_id.as_deref(),
+                CharacterEntry::NameOnly(_) => None,
+            }
+        }
+        fn throwable(&self) -> Option<&str> {
+            match self {
+                CharacterEntry::Full { throwable_def_id, .. } => throwable_def_id.as_deref(),
+                CharacterEntry::NameOnly(_) => None,
+            }
+        }
+    }
+
+    /// Extended manifest payload: tiles + character entries.
     /// Falls back to parsing as flat Vec<TileEntry> for backward compat.
     #[derive(serde::Deserialize)]
     struct ManifestPayload {
         tiles: Vec<TileEntry>,
         #[serde(default)]
-        characters: Vec<String>,
+        characters: Vec<CharacterEntry>,
     }
 
     fn default_variations() -> u8 {
@@ -1874,10 +1957,10 @@ pub fn reload_game_manifest(json: &str) {
 
     // Try extended format first: { tiles: [...], characters: [...] }
     // Fall back to flat array for backward compat: [...]
-    let (entries, char_names) = match serde_json::from_str::<ManifestPayload>(json) {
+    let (entries, char_entries) = match serde_json::from_str::<ManifestPayload>(json) {
         Ok(payload) => (payload.tiles, payload.characters),
         Err(_) => match serde_json::from_str::<Vec<TileEntry>>(json) {
-            Ok(entries) => (entries, Vec::new()),
+            Ok(entries) => (entries, Vec::<CharacterEntry>::new()),
             Err(e) => {
                 web_sys::console::error_1(
                     &format!("[freedom-board] manifest parse error: {}", e).into(),
@@ -1924,10 +2007,18 @@ pub fn reload_game_manifest(json: &str) {
         })
         .collect();
 
+    // Extract character names and equipment from entries
+    let char_names: Vec<String> = char_entries.iter().map(|e| e.name().to_string()).collect();
+    let char_equipment: Vec<(Option<String>, Option<String>)> = char_entries
+        .iter()
+        .map(|e| (e.weapon().map(|s| s.to_string()), e.throwable().map(|s| s.to_string())))
+        .collect();
+
     let tile_count = registry.len();
     let char_count = char_names.len();
     PENDING_TILE_REGISTRY.with(|p| *p.borrow_mut() = Some(registry));
     PENDING_CHARACTER_NAMES.with(|p| *p.borrow_mut() = Some(char_names));
+    PENDING_CHARACTER_EQUIPMENT.with(|p| *p.borrow_mut() = Some(char_equipment));
     web_sys::console::log_1(
         &format!(
             "[freedom-board] manifest queued: {} tiles, {} characters",

@@ -40,6 +40,8 @@ interface CharacterDefinition {
   id: string;
   name: string;
   frameDuration: number;
+  weaponDefId?: string;
+  throwableDefId?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -50,6 +52,12 @@ export function CharacterEditor() {
   const [characterId, setCharacterId] = useState('');
   const [characterName, setCharacterName] = useState('');
   const [frameDuration, setFrameDuration] = useState(DEFAULT_FRAME_DURATION);
+
+  // Equipment
+  const [weaponDefId, setWeaponDefId] = useState<string>('');
+  const [throwableDefId, setThrowableDefId] = useState<string>('');
+  const [availableWeapons, setAvailableWeapons] = useState<{ id: string; name: string }[]>([]);
+  const [availableObjects, setAvailableObjects] = useState<{ id: string; name: string }[]>([]);
 
   // Discovered frame counts per animation (from existing sprites)
   const [frameCounts, setFrameCounts] = useState<Record<AnimationState, number>>({
@@ -290,7 +298,7 @@ export function CharacterEditor() {
     return () => clearInterval(interval);
   }, [isPlaying, currentFrameCount, frameDuration]);
 
-  // Load existing characters on mount
+  // Load existing characters, weapons, and objects on mount
   useEffect(() => {
     async function loadCharacters() {
       try {
@@ -308,7 +316,33 @@ export function CharacterEditor() {
         console.error('Failed to load characters:', e);
       }
     }
+    async function loadEquipment() {
+      try {
+        const storage = createStorage();
+        // Load available objects (used for both weapon and throwable dropdowns)
+        const objFiles = await storage.list('objects');
+        const objIds = [...new Set(
+          objFiles
+            .filter((f) => f.includes('/') && f.endsWith('definition.json'))
+            .map((f) => f.split('/')[1])
+        )];
+        const objects: { id: string; name: string }[] = [];
+        for (const id of objIds) {
+          try {
+            const json = await storage.readText(`objects/${id}/definition.json`);
+            const def = JSON.parse(json);
+            objects.push({ id, name: def.name || id });
+          } catch { objects.push({ id, name: id }); }
+        }
+        // Both dropdowns draw from the same object pool
+        setAvailableWeapons(objects);
+        setAvailableObjects(objects);
+      } catch (e) {
+        console.error('Failed to load equipment:', e);
+      }
+    }
     loadCharacters();
+    loadEquipment();
   }, []);
 
   // Load character from storage - discover frame counts from files
@@ -326,6 +360,8 @@ export function CharacterEditor() {
         setCharacterId(def.id);
         setCharacterName(def.name);
         setFrameDuration(def.frameDuration || DEFAULT_FRAME_DURATION);
+        setWeaponDefId(def.weaponDefId || '');
+        setThrowableDefId(def.throwableDefId || '');
 
         // Clear existing sprites
         spritesRef.current.clear();
@@ -422,6 +458,8 @@ export function CharacterEditor() {
         id: characterId,
         name: characterName || characterId,
         frameDuration,
+        ...(weaponDefId ? { weaponDefId } : {}),
+        ...(throwableDefId ? { throwableDefId } : {}),
         createdAt: now,
         updatedAt: now,
       };
@@ -714,6 +752,48 @@ export function CharacterEditor() {
               }}
             />
             <span style={{ color: '#666', fontSize: '0.75rem' }}>sec</span>
+          </label>
+
+          <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <span style={{ color: '#888', fontSize: '0.875rem' }}>Weapon:</span>
+            <select
+              value={weaponDefId}
+              onChange={(e) => setWeaponDefId(e.target.value)}
+              style={{
+                background: '#0f0f23',
+                border: '1px solid #333',
+                borderRadius: '4px',
+                padding: '0.25rem 0.5rem',
+                color: '#ccc',
+                fontSize: '0.875rem',
+              }}
+            >
+              <option value="">None</option>
+              {availableWeapons.map(w => (
+                <option key={w.id} value={w.id}>{w.name}</option>
+              ))}
+            </select>
+          </label>
+
+          <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <span style={{ color: '#888', fontSize: '0.875rem' }}>Throwable:</span>
+            <select
+              value={throwableDefId}
+              onChange={(e) => setThrowableDefId(e.target.value)}
+              style={{
+                background: '#0f0f23',
+                border: '1px solid #333',
+                borderRadius: '4px',
+                padding: '0.25rem 0.5rem',
+                color: '#ccc',
+                fontSize: '0.875rem',
+              }}
+            >
+              <option value="">None</option>
+              {availableObjects.map(o => (
+                <option key={o.id} value={o.id}>{o.name}</option>
+              ))}
+            </select>
           </label>
 
           <div style={{ flex: 1 }} />

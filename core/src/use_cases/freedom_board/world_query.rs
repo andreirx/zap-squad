@@ -143,24 +143,41 @@ pub fn cardinal_neighbors(
 ///
 /// Returns 0 if the position is empty on this layer.
 pub fn connectivity_bitmask(world: &SparseWorld, coord: TileCoord, layer: u8) -> u8 {
+    connectivity_bitmask_with(world, coord, layer, |center, neighbor| {
+        center.asset_id == neighbor.asset_id
+    })
+}
+
+/// Compute a 4-bit connectivity bitmask using a custom match predicate.
+///
+/// Bits: N=8, S=4, W=2, E=1. A bit is set if the neighbor exists on the
+/// same layer and `should_connect(center, neighbor)` returns true.
+///
+/// This allows callers to implement group-based connectivity (e.g., all
+/// land-based paths connect regardless of specific asset type).
+pub fn connectivity_bitmask_with(
+    world: &SparseWorld,
+    coord: TileCoord,
+    layer: u8,
+    should_connect: impl Fn(&TilePlacement, &TilePlacement) -> bool,
+) -> u8 {
     let Some(center) = world.get(coord, layer) else {
         return 0;
     };
-    let aid = center.asset_id;
 
     let [n, e, s, w] = world.neighbors_4(coord, layer);
 
     let mut bits = 0u8;
-    if n.map_or(false, |t| t.asset_id == aid) {
+    if n.as_ref().map_or(false, |t| should_connect(center, t)) {
         bits |= 8;
     }
-    if s.map_or(false, |t| t.asset_id == aid) {
+    if s.as_ref().map_or(false, |t| should_connect(center, t)) {
         bits |= 4;
     }
-    if w.map_or(false, |t| t.asset_id == aid) {
+    if w.as_ref().map_or(false, |t| should_connect(center, t)) {
         bits |= 2;
     }
-    if e.map_or(false, |t| t.asset_id == aid) {
+    if e.as_ref().map_or(false, |t| should_connect(center, t)) {
         bits |= 1;
     }
     bits

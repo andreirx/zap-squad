@@ -31,8 +31,6 @@ export function FBToolbar({ tool, onToolChange, onImport, onSaveToDisk, onLoadFr
       fontSize: 13,
       userSelect: 'none',
     }}>
-      <span style={{ fontWeight: 600, marginRight: 8, color: '#e94560' }}>Freedom Board</span>
-
       {TOOLS.map(t => (
         <button
           key={t.id}

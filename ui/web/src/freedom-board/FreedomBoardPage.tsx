@@ -384,6 +384,7 @@ export function FreedomBoardPage() {
             activeCharacterId={activeCharacterId}
             tileRegistry={tileRegistry}
             characterNames={characters.map(c => c.id)}
+            characterDefs={characters}
             pendingStamp={pendingStamp}
             onStampComplete={handleStampComplete}
             pendingPlacement={pendingPlacement}

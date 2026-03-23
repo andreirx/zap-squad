@@ -33,7 +33,8 @@ Pass 3: BRIDGES (layer 3 — Foreground)
 
 Pass 4: GROUND PATHS (layer 4 — VFX)
   For each visible tile where tileType == "PATH" AND terrainType == "LAND":
-    Compute connectivity bitmask against same-asset_id neighbors.
+    Compute connectivity bitmask against all adjacent LAND paths,
+    even when their asset types differ.
     Draw the connectivity-selected feathered sprite at the tile's position.
 
 Pass 5: ENTITIES (layer 5 — UI)
@@ -173,18 +174,32 @@ Parameters:
 
 ## 4. Path Connectivity Algorithm
 
-Path tiles (roads, rivers) auto-connect to adjacent paths of the **same asset_id**.
+Path connectivity is intentionally asymmetric:
+- water paths connect only to the same water path type
+- land paths connect to any adjacent land path
 
 ### Bitmask Computation
 
 ```
-function connectivityBitmask(world, coord, asset_id) -> u4:
+function connectivityBitmask(world, coord, path) -> u4:
     bits = 0
-    if world.get(coord + N)?.asset_id == asset_id: bits |= 8   // N = bit 3
-    if world.get(coord + S)?.asset_id == asset_id: bits |= 4   // S = bit 2
-    if world.get(coord + W)?.asset_id == asset_id: bits |= 2   // W = bit 1
-    if world.get(coord + E)?.asset_id == asset_id: bits |= 1   // E = bit 0
+
+    if matches_for_connectivity(path, world.get(coord + N)): bits |= 8
+    if matches_for_connectivity(path, world.get(coord + S)): bits |= 4
+    if matches_for_connectivity(path, world.get(coord + W)): bits |= 2
+    if matches_for_connectivity(path, world.get(coord + E)): bits |= 1
     return bits
+
+function matches_for_connectivity(path, neighbor) -> bool:
+    if neighbor is None: return false
+    if neighbor.tileType != "PATH": return false
+
+    if path.terrainType == "WATER":
+        return neighbor.terrainType == "WATER"
+           and neighbor.asset_id == path.asset_id
+
+    return path.terrainType == "LAND"
+       and neighbor.terrainType == "LAND"
 ```
 
 ### Variation Index from Bitmask
@@ -211,7 +226,9 @@ Row 0 of the path atlas contains the 15 connectivity variants.
 
 ### Reactivity
 
-When a path tile is placed or removed, **all 4 cardinal neighbors must recompute their connectivity**. The existing MapEditor handles this by re-scanning neighbors on every tile mutation. The freedom-board WASM must do the same: after placing/erasing a path, dirty the 4 cardinal neighbors for re-rendering.
+When a path tile is placed or removed, **all 4 cardinal neighbors must recompute their connectivity**. This rule now depends on path terrain type:
+- water paths only care about same-type water neighbors
+- land paths care about any land-path neighbors
 
 ---
 
@@ -242,7 +259,7 @@ function needsBridge(world, coord, path_placement, tile_registry) -> bool:
 
 ### Bridge Connectivity
 
-The bridge's connectivity bitmask **matches the path above it exactly**. This ensures the bridge shape follows the road shape:
+The bridge's connectivity bitmask **matches the effective land-path network above it**. This ensures the bridge shape follows the visible road network even when neighboring road tiles use different assets:
 
 ```
 function renderBridge(world, coord, path_placement, path_def):
@@ -393,7 +410,10 @@ rebuild_visible_entities():
 
 4. **Multiple terrain types meeting**: A cell with 3+ different neighboring terrain types gets multiple transition overlays. Each dominant neighbor contributes its transition independently.
 
-5. **Path connectivity across tile types**: A "drum_gri" road does NOT connect to a "river" water path. Connectivity is strictly same-asset_id.
+5. **Path connectivity across tile types**:
+   - a road does NOT connect to a river
+   - one water path type does NOT connect to a different water path type
+   - one land path type DOES connect to another land path type
 
 6. **Bridge with no bridgeAssetId**: If a LAND path has no `bridgeAssetId` defined, no bridge renders even over water. The path just floats.
 

@@ -1,210 +1,190 @@
-# Next Steps: WASM Integration & Editor/Game Separation
+# Next Steps
 
-## Current State Summary
+This document tracks the remaining work for the current product direction.
 
-### What's Built and Working
-- **Editors**: Character, Object, Tile, Map editors - fully functional
-- **Canvas2D Rendering**: GameCanvas.tsx renders levels with Canvas2D
-- **WASM Binary**: Built and available at `ui/web/pkg/zapsquad_wasm.wasm` (2.9MB)
-- **WASM API**: Full TypeScript bindings generated
+The direction is:
+- one unified web app
+- Freedom Board as the primary runtime/editor surface
+- source-asset editors as supporting tools
+- local-first persistence
+- character-behavior scripting as the first scripting experience
 
-### What's NOT Connected
-- React UI does NOT import or use the WASM module
-- zap-engine WebGPU rendering is available but unused
-- Hot-reload APIs exist but aren't wired to UI
+Support code that is not exposed as a finished feature remains incomplete.
 
 ---
 
-## WASM API (Already Available)
+## Current State
 
-```typescript
-// From pkg/zapsquad_wasm.d.ts
-import init, {
-  game_init,
-  game_tick,
-  load_level,
-  reload_scripts,
-  reload_manifest,
-  reload_sprite_manifest,
-  game_key_down,
-  game_key_up,
-  game_pointer_down,
-  game_pointer_move,
-  game_pointer_up,
-  get_instances_ptr,
-  get_instance_count,
-  // ... more getters for render buffers
-} from '../pkg/zapsquad_wasm';
-```
+### Built
 
----
+- Freedom Board is the main route and active development surface.
+- Editors continue to author 128x128 source assets.
+- Infinite sparse world storage, chunking, quadtree culling, map stamping, save/load, and auto-save exist.
+- Character placement and smooth movement exist.
+- Combat primitives and Rhai script primitives exist.
+- WASM feathering crate exists.
+- Debug/profiling overlay and persisted runtime settings exist.
 
-## Phase 1: Connect WASM to Existing UI (Quickest Win) - DONE
+### Deferred or incomplete
 
-### Task 1.1: Create WasmGame Component - DONE
-Created `ui/web/src/components/WasmGame.tsx`:
-- Loads and initializes WASM module
-- Sets up WebGPU context
-- Runs game loop with `requestAnimationFrame`
-- Forwards keyboard/pointer input to WASM
-- Includes reload buttons for scripts and assets
-
-### Task 1.2: Set Up WebGPU Renderer - DONE
-Created `ui/web/src/lib/webgpu-renderer.ts`:
-- GPU-instanced quad rendering
-- Reads instance data directly from WASM memory
-- Orthographic camera with pan/zoom
-- Sprite atlas support (placeholder for now)
-- ~10,000 instances at 60fps
-
-### Task 1.3: Add WASM Game Tab - DONE
-- Route: `/game/wasm`
-- Full-screen WebGPU canvas
-- Level selector dropdown
-- FPS counter + instance count
-- "Play (WebGPU)" button in navigation
-
-### Next: Sprite Atlas Integration
-For sprites to appear, need to:
-1. Run `make bake-atlases` to generate sprite atlases
-2. Load atlas into WebGPU renderer
-3. Call `reload_sprite_manifest()` with atlas metadata
+- User-facing script workflow
+- User-facing combat workflow
+- Multi-select and group control workflow
+- Script persistence
+- UUID-based runtime identity completion
+- Dynamic runtime asset loading for user-created assets
+- Wiring the WASM feathering step into the runtime pipeline
 
 ---
 
-## Phase 2: Hot-Reload Integration
+## Plan
 
-### Task 2.1: Wire Script Hot-Reload
-```typescript
-async function reloadScripts() {
-  const storage = createStorage();
-  const scripts: Record<string, string> = {};
+### Phase 1: Align Tile Semantics Across Freedom Board and Map Editor
 
-  // Load all .rhai files
-  const files = await storage.list('scripts');
-  for (const file of files.filter(f => f.endsWith('.rhai'))) {
-    scripts[file] = await storage.readText(`scripts/${file}`);
-  }
+### Goal
 
-  wasm.reload_scripts(JSON.stringify(scripts));
-}
-```
+Remove semantic drift between the two world surfaces.
 
-### Task 2.2: Wire Asset Manifest Reload
-```typescript
-async function reloadManifest() {
-  // Build manifest from character/object/tile definitions
-  const manifest = await buildGameManifest();
-  wasm.reload_manifest(JSON.stringify(manifest));
-}
-```
+### Tasks
 
-### Task 2.3: Add Reload Button to Game UI
-Simple button that triggers `reloadScripts()` + `reloadManifest()`.
+1. Change non-water path connectivity so all LAND paths connect to one another regardless of path asset type.
+2. Keep WATER paths strict: only same-type water paths connect.
+3. Ensure bridge connectivity follows the effective LAND-path network above water.
+4. Update Freedom Board rendering and Map Editor preview to use the same rule.
+5. Update import/export assumptions and tests for the new path rule.
+
+### Done when
+
+- Roads of different non-water types visibly connect in both Freedom Board and Map Editor
+- Rivers of different water types remain separate
+- Bridge shapes match the visible road network
 
 ---
 
-## Phase 3: Editor/Game Separation
+### Phase 2: Finish the Combat Feature Layer
 
-### Task 3.1: Create Directory Structure
-```
-zap-squad/
-├── editor/                  # Move current ui/web here
-│   └── web/
-│       ├── src/
-│       │   ├── editors/     # Keep all editors
-│       │   ├── components/  # Canvas2D preview components
-│       │   └── storage/     # Keep storage layer
-│       └── package.json
-│
-├── game/                    # New game-only app
-│   └── web/
-│       ├── src/
-│       │   ├── WasmGame.tsx
-│       │   ├── LevelSelect.tsx
-│       │   └── App.tsx
-│       └── package.json
-```
+### Goal
 
-### Task 3.2: Create Game-Only React App
-Minimal React app with:
-- WASM loader
-- Level selector
-- Hot-reload button
-- No editors, no Canvas2D fallback
+Convert combat support into an actual usable feature.
 
-### Task 3.3: Add Editor "Play in Game" Button
-Button in Map Editor that opens the game app with the current level.
+### Tasks
+
+1. Expose attack targeting in Freedom Board UI.
+2. Support ranged attacks through the object asset model.
+3. Add range validation and failure feedback.
+4. Add combat feedback: hit results, death/removal behavior, visible state changes.
+5. Ensure characters return to a stable idle state after attack completion.
+
+### Done when
+
+- A user can select a character and attack a valid target from the UI
+- Melee and ranged attacks both execute through the intended asset flow
+- Animation state returns cleanly to idle after action completion
 
 ---
 
-## Phase 4: Authentication Split
+### Phase 3: Finish the Scripting Feature Layer
 
-### Task 4.1: Editor with Cognito
-- Add AWS Amplify to editor app
-- Require login for all write operations
-- S3 storage with presigned URLs
+### Goal
 
-### Task 4.2: Game as Public App
-- Read-only access to public S3/CDN
-- No authentication required
-- Level data fetched from public URL
+Make scripting a first-class, teachable product feature.
 
----
+### Tasks
 
-## Quick Start: Test WASM Now
+1. Define the first scripting scope explicitly as character behavior scripting.
+2. Add script editor UI in Freedom Board.
+3. Add assign/unassign script workflow on characters.
+4. Add reload/apply flow and play/pause execution control.
+5. Persist `script_id` or equivalent stable script reference in world serialization.
+6. Provide starter examples for patrol, chase, guard, follow, and attack behaviors.
 
-```bash
-# 1. Rebuild WASM (if needed)
-make wasm
+### Done when
 
-# 2. Add import to App.tsx (temporary test)
-# In ui/web/src/App.tsx, add a test route
-
-# 3. Run dev server
-cd ui/web && npm run dev
-
-# 4. Check browser console for WASM init
-```
+- A user can write a script, assign it to a character, save the world, reload, and retain behavior
+- The scripting surface is narrow, understandable, and stable enough for kids
 
 ---
 
-## Dependencies & Considerations
+### Phase 4: Group Command Features
 
-### WebGPU Availability
-- Chrome 113+ has WebGPU by default
-- Firefox needs `dom.webgpu.enabled` flag
-- Safari 17+ has WebGPU
-- Need Canvas2D fallback for older browsers
+### Goal
 
-### Sprite Atlas
-- zap-engine expects sprites in an atlas format
-- Need `make bake-atlases` to generate from individual PNGs
-- Atlas JSON format documented in zap-engine
+Turn single-character movement into squad control.
 
-### Memory Layout
-- WASM exports pointers to instance buffers
-- JS reads Float32Arrays from WASM memory
-- Instance format: [x, y, w, h, u, v, u2, v2, r, g, b, a, ...]
+### Tasks
 
----
+1. Add multi-select.
+2. Add group move commands.
+3. Prevent overlap and naive pileups during group movement.
+4. Expose commander/follower assignment.
+5. Use the existing follow-state support as the core primitive, but finish the actual UX layer.
 
-## Recommended Order
+### Done when
 
-1. **Task 1.1-1.3**: Get WASM rendering visible (even if broken)
-2. **Task 2.3**: Add reload button to test hot-reload
-3. **Task 2.1-2.2**: Wire actual hot-reload
-4. **Task 3.1-3.3**: Separate apps (can defer)
-5. **Task 4.1-4.2**: Auth (can defer until deployment)
+- Multiple characters can be selected and moved together
+- Followers can remain bound to a commander
+- Group movement is visually and behaviorally coherent
 
 ---
 
-## Verification Checklist
+### Phase 5: Close the Persistence Architecture
 
-- [ ] WASM loads without errors
-- [ ] `game_init()` called successfully
-- [ ] WebGPU context created
-- [ ] Level loads and actors appear
-- [ ] Keyboard input works (WASD movement)
-- [ ] Hot-reload updates game state
-- [ ] Editor and game are separate builds
+### Goal
+
+Finish the local-first storage direction across all tools.
+
+### Tasks
+
+1. Ensure all editors persist through the shared browser-side storage path.
+2. Keep explicit save/load to disk for worlds, levels, and assets.
+3. Complete UUID-based runtime identity so saved data is independent of manifest ordering.
+4. Support user-created assets consistently across editors and Freedom Board.
+5. Preserve settings and recent-state continuity where useful.
+
+### Done when
+
+- User-created tiles, characters, objects, maps, and worlds survive reloads
+- Export/import works without relying on positional indices
+- Freedom Board can load and render user-created assets, not just seed assets
+
+---
+
+### Phase 6: Wire Feathering Into the Real Runtime Pipeline
+
+### Goal
+
+Eliminate Python-only dependence for the feathering step.
+
+### Tasks
+
+1. Invoke the WASM feathering module from the client-side asset pipeline.
+2. Cache feathered outputs locally.
+3. Keep editors working on raw 128x128 assets.
+4. Ensure Freedom Board consumes the baked feathered outputs only.
+
+### Done when
+
+- The feathering pipeline runs client-side without Python
+- Freedom Board uses the baked results
+- Editors remain unaware of feathered atlas geometry
+
+---
+
+## Cross-Cutting Verification
+
+For every phase:
+- update the docs
+- add or extend automated tests where the rule lives in `core/`
+- verify both Freedom Board and Map Editor when behavior is shared
+- document technical debt created by any temporary divergence
+
+---
+
+## Immediate Priority Order
+
+1. LAND-path cross-type connectivity in both Freedom Board and Map Editor
+2. Attack feature completion, including ranged attacks through objects
+3. Script UI, assignment, and persistence
+4. Multi-select and commander/follower behavior
+5. UUID/runtime asset identity completion
+6. WASM feathering pipeline wiring

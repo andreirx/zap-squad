@@ -2,7 +2,7 @@ import { BrowserRouter, Routes, Route, Link, useLocation } from 'react-router-do
 import { GamePage } from './pages/GamePage';
 import { WasmGamePage } from './pages/WasmGamePage';
 import { FreedomBoardPage } from './freedom-board/FreedomBoardPage';
-import { CharacterEditor, ObjectEditor, TileEditor, WeaponEditor, MapEditor } from './editors';
+import { CharacterEditor, ObjectEditor, TileEditor, MapEditor } from './editors';
 
 export default function App() {
   return (
@@ -40,7 +40,6 @@ export default function App() {
                 <Routes>
                   <Route path="character" element={<CharacterEditor />} />
                   <Route path="object" element={<ObjectEditor />} />
-                  <Route path="weapon" element={<WeaponEditor />} />
                   <Route path="tile" element={<TileEditor />} />
                   <Route path="map" element={<MapEditor />} />
                 </Routes>
@@ -94,18 +93,8 @@ function Navigation() {
       <Link to="/editor/object" style={linkStyle('/editor/object')}>
         Objects
       </Link>
-      <Link to="/editor/weapon" style={linkStyle('/editor/weapon')}>
-        Weapons
-      </Link>
       <Link to="/editor/map" style={linkStyle('/editor/map')}>
         Maps
-      </Link>
-      <span style={{ color: '#333' }}>|</span>
-      <Link to="/game/canvas2d" style={linkStyle('/game/canvas2d')}>
-        Canvas2D
-      </Link>
-      <Link to="/game/wasm" style={linkStyle('/game/wasm')}>
-        WebGPU
       </Link>
     </nav>
   );

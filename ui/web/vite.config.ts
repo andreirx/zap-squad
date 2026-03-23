@@ -36,6 +36,8 @@ function fileWritePlugin(): Plugin {
     name: 'vite-plugin-file-write',
     configureServer(server) {
       server.middlewares.use('/__write-file', async (req, res) => {
+        // Required for COEP require-corp — Safari blocks without this
+        res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
         if (req.method !== 'POST') {
           res.statusCode = 405;
           res.end('Method not allowed');
@@ -78,6 +80,8 @@ function fileWritePlugin(): Plugin {
 
       // Endpoint to list files in a directory
       server.middlewares.use('/__list-files', async (req, res) => {
+        // Required for COEP require-corp — Safari blocks without this
+        res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
         if (req.method !== 'GET') {
           res.statusCode = 405;
           res.end('Method not allowed');

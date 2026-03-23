@@ -170,7 +170,8 @@ interface TileDefinition {
 - Exactly 15 directional variations
 - LAND terrain: passable walkways/roads
 - WATER terrain: non-passable rivers/streams
-- Auto-connects based on adjacent paths of the same type
+- WATER paths auto-connect only to adjacent water paths of the same type
+- LAND paths auto-connect to adjacent land paths regardless of specific path asset type
 - LAND paths can specify `bridgeAssetId` for water crossings
 
 #### BRIDGE
@@ -185,8 +186,8 @@ When a ground path (PATH + LAND) is placed over water terrain or a water path (r
 1. The renderer detects the overlap
 2. Looks up the path's `bridgeAssetId`
 3. Renders the bridge tile UNDER the path
-4. Bridge connectivity matches the path connectivity (same neighbors = same shape)
-5. Different path types crossing the same water do NOT have connected bridges
+4. Bridge connectivity matches the effective land-path connectivity above it
+5. Different water path types crossing the same water do NOT share connectivity
 
 ### Path Connectivity Bitmask
 

@@ -1,154 +1,179 @@
 # ZapSquad Vision
 
 ## Mission
-Create a **programmable 2D game engine** that enables kids to learn coding by making games.
 
-## Core Features
+Create a programmable 2D world-building and game-making system for kids, where the same world can be edited, populated, animated, and eventually played through character behavior scripts.
 
-### For Kids (Game Creators)
-- **Visual Level Editor:** LDtk-compatible map editor for tile-based level design
-- **Simple Scripting:** Rhai scripts for game logic (movement, interactions)
-- **Instant Feedback:** Hot-reload scripts, see changes immediately
-- **Asset Pipeline:** Built-in editors for characters, objects, and tiles
-
-### For the Engine
-- **A* Pathfinding:** NPCs navigate around obstacles
-- **Group Movement:** Party members follow the leader
-- **Physics:** Rapier2D for collisions and dynamics
-- **Rendering:** WebGPU with HDR/EDR support via zap-engine, fallback to js renderer if not supported
+The product is not a split "editor app" and "game app" anymore. The product is a single unified web application centered on Freedom Board, with supporting editors for source assets.
 
 ---
 
-## Architecture Principles
+## Product Direction
 
-### Clean Architecture Layers
-```
-+-----------------------------------------------------+
-|                    CORE (Stable)                     |
-|  +-----------------------------------------------+  |
-|  |              Entities                          |  |
-|  |  GameState, Actor, Level, Script               |  |
-|  +-----------------------------------------------+  |
-|  +-----------------------------------------------+  |
-|  |              Use Cases                         |  |
-|  |  Pathfinding, GroupMovement, ScriptExecution   |  |
-|  +-----------------------------------------------+  |
-+-----------------------------------------------------+
-|                 ADAPTERS (Semi-Stable)              |
-|  EngineGateway, AssetGateway, InputAdapter          |
-|  CompositeRenderer, ScriptEngine                    |
-+-----------------------------------------------------+
-|               INFRASTRUCTURE (Volatile)              |
-|  WASM exports, React UI, Asset files                |
-+-----------------------------------------------------+
-```
+### 1. Freedom Board is the center
 
-### Dependency Rule
-- Infrastructure -> Adapters -> Core
-- Core NEVER imports from Adapters or Infrastructure
-- Data crosses boundaries via DTOs only
+Freedom Board is the primary surface of the product:
+- infinite sparse world canvas
+- world editing surface
+- character placement and movement surface
+- future scripting, combat, and group-command surface
+- future runtime for the actual playable experience
 
----
+The old standalone renderers are no longer the main direction. They may still exist in the repository as reference or fallback code, but they are not the product path.
 
-## Current Implementation Status
+### 2. Editors are supporting authoring tools
 
-### What EXISTS (Scaffolded)
-- **core/**: Rust game logic (CompositeActor, GameState, etc.)
-- **adapters/**: Rust bridges (CompositeRenderer, ScriptEngine, AssetGateway)
-- **infrastructure/wasm/**: WASM entry point with zap-engine Game trait implementation
-- **ui/web/**: React editors (Character, Object, Tile, Map) + Canvas2D game preview
+The Tile, Character, Object, and Map editors remain important, but they are no longer the center of the user experience. Their role is:
+- author 128x128 source assets
+- author bounded LDtk-style maps when needed
+- feed Freedom Board and the runtime pipeline
 
-### What's WORKING
-- All editors (Character, Object, Tile, Map) - fully functional
-- Canvas2D rendering for map preview and game preview
-- Storage layer (local filesystem via Vite plugin)
-- Path auto-connectivity, bridge auto-placement
-- LDtk-compatible level format
+They are asset-production tools, not the gameplay destination.
 
-### What's NOT CONNECTED
-- **WASM is NOT built or linked** - the Rust code exists but isn't compiled to WASM
-- **zap-engine WebGPU rendering is NOT used** - React does its own Canvas2D rendering
-- **Hot-reload to WASM is NOT wired** - scripts don't go through Rhai engine
+### 3. Local-first, no backend for user content
 
----
+The deployed product should ship seed assets from S3/CDN, but user-created work stays local to the browser unless the user explicitly exports it.
 
-## Target Architecture (Next Phase)
+This is intentional:
+- no moderation backend
+- no untrusted public uploads
+- full offline-capable editing after initial load
+- explicit user ownership of data
 
-### Two Separate Deployments
+### 4. Feathering is a runtime bake step, not an editor concern
 
-```
-zap-squad/
-├── core/                    # Rust - pure game logic (NO rendering)
-├── adapters/                # Rust - bridges to external systems
-│
-├── editor/                  # DEPLOYMENT 1: Authenticated editor suite
-│   └── web/
-│       ├── src/
-│       │   ├── editors/     # Character, Object, Tile, Map editors
-│       │   ├── storage/     # S3Storage with Cognito auth
-│       │   └── components/  # Shared UI components
-│       └── package.json
-│
-├── game/                    # DEPLOYMENT 2: Public game runtime
-│   ├── wasm/                # Rust WASM build (zap-engine integration)
-│   │   └── src/lib.rs       # Game trait impl, hot-reload exports
-│   └── web/
-│       ├── src/
-│       │   ├── GameHost.tsx # WASM loader, canvas host
-│       │   ├── ScriptPanel  # In-browser Rhai editing (optional)
-│       │   └── ReloadBtn    # Hot reload trigger
-│       └── package.json
-│
-└── shared/                  # Shared TypeScript types
-    └── src/types/           # Asset schemas, API contracts
-```
+Editors continue to work with raw 128x128 source sprites.
 
-### Authentication Model
-- **Editor**: Cognito authentication required to write assets to S3
-- **Game**: No authentication - reads assets from public CDN/S3
+Freedom Board uses baked feathered atlases. Feathering is an intermediate transformation step, ultimately performed in WASM in the client/runtime pipeline, not in Python-only infrastructure and not inside the editors themselves.
 
-### Rendering Architecture
-- **Editor**: Canvas2D for previews (current implementation - fast, good enough)
-- **Game**: zap-engine WebGPU for actual gameplay (GPU-accelerated, HDR support)
+### 5. Scripting starts with character behavior
+
+The first scripting model for kids is character behavior scripting:
+- patrol
+- chase
+- flee
+- guard
+- follow
+- attack
+
+World generation scripts and game-rule scripts remain valid future directions, but the first user-facing scripting milestone is character AI and behavior.
+
+### 6. Asset model simplification
+
+Weapons and objects are converging toward a simpler "object asset" model for visuals. Characters may reference melee equipment and ranged/throwable objects, but the product direction is toward fewer overlapping content categories and clearer runtime usage.
 
 ---
 
-## Phase Plan
+## Experience Goals
 
-### Phase 1: WASM Build Pipeline (Current Gap)
-1. Set up `wasm-pack` build for `infrastructure/wasm/`
-2. Generate JS bindings and TypeScript types
-3. Create simple test page that loads WASM and shows zap-engine canvas
-4. Verify WebGPU rendering works in browser
+For the kid:
+- draw or import tiles and characters
+- place them into a world
+- assign simple behavior scripts
+- issue commands to one or many characters
+- observe movement, combat, and interactions immediately
 
-### Phase 2: Game Runtime
-1. Create `game/web/` React app (minimal - just WASM host)
-2. Implement WASM loading and initialization
-3. Connect level loading (fetch JSON, pass to WASM)
-4. Connect hot-reload (scripts, manifests)
-5. Add basic UI (level selector, reload button)
-
-### Phase 3: Editor Separation
-1. Move current `ui/web/` to `editor/web/`
-2. Remove game runtime code from editor
-3. Add Cognito authentication to editor
-4. Configure S3 storage for production
-
-### Phase 4: Integration
-1. Editor "Play" button opens game in new tab/iframe
-2. Game loads level from CDN
-3. Scripts can be edited in game (ScriptPanel)
-4. Hot-reload works for live iteration
+For the educator or advanced creator:
+- inspect behavior in a deterministic system
+- persist worlds and assets locally
+- export/import all authored content
+- iterate without needing a backend or deployment step
 
 ---
 
-## Target Audience
-1. **Primary:** Kids aged 8-14 learning to code
-2. **Secondary:** Educators teaching game development
-3. **Tertiary:** Indie developers wanting a scriptable engine
+## Architectural Direction
 
-## Success Metrics
-- Kids can create a working game in under 1 hour
-- Scripts are readable by someone with no coding experience
-- Engine runs at 60fps on mid-range hardware
-- All core logic testable without browser/WASM
+### Clean Architecture remains mandatory
+
+- `core/` contains stable rules, pure Rust, no framework dependencies
+- `adapters/` contains reusable bridges such as scripting bindings
+- `infrastructure/` contains WASM integration and volatile runtime details
+- `ui/web/` contains the unified application shell and editors
+
+Freedom Board is allowed to talk directly to `core/` from its WASM integration layer where the adapter boundary remains thin, but the dependency rule still holds: policy inward, details outward.
+
+### Shared persistence model
+
+All tools should converge on one browser-side persistence model:
+- shared IndexedDB database
+- explicit load/save to disk
+- seed assets from CDN/S3
+- user assets, levels, worlds, and settings stored locally
+
+### Shared runtime semantics
+
+The same tile and character rules must apply in:
+- Freedom Board
+- Map Editor preview
+- future runtime/play mode
+
+This includes rendering rules, path connectivity rules, bridge behavior, persistence formats, and script-triggered actions.
+
+---
+
+## World Rendering Direction
+
+### Terrain
+
+Terrain transitions are no longer authored or rendered via skirt/transition overlays. Terrain smoothing is handled by feathered rendering in Freedom Board. Map Editor should not depend on the old skirt tiles.
+
+### Paths
+
+The path system is intentionally asymmetric:
+- water paths remain type-strict and connect only to the same water path type
+- land paths should form a shared road network and connect across different non-water path types
+
+This is a product choice, not a convenience hack. Roads should feel structurally connected even when their art styles differ. Rivers should remain semantically distinct by type.
+
+### Bridges
+
+Bridges are still derived from land paths crossing water. Their visual connectivity should follow the effective land-path network above them.
+
+---
+
+## Remaining Product Work
+
+The remaining work is no longer about proving that the engine can render. It is about turning support modules into finished features.
+
+### Feature track
+
+1. Character scripting UI
+2. Script assignment and reload flow
+3. Script persistence
+4. Attack UI and ranged-attack flow
+5. Multi-select and group commands
+6. Commander/follower behavior
+7. Reliable idle/attack/return animation state behavior
+
+### Platform track
+
+1. Complete local-first persistence across all editors
+2. Finish UUID-based runtime identity and user-asset loading
+3. Wire the WASM feathering step into the runtime asset pipeline
+4. Keep disk export/import first-class
+5. Keep Freedom Board and Map Editor semantics aligned
+
+---
+
+## Definition of Done
+
+Support alone is not done.
+
+A capability is done only when both exist:
+- the support module or engine primitive
+- the user-facing feature that exposes it in the product
+
+Examples:
+- Rhai engine without a script UI is not done
+- attack commands without attack interaction and feedback are not done
+- follow-state math without group controls is not done
+
+---
+
+## Success Criteria
+
+- A child can place characters into a world and make them do meaningful things with scripts.
+- The same world can move from editing to play behavior without format conversion or duplicated logic.
+- Terrain and path rendering feel visually coherent without manual transition assets.
+- User-created work persists locally, exports cleanly, and imports back without corruption.
+- The core rules remain testable off-target and independent of browser/runtime details.

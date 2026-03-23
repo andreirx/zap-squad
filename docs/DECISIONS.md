@@ -136,12 +136,12 @@ See `docs/storage-architecture.md` for the detailed 8-phase plan with current im
 
 # ADR: App Unification — Freedom Board as Primary Route
 
-## Status: Implemented (2026-03-22)
+## Status: Implemented (2026-03-23)
 
 ## Context
 
-The project has two separate React applications:
-- `ui/web/` — main app with editors (tile, character, map) and legacy game pages
+The project had two separate React applications:
+- `ui/web/` — main app with editors and legacy game pages
 - `ui/canvas/` — standalone freedom-board prototype
 
 Running two separate apps creates friction: no shared IDB database, no shared routing, no shared asset registry. Users cannot navigate between editors and the freedom board without switching browser tabs/ports.
@@ -164,9 +164,7 @@ Freedom-board components (InfiniteCanvas, DebugPanel, AssetPanel, StatusBar, FBT
 /editor/character     → Character Editor
 /editor/map           → Map Editor
 /editor/object        → Object Editor
-/editor/weapon        → Weapon Editor
-/game/canvas2d        → Legacy Canvas2D game page (retained)
-/game/wasm            → Legacy WebGPU game page (retained)
+/game/*               → Legacy reference surfaces, not part of the main navigation
 ```
 
 The home route (`/`) is freedom-board. Changing which page is home is a route configuration change in App.tsx.
@@ -193,9 +191,9 @@ Freedom-board toolbar has explicit Save (download JSON) and Load (upload JSON �
 
 Debug panel state (grid, crosshair, quadtree toggles, SAB lock) persists in IDB `config` store under `freedom-board.*` keys. Loaded on mount, saved on change.
 
-### 8. Legacy game pages retained
+### 8. Legacy game pages de-emphasized
 
-`/game/wasm` and `/game/canvas2d` are kept as reference. They will be deleted when freedom-board achieves full feature parity.
+Legacy game pages may still exist in the repository, but they are no longer exposed as primary navigation in the main app shell. Freedom Board is the product-facing route.
 
 ## Consequences
 
@@ -204,4 +202,40 @@ Debug panel state (grid, crosshair, quadtree toggles, SAB lock) persists in IDB 
 - Users navigate between editors and freedom-board seamlessly
 - Adding new tool pages follows the same pattern (route + component)
 - The two WASM crate builds add ~2 seconds to CI, but only the actively-used crate is loaded per route
-- Editors still use StorageGateway for reads (seed assets from CDN/disk); IDB migration for editor saves is next phase
+- Editors still use StorageGateway-style reads for seed content while converging on IDB-backed persistence
+
+---
+
+# ADR: Path Connectivity Semantics and Asset Simplification
+
+## Status: Accepted (implementation in progress, 2026-03-23)
+
+## Context
+
+The original path system treated all path connectivity as type-strict: a path only connected to adjacent paths with the same asset identity. This works for rivers, but it is too rigid for roads and other land-based paths once terrain blending is smooth and path art styles are allowed to vary.
+
+At the same time, the content model is being simplified: weapons and ranged/throwable visuals are converging toward a simpler object-centric visual asset model rather than separate parallel content categories.
+
+## Decision
+
+### 1. Asymmetric path connectivity
+
+- `PATH + WATER` remains strict: water paths only connect to adjacent water paths of the same type.
+- `PATH + LAND` becomes network-oriented: land paths connect across different land-path asset types.
+
+This is a semantic rule, not merely a renderer trick. Roads are treated as one traversable network even when their art variants differ. Rivers remain type-distinct.
+
+### 2. Bridge connectivity follows the effective land-path network
+
+Bridges continue to be derived from land paths crossing water, but their connectivity should follow the visible land-path network rather than the old same-type-only road rule.
+
+### 3. Object asset simplification
+
+The product direction is toward a simplified visual asset model where ranged/throwable visuals are represented through object assets with idle frames, reducing category overlap and making attack presentation easier to reason about in the runtime.
+
+## Consequences
+
+- Map Editor and Freedom Board must share the same asymmetric path rule
+- Data schemas and docs must stop describing land paths as same-type-only
+- Bridge rendering logic must be validated against mixed road types
+- Combat feature work can rely on object assets for ranged/throwable presentation without preserving a separate user-facing weapon editor concept as a primary surface

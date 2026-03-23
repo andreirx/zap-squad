@@ -6,6 +6,8 @@ Freedom Board is an infinite, sparse, chunk-based tile canvas that serves as bot
 
 It extends the existing zap-squad codebase without modifying existing code. All core logic is pure Rust, testable without WASM or a browser.
 
+The active UI surface now lives in `ui/web/src/freedom-board/`. `ui/canvas/` remains a prototype/reference path.
+
 ---
 
 ## Architecture Layers
@@ -23,12 +25,12 @@ It extends the existing zap-squad codebase without modifying existing code. All 
 |  infrastructure/wasm-canvas/  (Rust, WASM)                        |
 |    FreedomBoardGame: Game trait impl, event dispatch,             |
 |    entity spawning, asset registry, camera state mirror           |
-|  ui/canvas/  (React + TypeScript)                                 |
+|  ui/web/src/freedom-board/  (React + TypeScript)                  |
 |    InfiniteCanvas, Toolbar, StatusBar, manifest loader            |
 +-------------------------------------------------------------------+
 ```
 
-Dependency direction: `ui/canvas/ --> wasm-canvas --> core/`. Core never imports from infrastructure.
+Dependency direction: `ui/web/src/freedom-board/ --> wasm-canvas --> core/`. Core never imports from infrastructure.
 
 There is no adapters layer for freedom-board currently. The WASM crate directly imports core entities and use cases. This is acceptable because freedom-board's "adapter" concerns (sprite mapping, event translation) are thin enough to live in the infrastructure layer without violating the dependency rule. If the adapter logic grows (e.g., Rhai scripting bridge, persistence gateway), it should be extracted.
 
@@ -191,11 +193,13 @@ Read-only. No mutations.
 | `query_viewport_lod(world, min, max, zoom, base_px, threshold)` | Adaptive detail/aggregate | Far-zoom rendering |
 | `get_chunk_tiles(world, chunk)` | All tiles from one chunk | Serialization, export |
 | `count_tiles_in_rect(world, min, max)` | Count without allocation | Statistics |
-| `connectivity_bitmask(world, coord)` | 4-bit neighbor mask | Transition sprite selection |
+| `connectivity_bitmask(world, coord)` | 4-bit neighbor mask | Path and bridge connectivity selection |
 | `is_occupied(world, coord)` | Point query | Pathfinding, collision |
-| `cardinal_neighbors(world, coord)` | N/E/S/W tile data | Transition calculations |
+| `cardinal_neighbors(world, coord)` | N/E/S/W tile data | Connectivity and neighborhood logic |
 
-**Connectivity bitmask**: `N=8, S=4, W=2, E=1`. A bit is set if the neighbor exists **and has the same `asset_id`**. This drives automatic transition tile selection -- the bitmask maps directly to the existing atlas row system (base row + 8 directional transition rows per tile type).
+**Connectivity bitmask**: `N=8, S=4, W=2, E=1`. Connectivity is semantic, not uniformly same-asset:
+- WATER paths connect only to same-type water neighbors
+- LAND paths connect to adjacent land paths regardless of specific path asset type
 
 ---
 
@@ -527,7 +531,7 @@ Total: **77 tests** covering core entities and use cases.
 | ~~Fill tool incomplete~~ | ~~Low~~ | DONE (2026-03-21). UI sends `FLOOD_FILL` (kind=5) event. WASM calls `flood_fill()` with 10K tile safety limit. Full undo/redo support. |
 | ~~Drawing tools not wired~~ | ~~Medium~~ | DONE (2026-03-21). Line tool (Bresenham), Rect fill tool, Erase rect, Undo/Redo (Ctrl+Z/Ctrl+Shift+Z). Two-point drag protocol via DRAG_START event. Keyboard shortcuts wired (H/B/E/G/L/R/C). Drag preview overlay for line/rect tools (SVG, Bresenham-accurate for line, bounding rect for rect). |
 | ~~Character system missing~~ | ~~High~~ | DONE (2026-03-21). Characters stored as CompositeActor (core entity) in WASM HashMap. Place (Shift+click), Select (click), Move (right-click), Delete. Rendered as colored vector rectangles with direction indicator and health bar. Pathfinding trait (InfiniteNavGrid) ready but movement is instant teleport for now. |
-| ~~Tile selector flat dropdown~~ | ~~Medium~~ | DONE (2026-03-21). Replaced single `<select>` with categorized AssetPanel. Tiles grouped by tileType (Terrain/Paths/Bridges). Sprite previews from atlas first-frame CSS crop. Characters and weapons sections with previews. |
+| ~~Tile selector flat dropdown~~ | ~~Medium~~ | DONE (2026-03-21). Replaced single `<select>` with categorized AssetPanel. Tiles grouped by tileType (Terrain/Paths/Bridges). Sprite previews from atlas first-frame CSS crop. Characters and object assets shown with previews. |
 | **MapEditor stays on source atlases** | Low | Decision: Option A (2026-03-21). MapEditor keeps 128x128 source atlases, no feathering. Old transition system remains. MapEditor is the authoring tool for discrete maps that get stamped onto the infinite canvas. |
 | ~~GameCanvas renderer~~ | ~~N/A~~ | DEPRECATED (2026-03-21). Freedom-board supersedes GameCanvas as the runtime renderer. GameCanvas code retained for reference only. |
 | **TileEditor save pipeline not updated** | Medium | Tile Editor outputs 128x128 PNGs but no auto-feathering step. Production pipeline needs WASM featherer or CI hook. |

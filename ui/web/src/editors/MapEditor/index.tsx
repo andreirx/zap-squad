@@ -111,34 +111,58 @@ function loadImage(url: string): Promise<HTMLImageElement> {
  * Calculate path connectivity variation (0-14) based on neighboring paths
  * Bitmask: N=8, S=4, W=2, E=1
  */
+/**
+ * Calculate path connectivity bitmask.
+ *
+ * @param landPathIds - Set of asset IDs that are land-based paths.
+ *   If the center tile is a land path, it connects to ANY other land path.
+ *   If not (water path), it only connects to the same asset_id.
+ */
 function calculatePathVariation(
   x: number,
   y: number,
   pathGrid: Map<string, GridTile>,
   pathAssetId: string,
   mapWidth: number,
-  mapHeight: number
+  mapHeight: number,
+  landPathIds?: Set<string>,
 ): number {
   let bits = 0;
+  const isLand = landPathIds?.has(pathAssetId) ?? false;
 
   const gridX = x / TILE_SIZE;
   const gridY = y / TILE_SIZE;
 
+  const connects = (neighbor: GridTile | undefined) => {
+    if (!neighbor) return false;
+    if (isLand) {
+      // Land paths connect to any other land path
+      return landPathIds!.has(neighbor.src);
+    }
+    // Water paths: same asset only
+    return neighbor.src === pathAssetId;
+  };
+
   // Check North (up)
-  const northKey = `${x},${y - TILE_SIZE}`;
-  if (gridY > 0 && pathGrid.get(northKey)?.src === pathAssetId) bits |= 8;
-
+  if (gridY > 0) {
+    const n = pathGrid.get(`${x},${y - TILE_SIZE}`);
+    if (connects(n)) bits |= 8;
+  }
   // Check South (down)
-  const southKey = `${x},${y + TILE_SIZE}`;
-  if (gridY < mapHeight / TILE_SIZE - 1 && pathGrid.get(southKey)?.src === pathAssetId) bits |= 4;
-
+  if (gridY < mapHeight / TILE_SIZE - 1) {
+    const s = pathGrid.get(`${x},${y + TILE_SIZE}`);
+    if (connects(s)) bits |= 4;
+  }
   // Check West (left)
-  const westKey = `${x - TILE_SIZE},${y}`;
-  if (gridX > 0 && pathGrid.get(westKey)?.src === pathAssetId) bits |= 2;
-
+  if (gridX > 0) {
+    const w = pathGrid.get(`${x - TILE_SIZE},${y}`);
+    if (connects(w)) bits |= 2;
+  }
   // Check East (right)
-  const eastKey = `${x + TILE_SIZE},${y}`;
-  if (gridX < mapWidth / TILE_SIZE - 1 && pathGrid.get(eastKey)?.src === pathAssetId) bits |= 1;
+  if (gridX < mapWidth / TILE_SIZE - 1) {
+    const e = pathGrid.get(`${x + TILE_SIZE},${y}`);
+    if (connects(e)) bits |= 1;
+  }
 
   // Convert to variation index (0-14)
   return bits === 0 ? 0 : bits - 1;
@@ -182,69 +206,6 @@ function getVariationFromSeed(seed: number, variations: number): number {
   const x = Math.sin(seed * 9999) * 10000;
   const rand = x - Math.floor(x);
   return Math.floor(rand * variations);
-}
-
-/**
- * Direction offsets for transition calculations
- */
-const DIRECTION_OFFSETS = {
-  n:  { dx: 0,  dy: -1 },
-  ne: { dx: 1,  dy: -1 },
-  e:  { dx: 1,  dy: 0 },
-  se: { dx: 1,  dy: 1 },
-  s:  { dx: 0,  dy: 1 },
-  sw: { dx: -1, dy: 1 },
-  w:  { dx: -1, dy: 0 },
-  nw: { dx: -1, dy: -1 }
-} as const;
-
-type TransitionDirection = keyof typeof DIRECTION_OFFSETS;
-const ALL_DIRECTIONS: TransitionDirection[] = ['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw'];
-
-/**
- * Get directions where this tile should project transitions onto neighbors
- * Dominant tile (higher assetId) wins when tiles are different
- */
-function getTransitionDirections(
-  x: number,
-  y: number,
-  terrainGrid: Map<string, GridTile>,
-  mapWidth: number,
-  mapHeight: number,
-  tileAssetId: string
-): TransitionDirection[] {
-  const gridX = x / TILE_SIZE;
-  const gridY = y / TILE_SIZE;
-  const directions: TransitionDirection[] = [];
-
-  for (const dir of ALL_DIRECTIONS) {
-    const offset = DIRECTION_OFFSETS[dir];
-    const nx = gridX + offset.dx;
-    const ny = gridY + offset.dy;
-
-    // Skip if neighbor is out of bounds
-    if (nx < 0 || nx >= mapWidth / TILE_SIZE || ny < 0 || ny >= mapHeight / TILE_SIZE) continue;
-
-    const neighborKey = `${nx * TILE_SIZE},${ny * TILE_SIZE}`;
-    const neighbor = terrainGrid.get(neighborKey);
-
-    // Determine if we should draw transition
-    let shouldDraw = false;
-
-    if (!neighbor) {
-      // Neighbor is void - always draw transition
-      shouldDraw = true;
-    } else if (neighbor.src !== tileAssetId) {
-      // Different tile - dominant tile (higher assetId) wins
-      shouldDraw = tileAssetId > neighbor.src;
-    }
-
-    if (shouldDraw) {
-      directions.push(dir);
-    }
-  }
-
-  return directions;
 }
 
 /**
@@ -711,13 +672,26 @@ export function MapEditor() {
       const selectedAsset = tileImagesRef.current.get(selectedTileId);
       const isGroundPath = selectedAsset?.tileType === 'PATH' && selectedAsset?.terrainType !== 'WATER';
 
+      // Determine which storage layer this tile belongs to (matches freedom-board layer system)
+      const storageLayer = (() => {
+        if (!selectedAsset) return 0;
+        if (selectedAsset.tileType === 'BRIDGE') return 2;
+        if (selectedAsset.tileType === 'PATH') return selectedAsset.terrainType === 'WATER' ? 1 : 3;
+        return 0; // TILE
+      })();
+
+      // Helper: get storage layer for any tile by looking up its asset
+      const tileStorageLayer = (tile: GridTile): number => {
+        const a = tileImagesRef.current.get(tile.src);
+        if (!a) return 0;
+        if (a.tileType === 'BRIDGE') return 2;
+        if (a.tileType === 'PATH') return a.terrainType === 'WATER' ? 1 : 3;
+        return 0;
+      };
+
       setLevel(prev => {
         const layer = prev.layerInstances.find(l => l.__identifier === layerName);
         if (!layer || !layer.gridTiles) return prev;
-
-        const existingIdx = layer.gridTiles.findIndex(
-          t => t.px[0] === snapped.x && t.px[1] === snapped.y
-        );
 
         const newTile: GridTile = {
           px: [snapped.x, snapped.y],
@@ -725,64 +699,46 @@ export function MapEditor() {
           src: selectedTileId,
         };
 
-        let newGridTiles: GridTile[];
-        if (existingIdx >= 0) {
-          newGridTiles = [...layer.gridTiles];
-          newGridTiles[existingIdx] = newTile;
-        } else {
-          newGridTiles = [...layer.gridTiles, newTile];
-        }
+        // Replace only tiles at the same position AND same storage layer.
+        // Tiles on different storage layers coexist (e.g., water path + bridge + land path).
+        let newGridTiles = layer.gridTiles.filter(
+          t => !(t.px[0] === snapped.x && t.px[1] === snapped.y && tileStorageLayer(t) === storageLayer)
+        );
+        newGridTiles.push(newTile);
 
         let updatedLayers = prev.layerInstances.map(l =>
           l.__identifier === layerName ? { ...l, gridTiles: newGridTiles } : l
         );
 
-        // Auto-add bridge when painting ground path over water
+        // Auto-add bridge when painting a land path over an impassable tile
         if (isGroundPath && selectedBridgeId) {
-          const terrainLayer = prev.layerInstances.find(l => l.__identifier === 'Terrain');
-          const pathsLayer = prev.layerInstances.find(l => l.__identifier === 'Paths');
+          // Check all tiles at this position for impassable ones (water terrain, water paths, fences)
+          const allTilesHere = [
+            ...(prev.layerInstances.find(l => l.__identifier === 'Terrain')?.gridTiles || []),
+            ...newGridTiles,
+          ].filter(t => t.px[0] === snapped.x && t.px[1] === snapped.y);
 
-          // Check if there's water terrain or water path at this position
-          const terrainTile = terrainLayer?.gridTiles?.find(
-            t => t.px[0] === snapped.x && t.px[1] === snapped.y
-          );
-          const pathTile = pathsLayer?.gridTiles?.find(
-            t => t.px[0] === snapped.x && t.px[1] === snapped.y
-          );
+          const hasImpassableUnderneath = allTilesHere.some(t => {
+            if (t.src === selectedTileId) return false; // skip the tile we're placing
+            const a = tileImagesRef.current.get(t.src);
+            return a?.terrainType === 'WATER';
+          });
 
-          const terrainAsset = terrainTile ? tileImagesRef.current.get(terrainTile.src) : null;
-          const pathAsset = pathTile ? tileImagesRef.current.get(pathTile.src) : null;
-
-          const isOverWater =
-            terrainAsset?.terrainType === 'WATER' ||
-            (pathAsset?.tileType === 'PATH' && pathAsset?.terrainType === 'WATER');
-
-          if (isOverWater) {
-            // Add bridge tile to the Paths layer (rendered under ground paths)
+          if (hasImpassableUnderneath) {
             const bridgeTile: GridTile = {
               px: [snapped.x, snapped.y],
               t: Math.floor(Math.random() * 100),
               src: selectedBridgeId,
             };
 
-            // Find or create bridges in paths layer (before ground paths)
             updatedLayers = updatedLayers.map(l => {
               if (l.__identifier === 'Paths') {
-                // Check if there's already a bridge here
-                const existingBridgeIdx = (l.gridTiles || []).findIndex(
-                  t => t.px[0] === snapped.x && t.px[1] === snapped.y &&
-                       tileImagesRef.current.get(t.src)?.tileType === 'BRIDGE'
+                // Replace existing bridge at this position, or add new
+                const tiles = (l.gridTiles || []).filter(
+                  t => !(t.px[0] === snapped.x && t.px[1] === snapped.y && tileStorageLayer(t) === 2)
                 );
-
-                if (existingBridgeIdx >= 0) {
-                  // Update existing bridge
-                  const updatedTiles = [...(l.gridTiles || [])];
-                  updatedTiles[existingBridgeIdx] = bridgeTile;
-                  return { ...l, gridTiles: updatedTiles };
-                } else {
-                  // Add new bridge
-                  return { ...l, gridTiles: [...(l.gridTiles || []), bridgeTile] };
-                }
+                tiles.push(bridgeTile);
+                return { ...l, gridTiles: tiles };
               }
               return l;
             });
@@ -794,14 +750,35 @@ export function MapEditor() {
     } else if (tool === 'erase') {
       const layerName = editLayer === 'terrain' ? 'Terrain' : 'Paths';
 
-      setLevel(prev => ({
-        ...prev,
-        layerInstances: prev.layerInstances.map(l =>
-          l.__identifier === layerName
-            ? { ...l, gridTiles: (l.gridTiles || []).filter(t => t.px[0] !== snapped.x || t.px[1] !== snapped.y) }
-            : l
-        ),
-      }));
+      setLevel(prev => {
+        const layer = prev.layerInstances.find(l => l.__identifier === layerName);
+        if (!layer?.gridTiles) return prev;
+
+        // Find all tiles at this position, sorted by storage layer descending (top first)
+        const tilesHere = layer.gridTiles
+          .map((t, idx) => ({ t, idx, sl: (() => {
+            const a = tileImagesRef.current.get(t.src);
+            if (!a) return 0;
+            if (a.tileType === 'BRIDGE') return 2;
+            if (a.tileType === 'PATH') return a.terrainType === 'WATER' ? 1 : 3;
+            return 0;
+          })() }))
+          .filter(e => e.t.px[0] === snapped.x && e.t.px[1] === snapped.y)
+          .sort((a, b) => b.sl - a.sl); // highest storage layer first
+
+        if (tilesHere.length === 0) return prev;
+
+        // Remove the topmost tile only
+        const toRemove = tilesHere[0].idx;
+        const newGridTiles = layer.gridTiles.filter((_, i) => i !== toRemove);
+
+        return {
+          ...prev,
+          layerInstances: prev.layerInstances.map(l =>
+            l.__identifier === layerName ? { ...l, gridTiles: newGridTiles } : l
+          ),
+        };
+      });
     } else if (tool === 'entity' && selectedEntityId && editLayer === 'entities') {
       const newEntity: EntityInstance = {
         __identifier: entityType === 'character' ? 'Character' : 'Object',
@@ -845,15 +822,21 @@ export function MapEditor() {
     }
   }, [tool, snapToGrid, paintCell]);
 
+  // onClick still paints the clicked cell (for single-click placement)
   const handleWorldClick = useCallback((worldX: number, worldY: number, button: number) => {
     if (button !== 0) return;
-    isDrawingRef.current = true;
-    const snapped = snapToGrid(worldX, worldY);
-    lastCellRef.current = { x: snapped.x, y: snapped.y };
     paintCell(worldX, worldY);
-  }, [snapToGrid, paintCell]);
+  }, [paintCell]);
 
-  const handleWorldMouseUp = useCallback(() => {
+  // mousedown starts continuous drawing mode
+  const handleWrapperMouseDown = useCallback((e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    isDrawingRef.current = true;
+    lastCellRef.current = null;
+  }, []);
+
+  // mouseup ends continuous drawing mode
+  const handleWrapperMouseUp = useCallback(() => {
     isDrawingRef.current = false;
     lastCellRef.current = null;
   }, []);
@@ -872,7 +855,7 @@ export function MapEditor() {
       }
     }
 
-    // Build terrain grid for transition calculations
+    // Build terrain grid for bridge detection
     const terrainGrid = new Map<string, GridTile>();
     if (terrainLayer?.gridTiles) {
       for (const tile of terrainLayer.gridTiles) {
@@ -900,36 +883,6 @@ export function MapEditor() {
       }
     }
 
-    // Pass 1.5: Draw terrain transitions (Stacking Algorithm)
-    if (terrainLayer?.gridTiles) {
-      for (const tile of terrainLayer.gridTiles) {
-        const directions = getTransitionDirections(
-          tile.px[0], tile.px[1],
-          terrainGrid,
-          level.pxWid, level.pxHei,
-          tile.src
-        );
-
-        for (const dir of directions) {
-          const offset = DIRECTION_OFFSETS[dir];
-          const nx = tile.px[0] + offset.dx * TILE_SIZE;
-          const ny = tile.px[1] + offset.dy * TILE_SIZE;
-
-          // Load transition image
-          const storage = createStorage();
-          const transitionUrl = storage.getReadUrl(`tiles/${tile.src}/tile_0_transition_${dir}.png`);
-          const transitionImg = imageCache.get(transitionUrl);
-
-          if (transitionImg) {
-            ctx.drawImage(transitionImg, nx, ny, TILE_SIZE, TILE_SIZE);
-          } else {
-            // Start loading the transition image
-            loadImage(transitionUrl).then(() => setRenderKey(k => k + 1)).catch(() => {});
-          }
-        }
-      }
-    }
-
     // Separate paths by type: water paths, bridges, ground paths
     const waterPaths: GridTile[] = [];
     const bridges: GridTile[] = [];
@@ -945,6 +898,14 @@ export function MapEditor() {
         } else {
           groundPaths.push(tile);
         }
+      }
+    }
+
+    // Build set of all land-based path/bridge asset IDs for cross-type connectivity
+    const landPathIds = new Set<string>();
+    for (const [id, asset] of tileImagesRef.current) {
+      if ((asset.tileType === 'PATH' || asset.tileType === 'BRIDGE') && asset.terrainType !== 'WATER') {
+        landPathIds.add(id);
       }
     }
 
@@ -982,7 +943,8 @@ export function MapEditor() {
         const variation = calculatePathVariation(
           tile.px[0], tile.px[1],
           waterPathGrid, tile.src,
-          level.pxWid, level.pxHei
+          level.pxWid, level.pxHei,
+          undefined, // water paths: same-asset-only connectivity
         );
         const img = asset.images.get(variation) || asset.images.get(0);
         if (img) {
@@ -1015,23 +977,23 @@ export function MapEditor() {
     for (const [, bridge] of bridgeGrid) {
       const asset = tileImagesRef.current.get(bridge.bridgeSrc);
       if (asset?.images) {
-        // Calculate bridge variation based on neighboring ground paths OF THE SAME TYPE
+        // Calculate bridge variation based on neighboring land paths (cross-type)
         let bits = 0;
         const x = bridge.px[0];
         const y = bridge.px[1];
         const gridX = x / TILE_SIZE;
         const gridY = y / TILE_SIZE;
 
-        // Only connect if neighbor has the same path type
         const northPath = groundPathGrid.get(`${x},${y - TILE_SIZE}`);
         const southPath = groundPathGrid.get(`${x},${y + TILE_SIZE}`);
         const westPath = groundPathGrid.get(`${x - TILE_SIZE},${y}`);
         const eastPath = groundPathGrid.get(`${x + TILE_SIZE},${y}`);
 
-        if (gridY > 0 && northPath?.src === bridge.pathSrc) bits |= 8;
-        if (gridY < level.pxHei / TILE_SIZE - 1 && southPath?.src === bridge.pathSrc) bits |= 4;
-        if (gridX > 0 && westPath?.src === bridge.pathSrc) bits |= 2;
-        if (gridX < level.pxWid / TILE_SIZE - 1 && eastPath?.src === bridge.pathSrc) bits |= 1;
+        // Bridges connect to any land-based path, not just the same type
+        if (gridY > 0 && northPath && landPathIds.has(northPath.src)) bits |= 8;
+        if (gridY < level.pxHei / TILE_SIZE - 1 && southPath && landPathIds.has(southPath.src)) bits |= 4;
+        if (gridX > 0 && westPath && landPathIds.has(westPath.src)) bits |= 2;
+        if (gridX < level.pxWid / TILE_SIZE - 1 && eastPath && landPathIds.has(eastPath.src)) bits |= 1;
 
         const variation = bits === 0 ? 0 : bits - 1;
         const img = asset.images.get(variation) || asset.images.get(0);
@@ -1048,7 +1010,8 @@ export function MapEditor() {
         const variation = calculatePathVariation(
           tile.px[0], tile.px[1],
           groundPathGrid, tile.src,
-          level.pxWid, level.pxHei
+          level.pxWid, level.pxHei,
+          landPathIds, // land paths: cross-type connectivity
         );
         const img = asset.images.get(variation) || asset.images.get(0);
         if (img) {
@@ -1274,7 +1237,7 @@ export function MapEditor() {
       </div>
 
       {/* Main canvas */}
-      <div style={{ flex: 1, position: 'relative' }} onMouseUp={handleWorldMouseUp} onMouseLeave={handleWorldMouseUp}>
+      <div style={{ flex: 1, position: 'relative' }} onMouseDown={handleWrapperMouseDown} onMouseUp={handleWrapperMouseUp} onMouseLeave={handleWrapperMouseUp}>
         <PanZoomCanvas
           width={level.pxWid}
           height={level.pxHei}

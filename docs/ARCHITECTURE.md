@@ -1,305 +1,287 @@
-# Zap-Architect Architecture
+# ZapSquad Architecture
 
 ## Overview
 
-Zap-Architect is a programmable 2D game engine for kids, built with Rust/WASM and React. It provides:
-- X-COM style sprite compositing (body + weapon layers)
-- Hot-reloadable Rhai scripting
-- LDtk-compatible level loading
-- Integrated asset editors
-- Local filesystem storage (dev) / S3 + Cognito (deployed)
+ZapSquad is a unified Rust/WASM + React application for:
+- authoring 128x128 source assets
+- building worlds on an infinite sparse canvas
+- placing and controlling characters
+- evolving toward a scriptable playable runtime for kids
 
-## Directory Structure
-
-```
-zap-squad/
-├── core/                    # Pure Rust business logic (no external deps)
-│   └── src/entities/        # CompositeActor, Direction, AnimationState
-├── adapters/                # Interface adapters (zap-engine, Rhai, LDtk)
-│   └── src/                 # CompositeRenderer, ScriptEngine, AssetManifest
-├── infrastructure/
-│   └── wasm/               # WASM bindings, Game trait implementation
-├── ui/web/                 # React frontend
-│   ├── public/
-│   │   ├── mods/           # Source assets (editable)
-│   │   │   ├── characters/{id}/definition.json + *.png
-│   │   │   ├── tiles/{id}/definition.json + *.png
-│   │   │   ├── weapons/{id}/definition.json + *.png
-│   │   │   ├── levels/*.json
-│   │   │   └── scripts/*.rhai
-│   │   └── assets/         # Baked atlases (generated)
-│   │       ├── characters/{id}.png
-│   │       ├── tiles/{id}.png
-│   │       ├── weapons/{id}.png
-│   │       └── manifest.json
-│   └── src/
-│       ├── components/     # GameCanvas, PanZoomCanvas
-│       ├── editors/        # CharacterEditor, TileEditor, MapEditor
-│       ├── hooks/          # useCanvasTransform, useHotReload
-│       ├── pages/          # GamePage
-│       └── storage/        # LocalStorage, S3Storage
-└── tools/                  # Build tools
-    ├── import-hexmanos.ts  # Import from hexmanos format
-    └── bake-atlases.ts     # Sprite packing
-```
-
-## Asset Pipeline
-
-### Source Assets (public/mods/)
-
-Editable assets stored as individual files:
-
-**Characters:**
-- `{id}/definition.json` - metadata (name, frames, frameDuration)
-- `{id}/{id}_{visualState}_{animation}_{frame}.png` - individual sprites
-
-**Tiles:**
-- `{id}/definition.json` - metadata (walkable, blocksVision)
-- `{id}/tile_{variation}.png` - base tiles
-- `{id}/tile_{variation}_transition_{dir}.png` - edge transitions
-
-**Levels:**
-- `{name}.json` - LDtk-compatible format with Tiles and Entities layers
-
-### Baked Assets (public/assets/)
-
-Optimized atlases for runtime:
-
-```
-make bake-atlases
-```
-
-Produces:
-- One PNG atlas per character/tile/weapon
-- `manifest.json` describing sprite locations
-
-**Manifest Structure (v2 - simplified, no visual states):**
-```json
-{
-  "version": 2,
-  "spriteSize": 128,
-  "maxFrames": 8,
-  "characters": {
-    "carnat_test": {
-      "atlas": "characters/carnat_test.png",
-      "atlasWidth": 1024,
-      "atlasHeight": 1536,
-      "animations": {
-        "idle_south": { "row": 0, "frames": 1, "loop": true },
-        "walk_south": { "row": 1, "frames": 4, "loop": true },
-        "melee_attack_south": { "row": 2, "frames": 7, "loop": false }
-      }
-    }
-  },
-  "tiles": { ... },
-  "weapons": { ... }
-}
-```
-
-## Storage Gateway
-
-Abstraction layer for dev vs production storage:
-
-```typescript
-interface StorageGateway {
-  readText(path: string): Promise<string>;
-  writeBytes(path: string, data: ArrayBuffer): Promise<void>;
-  list(prefix: string): Promise<string[]>;
-  getReadUrl(path: string): string;
-}
-```
-
-**Development (LocalStorage):**
-- Reads via Vite static file serving
-- Writes via `/__write-file` Vite plugin endpoint
-- Lists via `/__list-files` endpoint
-
-**Production (S3Storage):**
-- Reads via public S3 URLs
-- Writes via presigned URLs
-- Auth via Cognito Identity Pool
-
-## Data Flow
-
-### Development Workflow
-
-```
-1. Edit sprites in CharacterEditor/TileEditor
-   └── Saves to public/mods/{type}/{id}/
-
-2. Edit levels in MapEditor
-   └── Saves to public/mods/levels/{name}.json
-
-3. Run: make bake-atlases
-   └── Reads public/mods/
-   └── Writes public/assets/ (atlases + manifest.json)
-
-4. Run: npm run dev
-   └── GameCanvas loads /assets/manifest.json
-   └── GameCanvas loads /assets/{type}/{id}.png atlases
-   └── GameCanvas loads /mods/levels/{name}.json
-```
-
-### Production Deployment
-
-```
-1. Build: make build
-   └── bake-atlases (generate atlases)
-   └── wasm-pack build (compile WASM)
-   └── vite build (bundle React)
-
-2. Deploy to S3/CloudFront:
-   └── dist/assets/ (JS/CSS bundles)
-   └── assets/ (atlases + manifest)
-   └── mods/levels/ (if user-editable levels)
-
-3. Runtime:
-   └── Fetch manifest.json (1 request)
-   └── Fetch needed atlases (few requests)
-   └── Render using atlas coordinates
-```
-
-## Sprite Naming Conventions
-
-### Characters
-
-**Source files:** `{id}_full_{animation}_{frame}.png`
-- Only "full" visual state is used (hurt/critical states removed)
-- animation: `idle_south`, `walk_north`, `melee_attack_east`, etc.
-- frame: 0-indexed integer (max 8 frames per animation)
-
-**Atlas layout:**
-```
-Columns: 8 (max frames)
-Rows: one per animation (sorted alphabetically)
-```
-
-### Tiles
-
-**Source files:**
-- `tile_{variation}.png` - base tiles (row 0 in atlas)
-- `tile_{variation}_transition_{dir}.png` - transitions (rows 1-8)
-
-**Directions:** n, ne, e, se, s, sw, w, nw
-
-### Weapons/Objects
-
-**Source files:** `new_{animation}_{frame}.png`
-- Only "new" visual state is used (worn/damaged/broken removed)
-- animation: `idle`, `landed`
-- frame: 0-indexed integer (max 8 frames per animation)
-
-**Atlas layout:**
-```
-Columns: 8 (max frames)
-Rows: one per animation (sorted alphabetically)
-```
-
-## Level Format (LDtk-compatible)
-
-```json
-{
-  "levels": [{
-    "identifier": "level_name",
-    "pxWid": 512,
-    "pxHei": 512,
-    "layerInstances": [
-      {
-        "__identifier": "Tiles",
-        "__type": "Tiles",
-        "__gridSize": 32,
-        "gridTiles": [
-          { "px": [0, 0], "t": 5, "src": "grass" }
-        ]
-      },
-      {
-        "__identifier": "Entities",
-        "__type": "Entities",
-        "entityInstances": [
-          {
-            "__identifier": "Character",
-            "px": [100, 100],
-            "fieldInstances": [
-              { "__identifier": "body_def_id", "__value": "carnat_test" }
-            ]
-          }
-        ]
-      }
-    ]
-  }]
-}
-```
-
-## Sprite Sheet Editors
-
-The editors work directly with atlas PNG files (no individual frame files needed):
-
-### CharacterSheetEditor
-- Loads character atlases from `assets/characters/{id}.png`
-- Displays grid overlay with animation row labels
-- Click cells to edit in detail view
-- Save writes directly to atlas PNG
-
-### TileSheetEditor
-- Loads tile atlases from `assets/tiles/{id}.png`
-- Shows base tiles (row 0) and 8 transition rows
-- Click cells to edit variations
-
-### WeaponSheetEditor
-- Loads weapon atlases from `assets/weapons/{id}.png`
-- Similar to character editor but with weapon-specific animations
-
-### Workflow
-1. Run `make bake-atlases` to generate initial atlases from imported sprites
-2. Open sprite sheet editor (CharacterSheetEditor, TileSheetEditor, WeaponSheetEditor)
-3. Click cells in the sprite sheet to select them
-4. Edit the cell in the detail view (right panel)
-5. Changes sync automatically to the sprite sheet
-6. Press Ctrl+S to save the atlas PNG
-
-### Shared Types
-All editors and the game renderer use shared atlas schemas from `types/atlas.ts`:
-- `CharacterAtlasSchema` - 8 columns (frames) x N rows (animations)
-- `TileAtlasSchema` - N columns (variations) x 9 rows (base + 8 transitions)
-- `WeaponAtlasSchema` - 8 columns (frames) x N rows (animations)
-
-## Build Commands
-
-```bash
-make test           # Run Rust tests
-make check          # Check compilation (including WASM)
-make wasm           # Build WASM package
-make import-hexmanos  # Import from hexmanos format
-make bake-atlases   # Generate sprite atlases
-make build          # Full build (wasm + atlases)
-make dev            # Start dev server
-```
-
-## Freedom Board (Infinite Sparse Canvas)
-
-A second WASM application alongside the main game, providing an infinite sparse tile canvas for world editing and gameplay.
-
-**Core** (`core/src/entities/freedom_board/`, `core/src/use_cases/freedom_board/`):
-- `SparseWorld`: HashMap<ChunkCoord, Chunk> + QuadTreeIndex. Pure Rust, no framework deps.
-- Edit use cases: place, erase, fill, line (Bresenham), flood fill (BFS). All return invertible `EditResult` for undo/redo.
-- Query use cases: viewport query, LOD query, connectivity bitmask.
-
-**WASM** (`infrastructure/wasm-canvas/`):
-- `FreedomBoardGame` implements zap-engine `Game` trait. Translates custom events from React into core mutations, spawns engine entities for rendering.
-
-**UI** (`ui/canvas/`):
-- React app on port 5179. InfiniteCanvas component owns camera, dispatches events to WASM.
-- Loads tile manifest from shared assets (`ui/web/public/assets/`), never copies.
-
-See `docs/freedom-board.md` for full documentation.
+The current architectural center is Freedom Board inside the unified `ui/web/` app. Supporting editors remain important, but they feed the Freedom Board/runtime path rather than defining a separate product.
 
 ---
 
-## Key Decisions
+## Current Application Shape
 
-1. **One atlas per asset** (not one giant atlas) - enables incremental updates
-2. **Variable frame counts** - animations keep their natural frame counts
-3. **Manifest-driven** - single source of truth for sprite locations
-4. **StorageGateway abstraction** - same code for dev/prod
-5. **LDtk-compatible format** - can use LDtk for advanced level editing
-6. **Hybrid HashMap+Quadtree for SparseWorld** - O(1) point ops + O(log N) spatial (see ADR-005)
+### Main app shell
+
+The main application lives in `ui/web/` and currently hosts:
+- Freedom Board as the primary route
+- Tile editor
+- Character editor
+- Object editor
+- Map editor
+
+Legacy renderer pages may still exist in the repository, but they are no longer the main product path and should not drive new architecture.
+
+### Key directories
+
+```text
+zap-squad/
+├── core/                         # Pure Rust business logic
+│   └── src/
+│       ├── entities/             # Stable domain entities
+│       └── use_cases/            # Stable application rules
+├── adapters/                     # Reusable bridges (Rhai bindings, manifests, gateways)
+├── infrastructure/
+│   ├── wasm-canvas/              # Freedom Board WASM runtime
+│   ├── wasm-feather/             # Feather baking in Rust/WASM
+│   └── wasm/                     # Older WASM runtime/reference path
+├── ui/
+│   ├── web/                      # Unified app shell and active product surface
+│   └── canvas/                   # Freedom Board prototype/reference path
+├── tools/                        # Import, bake, and support scripts
+└── docs/                         # Product and architecture documentation
+```
+
+---
+
+## Architectural Layers
+
+### Core
+
+`core/` contains stable policy and must remain independent of frameworks and runtime details.
+
+Examples:
+- world entities
+- sparse-world storage
+- pathfinding
+- group-follow support
+- combat primitives
+- freedom-board use cases
+
+Rules:
+- no browser dependencies
+- no React dependencies
+- no engine dependencies
+- logic must be testable off-target
+
+### Adapters
+
+`adapters/` contains reusable translation and gateway logic.
+
+Examples:
+- Rhai bindings and script command emission
+- manifest interpretation
+- engine-facing abstraction helpers
+
+The adapters layer exists to keep volatile integration concerns out of `core/`, but Freedom Board currently keeps some thin integration logic in its WASM layer where that boundary is still small.
+
+### Infrastructure
+
+`infrastructure/` contains volatile implementation details:
+- WASM exports
+- Freedom Board runtime integration
+- feather-baking module
+- older runtime/reference WASM modules
+
+This layer may know about engine details, asset loading mechanics, and browser integration concerns. It must not invert the dependency rule back into `core/`.
+
+### UI
+
+`ui/web/` is the user-facing product shell.
+
+It contains:
+- Freedom Board UI
+- supporting editors
+- browser-side storage wiring
+- route structure
+- import/export flows
+
+The UI owns presentation and interaction state, not business rules.
+
+---
+
+## Product Surfaces
+
+### Freedom Board
+
+Freedom Board is both:
+- the primary world-building canvas
+- the primary runtime surface for future scripting, combat, and squad interaction
+
+Its architecture is:
+
+```text
+ui/web/src/freedom-board/
+  -> infrastructure/wasm-canvas/
+     -> core/
+```
+
+Freedom Board owns:
+- tile placement and editing tools
+- map stamping into the sparse world
+- character placement and movement commands
+- auto-save and explicit save/load
+- debug and profiling controls
+- future scripting/combat/group-control UI
+
+### Editors
+
+The editors remain source-asset tools:
+- TileEditor authors 128x128 source tile assets
+- CharacterEditor authors source character assets
+- ObjectEditor authors source object visuals, including ranged/throwable presentation assets
+- MapEditor authors bounded LDtk-style maps and preview semantics
+
+They do not define runtime rendering geometry. In particular, they do not work in feathered 160x160 space.
+
+---
+
+## Persistence Architecture
+
+### Local-first model
+
+The active persistence direction is:
+- seed assets from CDN/S3
+- user content in browser storage
+- explicit export/import to disk
+- no backend for user-generated content
+
+This keeps moderation and sync out of scope while preserving offline-capable iteration.
+
+### Shared browser storage
+
+The shared browser-side persistence layer is IndexedDB:
+- `assets`
+- `levels`
+- `worlds`
+- `config`
+- `files`
+
+In practice, the application currently uses both:
+- structured stores for worlds/settings and future asset identity
+- a file-like IDB-backed storage path for editor-facing content reads/writes
+
+This means the repository is mid-convergence, but the intended outcome is one coherent local-first persistence architecture rather than multiple independent storage silos.
+
+### StorageGateway role
+
+`StorageGateway` still matters, but its role has shifted:
+- read seed content
+- provide a file-like abstraction for editor workflows
+- optionally support curator/admin asset management flows
+
+It is no longer the primary place to anchor the user-content architecture.
+
+---
+
+## Asset Pipeline
+
+### Source assets
+
+Source assets remain 128x128 based.
+
+Examples:
+- tiles in `mods/tiles/{id}/...`
+- characters in `mods/characters/{id}/...`
+- objects in `mods/objects/{id}/...`
+- maps in `mods/levels/{name}.json`
+
+### Runtime atlases
+
+Runtime rendering uses baked atlases and manifest metadata.
+
+Important distinction:
+- editors operate on raw/source assets
+- Freedom Board operates on baked runtime assets
+
+### Feathering
+
+Feathering is a runtime bake step, not an editor concern.
+
+Current state:
+- Python tooling exists for offline conversion
+- `infrastructure/wasm-feather/` exists as the intended runtime/client-side implementation
+
+Target state:
+- source 128x128 assets authored in editors
+- feathered runtime atlases baked client-side or in the runtime pipeline
+- Freedom Board consumes the feathered outputs only
+
+---
+
+## Rendering Semantics
+
+### Terrain
+
+Terrain smoothing no longer depends on old skirt/transition overlays. Freedom Board uses feathered tile rendering. Map Editor should not depend on the old generated transition PNGs.
+
+### Paths
+
+Path connectivity is intentionally asymmetric:
+- `PATH + WATER` connects only to adjacent water paths of the same type
+- `PATH + LAND` connects to adjacent land paths regardless of specific asset type
+
+This rule must remain aligned between Freedom Board and Map Editor.
+
+### Bridges
+
+Bridges are structural overlays derived from land paths crossing water. Their connectivity should match the effective land-path network above them.
+
+---
+
+## Character and Scripting Direction
+
+### Character feature model
+
+Character support exists in the runtime already:
+- placement
+- selection
+- movement targets
+- smooth interpolation
+- combat primitives
+- script execution support
+
+The architecture still needs the user-facing feature layer:
+- script editing and assignment
+- attack interaction
+- ranged attack presentation
+- multi-select and group commands
+- commander/follower behavior
+
+### Script scope
+
+The first scripting scope is character behavior scripting, not world-authoring or rules-authoring.
+
+Initial scripting focus:
+- move
+- face
+- attack
+- set animation
+- query nearby actors
+- build behaviors like patrol, chase, guard, and follow
+
+---
+
+## Current Architectural Constraints
+
+1. `core/` must remain testable off-target.
+2. Shared semantics must not drift between Freedom Board and Map Editor.
+3. Editors must remain 128x128 source-authoring surfaces.
+4. Runtime feathering must stay outside the editors.
+5. Persistent identity must move toward UUID-based saved references rather than positional ordering.
+6. Support modules are not considered complete until exposed as real product features.
+
+---
+
+## Authoritative Companion Docs
+
+Use these alongside this document:
+- `docs/VISION.md` for product direction
+- `docs/DECISIONS.md` for current ADRs and active design choices
+- `docs/NEXT_STEPS.md` for the actual execution plan
+- `docs/storage-architecture.md` for local-first persistence details
+- `docs/tile-rendering-system.md` for rendering and path semantics
+- `docs/freedom-board.md` for sparse-world/runtime details

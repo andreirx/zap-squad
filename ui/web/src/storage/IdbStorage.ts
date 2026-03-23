@@ -148,12 +148,28 @@ export class IdbStorage implements StorageGateway {
     const key = this._key(path);
     const ct = contentType || (this._isBinaryPath(path) ? 'image/png' : 'application/octet-stream');
 
+    // 1. Write to IDB (primary persistence)
     await fileStore.save(key, data, ct);
     this.knownPaths.add(key);
 
-    // Create/update blob URL so getReadUrl() returns it immediately
+    // 2. In dev mode, also write to disk via Vite endpoint.
+    //    This keeps public/mods/ in sync so bake-atlases reads the latest data.
+    if (import.meta.env.DEV) {
+      try {
+        const fullPath = `public/${this.basePath}/${path}`;
+        const base64 = arrayBufferToBase64(data);
+        await fetch('/__write-file', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: fullPath, content: base64 }),
+        });
+      } catch {
+        // Disk write failed — IDB still has the data, not critical
+      }
+    }
+
+    // 3. Create/update blob URL so getReadUrl() returns it immediately
     if (this._isBinaryPath(path)) {
-      // Revoke old blob URL if exists
       const old = this.blobUrls.get(key);
       if (old) URL.revokeObjectURL(old);
 
@@ -180,9 +196,7 @@ export class IdbStorage implements StorageGateway {
       }
     }
 
-    // 2. In dev mode, also fetch CDN/local listing (for seed assets not yet cached).
-    //    The /__list-files endpoint only exists on the Vite dev server.
-    //    In production there is no such endpoint, so skip the fetch entirely.
+    // 2. Try /__list-files endpoint (Vite dev server only).
     if (import.meta.env.DEV) {
       try {
         const cdnPrefix = `public/${this.basePath}/${prefix}`;
@@ -194,8 +208,39 @@ export class IdbStorage implements StorageGateway {
             idbPaths.add(f.startsWith(`public/${this.basePath}/`) ? f.slice(cdnBaseLen) : f);
           }
         }
+      } catch (err) {
+        console.warn('[IdbStorage] /__list-files fetch failed, trying manifest fallback:', err);
+      }
+    }
+
+    // 3. Manifest fallback: if still empty, derive file listing from manifest.json.
+    //    The manifest lists all seed assets with their IDs. We synthesize the
+    //    directory structure that editors expect (e.g., tiles/{id}/definition.json).
+    //    This works even when /__list-files is blocked (Safari COEP) or in production.
+    if (idbPaths.size === 0) {
+      try {
+        const manifestUrl = this.basePath === 'assets'
+          ? '/assets/manifest.json'
+          : '/assets/manifest.json';
+        const resp = await fetch(manifestUrl);
+        if (resp.ok) {
+          const manifest = await resp.json() as Record<string, Record<string, { id: string }>>;
+          // Map prefix to manifest section: "tiles" → manifest.tiles, etc.
+          const section = prefix.replace(/\/$/, ''); // "tiles", "characters", "weapons", "levels"
+          const entries = manifest[section];
+          if (entries && typeof entries === 'object') {
+            for (const id of Object.keys(entries)) {
+              // Synthesize paths the editors scan for
+              idbPaths.add(`${section}/${id}/definition.json`);
+              idbPaths.add(`${section}/${id}/properties.json`);
+            }
+          }
+          if (idbPaths.size > 0) {
+            console.log(`[IdbStorage] manifest fallback: found ${idbPaths.size} paths for "${prefix}"`);
+          }
+        }
       } catch {
-        // Dev server endpoint unavailable — IDB-only paths are sufficient
+        // Manifest also unavailable — truly empty
       }
     }
 
@@ -258,4 +303,14 @@ export class IdbStorage implements StorageGateway {
     // Fall back to CDN/local URL (works for seed assets on disk)
     return `/${this.basePath}/${path}`;
   }
+}
+
+/** Convert ArrayBuffer to base64 string. */
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
 }
