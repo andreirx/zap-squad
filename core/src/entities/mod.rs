@@ -13,6 +13,10 @@ mod script;
 /// Self-contained module, no dependencies on other entities.
 pub mod freedom_board;
 
+/// Game Rules — teams, stats, resources, time models, events, and validation.
+/// The domain model for playable games built on the freedom board substrate.
+pub mod game_rules;
+
 pub use actor::{Actor, ActorId};
 pub use composite_actor::{AnimationState, CompositeActor, Direction, VisualState};
 pub use game_state::GameState;

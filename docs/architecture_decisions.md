@@ -66,7 +66,7 @@ The editor requires authentication (Cognito) for asset creation and storage.
 The game should be freely accessible without authentication.
 These have different security requirements and deployment lifecycles.
 
-This ADR has been superseded by the unified-app direction centered on Freedom Board. It is preserved here as project history.
+This ADR has been superseded by the unified-app direction centered on Freedom Board. It is preserved here as project history. We may still decide to add cognito-based tile submissions in the future, as a separate path for adding to the seed assets.
 
 ### Decision
 Split into two separate deployable applications:
