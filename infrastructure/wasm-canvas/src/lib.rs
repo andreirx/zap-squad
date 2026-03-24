@@ -64,6 +64,13 @@ use zapsquad_core::entities::freedom_board::{
 };
 use zapsquad_core::entities::{ActorId, AnimationState, CompositeActor, Direction, ScriptId};
 use zapsquad_adapters::script_bindings::{ScriptCommand, ScriptEngine, WorldQuery};
+use zapsquad_adapters::{RulesScriptEngine, RulesContext, RulesCommand, GameView, CharacterView, TeamView};
+use zapsquad_core::entities::game_rules::{
+    GameDefinition, GameSession, GamePhase, CharacterInstanceId, TeamId,
+    CharacterInstance, validate_game, IssueSeverity,
+};
+// Alias to avoid collision with zap_engine::GameEvent
+use zapsquad_core::entities::game_rules::GameEvent as RulesGameEvent;
 use zapsquad_core::use_cases::{apply_damage, calculate_damage, find_path_in_radius, InfiniteNavGrid};
 use zapsquad_core::use_cases::freedom_board::{
     connectivity_bitmask_with, draw_line, erase_rect, erase_tile, fill_rect, flood_fill, place_tile,
@@ -106,6 +113,8 @@ mod events {
 /// Game event kinds: WASM -> React
 mod game_events {
     pub const WORLD_STATS: u32 = 1;
+    /// Session state acknowledgment. a=state_code: 1=def_loaded, 2=playing, 3=stopped, 4=start_failed.
+    pub const SESSION_STATE: u32 = 2;
 }
 
 /// Editor tool modes.
@@ -259,6 +268,16 @@ impl<'a> InfiniteNavGrid for SparseWorldNav<'a> {
 ///
 /// Owns the SparseWorld and translates between the engine's entity system
 /// and the core's tile coordinate model.
+/// Snapshot of mutable state captured before entering play mode.
+/// Restored by stop_game_session() to ensure the board returns cleanly to edit state.
+struct PrePlaySnapshot {
+    characters: std::collections::HashMap<ActorId, CompositeActor>,
+    next_actor_id: u32,
+    selected_character: Option<ActorId>,
+    movement_targets: std::collections::HashMap<ActorId, glam::Vec2>,
+    waypoint_queues: std::collections::HashMap<ActorId, std::collections::VecDeque<glam::Vec2>>,
+}
+
 pub struct FreedomBoardGame {
     // ── Core state ──────────────────────────────────────────────────────
     world: SparseWorld,
@@ -305,6 +324,24 @@ pub struct FreedomBoardGame {
     // ── Scripting state ─────────────────────────────────────────────────
     /// Rhai script engine — compiles and executes .rhai scripts per frame.
     scripts: ScriptEngine,
+
+    // ── Game session orchestrator ────────────────────────────────────────
+    /// Loaded game definition. Set via `load_game_definition()` WASM export.
+    game_definition: Option<GameDefinition>,
+    /// Active game session. Created from game_definition via `start_game()`.
+    /// None when in edit mode, Some when playing.
+    game_session: Option<GameSession>,
+    /// Rhai engine for rules scripts. Separate from legacy AI engine.
+    rules_engine: RulesScriptEngine,
+    /// Reverse mapping: ActorId → CharacterInstanceId.
+    /// Built when characters are spawned during play, cleared on stop.
+    actor_to_instance: std::collections::HashMap<ActorId, CharacterInstanceId>,
+    /// Snapshot of edit-mode state captured before play. Restored on stop_game().
+    /// Ensures repeated start/stop cycles don't pollute the board with session artifacts.
+    pre_play_snapshot: Option<PrePlaySnapshot>,
+    /// Pending session state events to emit to React. Drained in update() where ctx is available.
+    /// Values: 1=def_loaded, 2=playing, 3=stopped, 4=start_failed.
+    pending_session_events: Vec<u32>,
 
     // ── Rendering state ─────────────────────────────────────────────────
     /// Engine entity IDs currently spawned for visible tiles.
@@ -365,6 +402,13 @@ impl FreedomBoardGame {
             movement_targets: std::collections::HashMap::new(),
             waypoint_queues: std::collections::HashMap::new(),
             scripts: ScriptEngine::new(),
+
+            game_definition: None,
+            game_session: None,
+            rules_engine: RulesScriptEngine::new(),
+            actor_to_instance: std::collections::HashMap::new(),
+            pre_play_snapshot: None,
+            pending_session_events: Vec::new(),
 
             tile_entities: Vec::new(),
             last_rendered_generation: u64::MAX, // force initial render
@@ -860,6 +904,547 @@ impl FreedomBoardGame {
                     i, info.name, info.tile_type, info.terrain_type, info.passable, info.movement_cost
                 ).into(),
             );
+        }
+    }
+
+    // ── Game Session Orchestrator ──────────────────────────────────────────
+    //
+    // Drives the GameSession lifecycle: emit events, execute rules script,
+    // apply commands. Only runs when game_session is Some (play mode).
+
+    /// Check pending game session thread-locals. Called at start of update().
+    fn check_pending_game_session(&mut self) {
+        // Load game definition
+        PENDING_GAME_DEF.with(|p| {
+            if let Some(json) = p.borrow_mut().take() {
+                match serde_json::from_str::<GameDefinition>(&json) {
+                    Ok(def) => {
+                        web_sys::console::log_1(
+                            &format!("[orchestrator] loaded game definition: '{}' mode={:?}", def.name, def.mode).into(),
+                        );
+                        // Compile the rules script if we have source for it
+                        let rules_name = def.rules_script.clone();
+                        self.game_definition = Some(def);
+                        self.pending_session_events.push(1); // def_loaded
+                        if !rules_name.is_empty() && !self.rules_engine.has_script(&rules_name) {
+                            web_sys::console::log_1(
+                                &format!("[orchestrator] rules script '{}' not yet compiled — load it via reload_scripts()", rules_name).into(),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        web_sys::console::error_1(
+                            &format!("[orchestrator] failed to parse game definition: {}", e).into(),
+                        );
+                    }
+                }
+            }
+        });
+
+        // Start game
+        let should_start = PENDING_START_GAME.with(|p| {
+            let v = *p.borrow();
+            *p.borrow_mut() = false;
+            v
+        });
+        if should_start {
+            self.start_game_session();
+        }
+
+        // Stop game
+        let should_stop = PENDING_STOP_GAME.with(|p| {
+            let v = *p.borrow();
+            *p.borrow_mut() = false;
+            v
+        });
+        if should_stop {
+            self.stop_game_session();
+        }
+    }
+
+    /// Create a GameSession from the loaded definition and begin play.
+    /// Runs authoritative validation first — refuses to start if not playable.
+    fn start_game_session(&mut self) {
+        let def = match &self.game_definition {
+            Some(d) => d,
+            None => {
+                web_sys::console::error_1(&"[orchestrator] cannot start: no game definition loaded".into());
+                return;
+            }
+        };
+
+        // Authoritative validation gate — same validator as wasm-validator crate
+        let validation = validate_game(def);
+        if !validation.is_playable() {
+            for issue in validation.errors() {
+                web_sys::console::error_1(
+                    &format!("[orchestrator] validation error: {}", issue.message).into(),
+                );
+            }
+            for issue in validation.warnings() {
+                web_sys::console::warn_1(
+                    &format!("[orchestrator] validation warning: {}", issue.message).into(),
+                );
+            }
+            web_sys::console::error_1(
+                &format!("[orchestrator] cannot start: {} errors, {} warnings",
+                    validation.errors().len(), validation.warnings().len()).into(),
+            );
+            self.pending_session_events.push(4); // start_failed
+            return;
+        }
+        // Log warnings even for valid definitions
+        for issue in validation.warnings() {
+            web_sys::console::warn_1(
+                &format!("[orchestrator] warning: {}", issue.message).into(),
+            );
+        }
+
+        // Snapshot edit-mode state before play mutations begin
+        self.pre_play_snapshot = Some(PrePlaySnapshot {
+            characters: self.characters.clone(),
+            next_actor_id: self.next_actor_id,
+            selected_character: self.selected_character,
+            movement_targets: self.movement_targets.clone(),
+            waypoint_queues: self.waypoint_queues.clone(),
+        });
+
+        let mut session = GameSession::from_definition(def);
+
+        // Emit GameStart event
+        session.events.push(RulesGameEvent::GameStart);
+
+        // Transition from Setup to Exploration
+        session.transition(GamePhase::Exploration);
+
+        web_sys::console::log_1(
+            &format!(
+                "[orchestrator] game started: '{}' mode={:?} teams={} templates={}",
+                def.name, def.mode, session.teams.len(), def.character_templates.len()
+            ).into(),
+        );
+
+        self.game_session = Some(session);
+        self.pending_session_events.push(2); // playing
+    }
+
+    /// Stop the active game session and restore pre-play edit-mode state.
+    /// All actors spawned during play are removed. Pre-existing actors are restored.
+    fn stop_game_session(&mut self) {
+        if self.game_session.is_none() {
+            return;
+        }
+
+        self.game_session = None;
+        self.actor_to_instance.clear();
+
+        // Restore edit-mode state from snapshot
+        if let Some(snapshot) = self.pre_play_snapshot.take() {
+            self.characters = snapshot.characters;
+            self.next_actor_id = snapshot.next_actor_id;
+            self.selected_character = snapshot.selected_character;
+            self.movement_targets = snapshot.movement_targets;
+            self.waypoint_queues = snapshot.waypoint_queues;
+            self.characters_dirty = true;
+            self.character_generation += 1;
+            web_sys::console::log_1(&"[orchestrator] game stopped, edit-mode state restored".into());
+        } else {
+            web_sys::console::warn_1(&"[orchestrator] game stopped but no snapshot to restore".into());
+        }
+        self.pending_session_events.push(3); // stopped
+    }
+
+    /// Run one orchestrator tick. Called from update() when a session is active.
+    /// Emits events, executes the rules script, applies commands.
+    fn run_orchestrator(&mut self, dt: f32) {
+        // Only run if we have an active session
+        let session = match &mut self.game_session {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Don't run if game has ended
+        if matches!(session.phase, GamePhase::Ended { .. }) {
+            return;
+        }
+
+        // Emit Tick event for real-time modes
+        match session.mode {
+            zapsquad_core::entities::game_rules::GameMode::RealTime
+            | zapsquad_core::entities::game_rules::GameMode::Tactical => {
+                if matches!(session.phase, GamePhase::Exploration) {
+                    session.tick(dt);
+                    session.events.push(RulesGameEvent::Tick { dt });
+                }
+            }
+            zapsquad_core::entities::game_rules::GameMode::TurnBased => {
+                // TurnBased: events emitted on turn transitions, not per-frame
+            }
+        }
+
+        // Drain events and execute rules script
+        let events = session.events.drain();
+        if events.is_empty() {
+            return;
+        }
+
+        // Get the rules script name from the definition
+        let rules_script_name = match &self.game_definition {
+            Some(def) if !def.rules_script.is_empty() => def.rules_script.clone(),
+            _ => return, // no rules script to run
+        };
+
+        if !self.rules_engine.has_script(&rules_script_name) {
+            return; // script not compiled yet
+        }
+
+        // Build GameView snapshot for the rules context
+        let game_view = self.build_game_view();
+
+        // Execute rules script for each event
+        let mut all_commands: Vec<RulesCommand> = Vec::new();
+        for event in &events {
+            let (event_name, event_data, event_strings) = self.event_to_dto(event);
+            let ctx = RulesContext::new(game_view.clone(), event_name, event_data, event_strings);
+
+            match self.rules_engine.run_on_event(&rules_script_name, ctx) {
+                Ok(cmds) => all_commands.extend(cmds),
+                Err(e) => {
+                    web_sys::console::error_1(
+                        &format!("[orchestrator] rules script error: {}", e).into(),
+                    );
+                }
+            }
+        }
+
+        // Apply all commands to the session
+        for cmd in all_commands {
+            self.apply_rules_command(cmd);
+        }
+    }
+
+    /// Build a GameView DTO from the current session + actor state.
+    fn build_game_view(&self) -> GameView {
+        let session = match &self.game_session {
+            Some(s) => s,
+            None => return GameView {
+                mode: String::new(), phase: String::new(), clock: 0.0,
+                turn_number: 0, active_team_id: None, teams: vec![], characters: vec![],
+            },
+        };
+
+        GameView {
+            mode: format!("{:?}", session.mode),
+            phase: format!("{:?}", session.phase),
+            clock: session.clock,
+            turn_number: session.turn_number,
+            active_team_id: session.active_team.map(|t| t.0),
+            teams: session.teams.iter().map(|t| TeamView {
+                id: t.id.0,
+                name: t.name.clone(),
+                resources: t.resources.clone(),
+                eliminated: t.eliminated,
+                unit_count: session.team_characters(t.id).len(),
+            }).collect(),
+            characters: session.characters.values().map(|c| {
+                // Cross-reference actor position
+                let (x, y) = c.actor_id
+                    .and_then(|aid| self.characters.get(&aid))
+                    .map(|actor| (actor.position.x, actor.position.y))
+                    .unwrap_or((0.0, 0.0));
+                CharacterView {
+                    instance_id: c.id.0,
+                    team_id: c.team_id.0,
+                    x, y,
+                    stats: c.stats.clone(),
+                    alive: c.alive,
+                    tags: vec![], // no tags on CharacterInstance (tags are on templates)
+                }
+            }).collect(),
+        }
+    }
+
+    /// Convert a GameEvent to (name, numeric_data, string_data) for RulesContext.
+    ///
+    /// Event names are always the base type: "StatChanged", "ZoneEntered", "Custom", etc.
+    /// String parameters (stat_key, resource_key, zone_id, custom name) go into string_data.
+    /// Numeric parameters (dt, damage, team_id, etc.) go into numeric_data.
+    fn event_to_dto(&self, event: &RulesGameEvent) -> (String, std::collections::HashMap<String, f64>, std::collections::HashMap<String, String>) {
+        let mut data = std::collections::HashMap::<String, f64>::new();
+        let mut strings = std::collections::HashMap::<String, String>::new();
+        let name = match event {
+            RulesGameEvent::GameStart => "GameStart".to_string(),
+            RulesGameEvent::Tick { dt } => {
+                data.insert("dt".into(), *dt as f64);
+                "Tick".to_string()
+            }
+            RulesGameEvent::TurnStart { team, turn_number } => {
+                data.insert("team_id".into(), team.0 as f64);
+                data.insert("turn_number".into(), *turn_number as f64);
+                "TurnStart".to_string()
+            }
+            RulesGameEvent::TurnEnd { team, turn_number } => {
+                data.insert("team_id".into(), team.0 as f64);
+                data.insert("turn_number".into(), *turn_number as f64);
+                "TurnEnd".to_string()
+            }
+            RulesGameEvent::EncounterTriggered { teams } => {
+                data.insert("team_a".into(), teams.0 .0 as f64);
+                data.insert("team_b".into(), teams.1 .0 as f64);
+                "EncounterTriggered".to_string()
+            }
+            RulesGameEvent::PlanningStart => "PlanningStart".to_string(),
+            RulesGameEvent::PlanningEnd => "PlanningEnd".to_string(),
+            RulesGameEvent::ResolutionStart => "ResolutionStart".to_string(),
+            RulesGameEvent::ResolutionEnd => "ResolutionEnd".to_string(),
+            RulesGameEvent::EncounterResolved => "EncounterResolved".to_string(),
+            RulesGameEvent::UnitSpawned { character_id, team } => {
+                data.insert("character_id".into(), character_id.0 as f64);
+                data.insert("team_id".into(), team.0 as f64);
+                "UnitSpawned".to_string()
+            }
+            RulesGameEvent::UnitDamaged { character_id, attacker_id, damage, remaining_hp } => {
+                data.insert("character_id".into(), character_id.0 as f64);
+                if let Some(a) = attacker_id { data.insert("attacker_id".into(), a.0 as f64); }
+                data.insert("damage".into(), *damage as f64);
+                data.insert("remaining_hp".into(), *remaining_hp as f64);
+                "UnitDamaged".to_string()
+            }
+            RulesGameEvent::UnitKilled { character_id, killer_id } => {
+                data.insert("character_id".into(), character_id.0 as f64);
+                if let Some(k) = killer_id { data.insert("killer_id".into(), k.0 as f64); }
+                "UnitKilled".to_string()
+            }
+            RulesGameEvent::StatChanged { character_id, stat_key, old_value, new_value } => {
+                data.insert("character_id".into(), character_id.0 as f64);
+                data.insert("old_value".into(), *old_value as f64);
+                data.insert("new_value".into(), *new_value as f64);
+                strings.insert("stat_key".into(), stat_key.clone());
+                "StatChanged".to_string()
+            }
+            RulesGameEvent::ResourceChanged { team, resource_key, old_value, new_value } => {
+                data.insert("team_id".into(), team.0 as f64);
+                data.insert("old_value".into(), *old_value as f64);
+                data.insert("new_value".into(), *new_value as f64);
+                strings.insert("resource_key".into(), resource_key.clone());
+                "ResourceChanged".to_string()
+            }
+            RulesGameEvent::WaveStart { wave_number } => {
+                data.insert("wave_number".into(), *wave_number as f64);
+                "WaveStart".to_string()
+            }
+            RulesGameEvent::WaveComplete { wave_number } => {
+                data.insert("wave_number".into(), *wave_number as f64);
+                "WaveComplete".to_string()
+            }
+            RulesGameEvent::ZoneEntered { character_id, zone_id } => {
+                data.insert("character_id".into(), character_id.0 as f64);
+                strings.insert("zone_id".into(), zone_id.clone());
+                "ZoneEntered".to_string()
+            }
+            RulesGameEvent::ZoneExited { character_id, zone_id } => {
+                data.insert("character_id".into(), character_id.0 as f64);
+                strings.insert("zone_id".into(), zone_id.clone());
+                "ZoneExited".to_string()
+            }
+            RulesGameEvent::Custom { name, data: custom_data } => {
+                for (k, v) in custom_data {
+                    data.insert(k.clone(), *v as f64);
+                }
+                strings.insert("custom_name".into(), name.clone());
+                "Custom".to_string()
+            }
+        };
+        (name, data, strings)
+    }
+
+    /// Apply a single RulesCommand to the game session and world state.
+    fn apply_rules_command(&mut self, cmd: RulesCommand) {
+        match cmd {
+            RulesCommand::Log(msg) => {
+                web_sys::console::log_1(&format!("[rules] {}", msg).into());
+            }
+            RulesCommand::SpawnUnit { template_id, team_id, x, y, individual } => {
+                let session = match &mut self.game_session {
+                    Some(s) => s,
+                    None => return,
+                };
+                let def = match &self.game_definition {
+                    Some(d) => d,
+                    None => return,
+                };
+
+                // Find the template
+                let template = def.character_templates.iter()
+                    .find(|t| t.id.0 == template_id);
+                let template = match template {
+                    Some(t) => t,
+                    None => {
+                        web_sys::console::error_1(
+                            &format!("[orchestrator] SpawnUnit: template '{}' not found", template_id).into(),
+                        );
+                        return;
+                    }
+                };
+
+                // Create domain instance
+                let instance_id = session.next_character_id();
+                let tid = TeamId(team_id);
+                let mut instance = CharacterInstance::from_template(instance_id, tid, template, individual);
+
+                // Create rendering actor
+                let actor_id = ActorId(self.next_actor_id);
+                self.next_actor_id += 1;
+                let mut actor = CompositeActor::new(actor_id, Vec2::new(x, y), &template.body_def_id);
+                actor.weapon_def_id = template.weapon_def_id.clone();
+                actor.throwable_def_id = template.throwable_def_id.clone();
+                actor.tag = format!("team_{}", team_id);
+                if let Some(&hp) = template.base_stats.get("hp") {
+                    actor.health = hp as i32;
+                    actor.max_health = hp as i32;
+                }
+
+                // Link domain ↔ rendering
+                instance.attach_actor(actor_id);
+                self.actor_to_instance.insert(actor_id, instance_id);
+
+                // Store both
+                session.add_character(instance);
+                self.characters.insert(actor_id, actor);
+                self.characters_dirty = true;
+                self.character_generation += 1;
+
+                // Emit event
+                session.events.push(RulesGameEvent::UnitSpawned {
+                    character_id: instance_id,
+                    team: tid,
+                });
+
+                web_sys::console::log_1(
+                    &format!("[orchestrator] spawned '{}' (instance={}, actor={}) at ({}, {})",
+                        template.name, instance_id.0, actor_id.0, x, y).into(),
+                );
+            }
+            RulesCommand::KillUnit { character_id } => {
+                let session = match &mut self.game_session {
+                    Some(s) => s,
+                    None => return,
+                };
+                let cid = CharacterInstanceId(character_id);
+                if let Some(instance) = session.character_mut(cid) {
+                    instance.alive = false;
+                    if let Some(actor_id) = instance.actor_id {
+                        self.characters.remove(&actor_id);
+                        self.movement_targets.remove(&actor_id);
+                        self.waypoint_queues.remove(&actor_id);
+                        self.actor_to_instance.remove(&actor_id);
+                        self.characters_dirty = true;
+                        self.character_generation += 1;
+                    }
+                    session.events.push(RulesGameEvent::UnitKilled {
+                        character_id: cid,
+                        killer_id: None,
+                    });
+                }
+            }
+            RulesCommand::ModifyStat { character_id, stat_key, delta } => {
+                let session = match &mut self.game_session {
+                    Some(s) => s,
+                    None => return,
+                };
+                let cid = CharacterInstanceId(character_id);
+                if let Some(instance) = session.character_mut(cid) {
+                    let old = instance.stat(&stat_key);
+                    let new_val = instance.modify_stat(&stat_key, delta);
+                    session.events.push(RulesGameEvent::StatChanged {
+                        character_id: cid,
+                        stat_key,
+                        old_value: old,
+                        new_value: new_val,
+                    });
+                }
+            }
+            RulesCommand::SetStat { character_id, stat_key, value } => {
+                let session = match &mut self.game_session {
+                    Some(s) => s,
+                    None => return,
+                };
+                let cid = CharacterInstanceId(character_id);
+                if let Some(instance) = session.character_mut(cid) {
+                    let old = instance.stat(&stat_key);
+                    instance.set_stat(&stat_key, value);
+                    session.events.push(RulesGameEvent::StatChanged {
+                        character_id: cid,
+                        stat_key,
+                        old_value: old,
+                        new_value: value,
+                    });
+                }
+            }
+            RulesCommand::ModifyResource { team_id, resource_key, delta } => {
+                let session = match &mut self.game_session {
+                    Some(s) => s,
+                    None => return,
+                };
+                let tid = TeamId(team_id);
+                if let Some(team) = session.team_mut(tid) {
+                    let old = team.resources.get(&resource_key).copied().unwrap_or(0.0);
+                    let entry = team.resources.entry(resource_key.clone()).or_insert(0.0);
+                    *entry += delta;
+                    let new_val = *entry;
+                    session.events.push(RulesGameEvent::ResourceChanged {
+                        team: tid,
+                        resource_key,
+                        old_value: old,
+                        new_value: new_val,
+                    });
+                }
+            }
+            RulesCommand::SetPhase(phase_str) => {
+                let session = match &mut self.game_session {
+                    Some(s) => s,
+                    None => return,
+                };
+                // Parse phase string to GamePhase
+                let phase = match phase_str.as_str() {
+                    "Setup" => GamePhase::Setup,
+                    "Exploration" => GamePhase::Exploration,
+                    "EncounterDecision" => GamePhase::EncounterDecision,
+                    "EncounterResolution" => GamePhase::EncounterResolution,
+                    _ => {
+                        web_sys::console::error_1(
+                            &format!("[orchestrator] unknown phase: '{}'", phase_str).into(),
+                        );
+                        return;
+                    }
+                };
+                session.transition(phase);
+            }
+            RulesCommand::EndGame { winner_team_id } => {
+                let session = match &mut self.game_session {
+                    Some(s) => s,
+                    None => return,
+                };
+                let winner = winner_team_id.map(TeamId);
+                session.transition(GamePhase::Ended { winner });
+                web_sys::console::log_1(
+                    &format!("[orchestrator] game ended. winner: {:?}", winner).into(),
+                );
+            }
+            RulesCommand::EmitEvent { name, data } => {
+                let session = match &mut self.game_session {
+                    Some(s) => s,
+                    None => return,
+                };
+                // Convert HashMap<String, f32> → Stats
+                let stats_data: std::collections::HashMap<String, f32> = data.into_iter()
+                    .map(|(k, v)| (k, v as f32))
+                    .collect();
+                session.events.push(RulesGameEvent::Custom {
+                    name,
+                    data: stats_data,
+                });
+            }
         }
     }
 
@@ -1765,9 +2350,10 @@ impl Game for FreedomBoardGame {
             }
         });
 
-        // 0f. Check for pending script reload
+        // 0f. Check for pending script reload (both legacy AI and rules engines)
         PENDING_SCRIPTS.with(|p| {
             if let Some(scripts) = p.borrow_mut().take() {
+                // Legacy AI engine
                 self.scripts.clear_scripts();
                 let mut ok = 0u32;
                 let mut fail = 0u32;
@@ -1776,17 +2362,36 @@ impl Game for FreedomBoardGame {
                         Ok(_) => ok += 1,
                         Err(e) => {
                             web_sys::console::error_1(
-                                &format!("[freedom-board] script '{}' compile error: {:?}", name, e).into(),
+                                &format!("[freedom-board] AI script '{}' compile error: {:?}", name, e).into(),
                             );
                             fail += 1;
                         }
                     }
                 }
+                // Rules engine — compile the same scripts (rules scripts call on_event, not update)
+                self.rules_engine.clear_scripts();
+                let mut rules_ok = 0u32;
+                let mut rules_fail = 0u32;
+                for (name, source) in &scripts {
+                    match self.rules_engine.compile_script(name, source) {
+                        Ok(_) => rules_ok += 1,
+                        Err(e) => {
+                            web_sys::console::error_1(
+                                &format!("[freedom-board] rules script '{}' compile error: {:?}", name, e).into(),
+                            );
+                            rules_fail += 1;
+                        }
+                    }
+                }
                 web_sys::console::log_1(
-                    &format!("[freedom-board] scripts reloaded: {} ok, {} failed", ok, fail).into(),
+                    &format!("[freedom-board] scripts reloaded: AI {}/{}, rules {}/{}",
+                        ok, ok + fail, rules_ok, rules_ok + rules_fail).into(),
                 );
             }
         });
+
+        // 0g. Check for pending game session operations (load def, start, stop)
+        self.check_pending_game_session();
 
         // 1. Process all custom events from React
         for event in input.iter() {
@@ -1795,7 +2400,10 @@ impl Game for FreedomBoardGame {
             }
         }
 
-        // 1b. Run Rhai scripts for characters with assigned script_ids
+        // 1a. Run game session orchestrator (emit events, execute rules script, apply commands)
+        self.run_orchestrator(1.0 / 60.0);
+
+        // 1b. Run Rhai scripts for characters with assigned script_ids (legacy AI path)
         self.run_scripts();
 
         // 1c. Update character movement (smooth interpolation toward targets)
@@ -1831,6 +2439,16 @@ impl Game for FreedomBoardGame {
 
         // 4. Emit stats to React
         self.emit_stats_if_changed(ctx);
+
+        // 5. Emit pending session state events to React
+        for code in self.pending_session_events.drain(..) {
+            ctx.emit_event(GameEvent {
+                kind: game_events::SESSION_STATE as f32,
+                a: code as f32,
+                b: 0.0,
+                c: 0.0,
+            });
+        }
     }
 
     fn render(&self, _ctx: &mut RenderContext) {
@@ -1866,6 +2484,15 @@ thread_local! {
     /// Map of script name → source code.
     static PENDING_SCRIPTS: std::cell::RefCell<Option<std::collections::HashMap<String, String>>> =
         std::cell::RefCell::new(None);
+    /// Queued game definition JSON. Set by `load_game_definition()`, consumed by update().
+    static PENDING_GAME_DEF: std::cell::RefCell<Option<String>> =
+        std::cell::RefCell::new(None);
+    /// Flag to start a game session. Set by `start_game()`, consumed by update().
+    static PENDING_START_GAME: std::cell::RefCell<bool> =
+        std::cell::RefCell::new(false);
+    /// Flag to stop the active game session. Set by `stop_game()`, consumed by update().
+    static PENDING_STOP_GAME: std::cell::RefCell<bool> =
+        std::cell::RefCell::new(false);
 }
 
 /// Load the tile asset registry. Called by the engine worker via `reload_game_manifest` dispatch.
@@ -2178,6 +2805,31 @@ pub fn reload_scripts(scripts_json: &str) {
             );
         }
     }
+}
+
+// ── Game session WASM exports ───────────────────────────────────────────────
+
+/// Load a GameDefinition from JSON. Parses and stores for later `start_game()`.
+/// Also compiles the rules script if present in the pending scripts cache.
+#[wasm_bindgen]
+pub fn load_game_definition(json: &str) {
+    PENDING_GAME_DEF.with(|p| *p.borrow_mut() = Some(json.to_string()));
+    web_sys::console::log_1(&"[freedom-board] game definition queued for loading".into());
+}
+
+/// Start a game session from the loaded GameDefinition.
+/// Requires a definition to be loaded first via `load_game_definition()`.
+#[wasm_bindgen]
+pub fn start_game() {
+    PENDING_START_GAME.with(|p| *p.borrow_mut() = true);
+    web_sys::console::log_1(&"[freedom-board] game start requested".into());
+}
+
+/// Stop the active game session and return to edit mode.
+#[wasm_bindgen]
+pub fn stop_game() {
+    PENDING_STOP_GAME.with(|p| *p.borrow_mut() = true);
+    web_sys::console::log_1(&"[freedom-board] game stop requested".into());
 }
 
 // Export the game using zap-web macro.

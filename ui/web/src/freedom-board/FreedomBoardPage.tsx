@@ -12,7 +12,7 @@ import {
   WeaponDefinition,
 } from './lib/manifest';
 import type { Tool, WorldStats, PendingPlacement, StampTile } from './types';
-import { worldStore } from '../lib/idb';
+import { worldStore, gameDefStore } from '../lib/idb';
 import type { WorldData } from '../lib/idb';
 
 // ── LDtk grid tile (matches MapEditor output) ────────────────────────
@@ -173,6 +173,49 @@ export function FreedomBoardPage() {
   // Last exported world data (for save-to-disk)
   const lastExportRef = useRef<WorldData | null>(null);
 
+  // ── Game session state ──────────────────────────────────────────────
+  // State is driven by WASM acknowledgment events (SESSION_STATE kind=2),
+  // not by optimistic local toggling. This prevents UI/runtime drift when
+  // validation rejects a start or WASM fails to parse a definition.
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [savedGameDefs, setSavedGameDefs] = useState<string[]>([]);
+  const [selectedGameDef, setSelectedGameDef] = useState<string | null>(null);
+  const [gameDefLoaded, setGameDefLoaded] = useState(false);
+  const sendEventRef = useRef<((msg: Record<string, unknown>) => void) | null>(null);
+
+  // Load saved game definitions list
+  useEffect(() => {
+    gameDefStore.list().then(names => {
+      setSavedGameDefs(names);
+      if (names.length > 0 && !selectedGameDef) {
+        setSelectedGameDef(names[0]);
+      }
+    });
+  }, []);
+
+  // Load the selected game definition into WASM when it changes
+  useEffect(() => {
+    if (!selectedGameDef || !sendEventRef.current) return;
+    setGameDefLoaded(false); // reset until WASM confirms
+    gameDefStore.load(selectedGameDef).then(record => {
+      if (!record) return;
+      const json = JSON.stringify(record.definition);
+      sendEventRef.current?.({ type: 'load_game_definition', json });
+      console.log(`[freedom-board] sent game definition to WASM: "${selectedGameDef}"`);
+    });
+  }, [selectedGameDef]);
+
+  const handlePlay = useCallback(() => {
+    if (!gameDefLoaded) return;
+    sendEventRef.current?.({ type: 'start_game' });
+    // Do NOT set isPlaying here — wait for WASM SESSION_STATE acknowledgment
+  }, [gameDefLoaded]);
+
+  const handleStop = useCallback(() => {
+    sendEventRef.current?.({ type: 'stop_game' });
+    // Do NOT set isPlaying here — wait for WASM SESSION_STATE acknowledgment
+  }, []);
+
   // ── Tool hotkeys (global) ────────────────────────────────────────
   // Matches the key labels shown in FBToolbar button tooltips.
   // Guarded against modifier keys (Ctrl/Meta/Alt bypass) and form focus.
@@ -216,8 +259,20 @@ export function FreedomBoardPage() {
 
   const handleGameEvent = useCallback((events: Array<{ kind: number; a: number; b: number; c: number }>) => {
     for (const e of events) {
-      if (e.kind === 1) {
+      if (e.kind === 1) { // WORLD_STATS
         setWorldStats({ tileCount: e.a, chunkCount: e.b });
+      } else if (e.kind === 2) { // SESSION_STATE — authoritative acknowledgment from WASM
+        const code = e.a;
+        if (code === 1) { // def_loaded
+          setGameDefLoaded(true);
+        } else if (code === 2) { // playing
+          setIsPlaying(true);
+        } else if (code === 3) { // stopped
+          setIsPlaying(false);
+        } else if (code === 4) { // start_failed
+          setIsPlaying(false);
+          console.warn('[freedom-board] game start failed — check console for validation errors');
+        }
       }
     }
   }, []);
@@ -366,7 +421,32 @@ export function FreedomBoardPage() {
         onSaveToDisk={handleSaveToDisk}
         onLoadFromDisk={handleLoadFromDisk}
         onWorldList={useCallback(() => setShowWorldList(true), [])}
+        isPlaying={isPlaying}
+        hasGameDef={gameDefLoaded}
+        onPlay={handlePlay}
+        onStop={handleStop}
       />
+      {/* Game definition selector — shown above canvas when not playing */}
+      {!isPlaying && savedGameDefs.length > 0 && (
+        <div style={{
+          padding: '4px 12px', background: '#0d1525', borderBottom: '1px solid #1a2a4a',
+          display: 'flex', gap: 8, alignItems: 'center', fontSize: 11,
+        }}>
+          <span style={{ color: '#556677' }}>Game Rules:</span>
+          <select
+            value={selectedGameDef ?? ''}
+            onChange={e => { setSelectedGameDef(e.target.value || null); setGameDefLoaded(false); }}
+            style={{
+              background: '#0f0f23', border: '1px solid #333', borderRadius: 4,
+              padding: '2px 6px', color: '#ccc', fontSize: 11,
+            }}
+          >
+            <option value="">(none)</option>
+            {savedGameDefs.map(name => <option key={name} value={name}>{name}</option>)}
+          </select>
+          {gameDefLoaded && <span style={{ color: '#4ecca3', fontSize: 10 }}>loaded</span>}
+        </div>
+      )}
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
         <AssetPanel
           tiles={tiles}
@@ -396,6 +476,9 @@ export function FreedomBoardPage() {
             onCameraChange={setCameraState}
             onGameEvent={handleGameEvent}
             onWorldExport={handleWorldExport}
+            onSendEventReady={useCallback((fn: (msg: Record<string, unknown>) => void) => {
+              sendEventRef.current = fn;
+            }, [])}
           />
         </div>
       </div>

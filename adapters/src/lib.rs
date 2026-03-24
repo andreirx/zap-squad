@@ -26,4 +26,5 @@ pub use game_script_bindings::{
     CharacterAiContext, RulesContext, WorldGenContext,
     AiCommand, RulesCommand, WorldGenCommand,
     GameView, CharacterView, TeamView,
+    RulesScriptEngine,
 };

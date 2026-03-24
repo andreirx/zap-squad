@@ -105,6 +105,9 @@ interface InfiniteCanvasProps {
   onGameEvent: (events: Array<{ kind: number; a: number; b: number; c: number }>) => void;
   /** Called when WASM exports world JSON (for parent to handle save-to-disk). */
   onWorldExport?: (worldData: WorldData) => void;
+  /** Called once the WASM sendEvent function is available. Parent uses this to send
+   *  messages to WASM (e.g., load_game_definition, start_game, stop_game). */
+  onSendEventReady?: (sendEvent: (msg: Record<string, unknown>) => void) => void;
 }
 
 /**
@@ -151,6 +154,7 @@ export function InfiniteCanvas({
   onCameraChange,
   onGameEvent,
   onWorldExport,
+  onSendEventReady,
 }: InfiniteCanvasProps) {
   // ── Camera state (local, sent to WASM on change) ──────────────────
   const cameraRef = useRef({ x: -5, y: -5, zoom: 64 });
@@ -308,6 +312,13 @@ export function InfiniteCanvas({
   // Stable ref for sendEvent (used in timer callback to avoid stale closure)
   const sendEventRef = useRef(sendEvent);
   sendEventRef.current = sendEvent;
+
+  // Expose sendEvent to parent for game session control
+  useEffect(() => {
+    if (sendEvent && onSendEventReady) {
+      onSendEventReady(sendEvent);
+    }
+  }, [sendEvent, onSendEventReady]);
 
   // ── Projection scale factor ─────────────────────────────────────
   //

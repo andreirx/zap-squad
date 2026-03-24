@@ -249,16 +249,26 @@ impl CharacterAiContext {
 pub struct RulesContext {
     pub game: GameView,
     pub event_name: String,
+    /// Numeric event parameters (e.g., dt, damage, team_id, old_value, new_value).
     pub event_data: HashMap<String, f64>,
+    /// String event parameters (e.g., stat_key, resource_key, zone_id, custom event name).
+    /// Avoids encoding strings into event_name or losing typed data at the DTO boundary.
+    pub event_strings: HashMap<String, String>,
     commands: Arc<Mutex<Vec<RulesCommand>>>,
 }
 
 impl RulesContext {
-    pub fn new(game: GameView, event_name: String, event_data: HashMap<String, f64>) -> Self {
+    pub fn new(
+        game: GameView,
+        event_name: String,
+        event_data: HashMap<String, f64>,
+        event_strings: HashMap<String, String>,
+    ) -> Self {
         Self {
             game,
             event_name,
             event_data,
+            event_strings,
             commands: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -413,6 +423,135 @@ impl WorldGenContext {
     }
 }
 
+// ── Rules Script Engine ─────────────────────────────────────────────────────
+//
+// Separate Rhai Engine instance for rules scripts. Registers only the
+// RulesContext type and its methods — no AI or WorldGen types leak in.
+// Compile + AST cache follows the same pattern as ScriptEngine.
+
+use rhai::{Engine, Scope, AST, EvalAltResult};
+
+/// Rhai engine for rules scripts. Isolated from AI and WorldGen scopes.
+///
+/// Rules scripts define an `on_event(ctx)` function. The orchestrator calls
+/// it once per event with a `RulesContext` containing the game state snapshot
+/// and event metadata. The script emits commands via `cmd_*` methods.
+pub struct RulesScriptEngine {
+    engine: Engine,
+    scripts: HashMap<String, AST>,
+}
+
+impl RulesScriptEngine {
+    pub fn new() -> Self {
+        let mut engine = Engine::new();
+
+        // ── Register RulesContext type ───────────────────────────────
+        engine.register_type_with_name::<RulesContext>("RulesCtx");
+
+        // ── Event metadata accessors ────────────────────────────────
+        engine.register_get("event_name", |ctx: &mut RulesContext| ctx.event_name.clone());
+        engine.register_fn("event_data", |ctx: &mut RulesContext, key: String| -> f64 {
+            ctx.event_data.get(&key).copied().unwrap_or(0.0)
+        });
+        engine.register_fn("event_string", |ctx: &mut RulesContext, key: String| -> String {
+            ctx.event_strings.get(&key).cloned().unwrap_or_default()
+        });
+
+        // ── Command methods ─────────────────────────────────────────
+        engine.register_fn("cmd_spawn", |ctx: &mut RulesContext, template_id: String, team_id: i64, x: f64, y: f64| {
+            ctx.cmd_spawn(template_id, team_id, x, y);
+        });
+        engine.register_fn("cmd_spawn_individual", |ctx: &mut RulesContext, template_id: String, team_id: i64, x: f64, y: f64| {
+            ctx.cmd_spawn_individual(template_id, team_id, x, y);
+        });
+        engine.register_fn("cmd_kill", |ctx: &mut RulesContext, character_id: i64| {
+            ctx.cmd_kill(character_id);
+        });
+        engine.register_fn("cmd_modify_stat", |ctx: &mut RulesContext, character_id: i64, stat_key: String, delta: f64| {
+            ctx.cmd_modify_stat(character_id, stat_key, delta);
+        });
+        engine.register_fn("cmd_set_stat", |ctx: &mut RulesContext, character_id: i64, stat_key: String, value: f64| {
+            ctx.cmd_set_stat(character_id, stat_key, value);
+        });
+        engine.register_fn("cmd_modify_resource", |ctx: &mut RulesContext, team_id: i64, resource_key: String, delta: f64| {
+            ctx.cmd_modify_resource(team_id, resource_key, delta);
+        });
+        engine.register_fn("cmd_end_game", |ctx: &mut RulesContext, winner_team_id: i64| {
+            ctx.cmd_end_game(winner_team_id);
+        });
+        engine.register_fn("cmd_log", |ctx: &mut RulesContext, msg: String| {
+            ctx.cmd_log(msg);
+        });
+
+        // ── Query methods ───────────────────────────────────────────
+        engine.register_fn("query_team_resource", |ctx: &mut RulesContext, team_id: i64, key: String| -> f64 {
+            ctx.query_team_resource(team_id, key)
+        });
+        engine.register_fn("query_unit_stat", |ctx: &mut RulesContext, character_id: i64, key: String| -> f64 {
+            ctx.query_unit_stat(character_id, key)
+        });
+        engine.register_fn("query_alive_count", |ctx: &mut RulesContext, team_id: i64| -> i64 {
+            ctx.query_alive_count(team_id)
+        });
+        engine.register_fn("query_phase", |ctx: &mut RulesContext| -> String {
+            ctx.query_phase()
+        });
+        engine.register_fn("query_clock", |ctx: &mut RulesContext| -> f64 {
+            ctx.query_clock()
+        });
+        engine.register_fn("query_turn", |ctx: &mut RulesContext| -> i64 {
+            ctx.query_turn()
+        });
+
+        Self { engine, scripts: HashMap::new() }
+    }
+
+    /// Compile a rules script and cache the AST.
+    pub fn compile_script(&mut self, name: &str, source: &str) -> Result<(), Box<EvalAltResult>> {
+        let ast = self.engine.compile(source)?;
+        self.scripts.insert(name.to_string(), ast);
+        Ok(())
+    }
+
+    /// Check if a named script exists.
+    pub fn has_script(&self, name: &str) -> bool {
+        self.scripts.contains_key(name)
+    }
+
+    /// Remove a compiled script.
+    pub fn remove_script(&mut self, name: &str) {
+        self.scripts.remove(name);
+    }
+
+    /// Remove all compiled scripts.
+    pub fn clear_scripts(&mut self) {
+        self.scripts.clear();
+    }
+
+    /// List all compiled script names.
+    pub fn list_scripts(&self) -> Vec<&str> {
+        self.scripts.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Execute a rules script's `on_event(ctx)` function.
+    ///
+    /// Returns the commands emitted by the script, or an error if
+    /// the script is not found or execution fails.
+    pub fn run_on_event(
+        &self,
+        script_name: &str,
+        ctx: RulesContext,
+    ) -> Result<Vec<RulesCommand>, Box<EvalAltResult>> {
+        let ast = self.scripts.get(script_name)
+            .ok_or_else(|| -> Box<EvalAltResult> {
+                format!("Rules script '{}' not found", script_name).into()
+            })?;
+        let mut scope = Scope::new();
+        let _: () = self.engine.call_fn(&mut scope, ast, "on_event", (ctx.clone(),))?;
+        Ok(ctx.take_commands())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,7 +595,7 @@ mod tests {
     #[test]
     fn rules_context_commands() {
         let game = make_game_view();
-        let ctx = RulesContext::new(game, "on_game_start".into(), HashMap::new());
+        let ctx = RulesContext::new(game, "on_game_start".into(), HashMap::new(), HashMap::new());
         ctx.cmd_spawn("marine".into(), 0, 5.0, 5.0);
         ctx.cmd_modify_resource(0, "gold".into(), 100.0);
         ctx.cmd_end_game(-1);
@@ -481,5 +620,70 @@ mod tests {
             assert_eq!(*team_id, None);
             assert_eq!(zone_type, "encounter");
         }
+    }
+
+    #[test]
+    fn rules_engine_compile_and_run() {
+        let mut engine = RulesScriptEngine::new();
+        let source = r#"
+            fn on_event(ctx) {
+                let name = ctx.event_name;
+                if name == "GameStart" {
+                    cmd_log(ctx, "Game started!");
+                    cmd_spawn(ctx, "marine", 0, 5.0, 5.0);
+                }
+            }
+        "#;
+        engine.compile_script("test_rules", source).expect("compile failed");
+        assert!(engine.has_script("test_rules"));
+
+        let game = make_game_view();
+        let ctx = RulesContext::new(game, "GameStart".into(), HashMap::new(), HashMap::new());
+        let cmds = engine.run_on_event("test_rules", ctx).expect("run failed");
+        assert_eq!(cmds.len(), 2);
+        assert!(matches!(&cmds[0], RulesCommand::Log(msg) if msg == "Game started!"));
+        assert!(matches!(&cmds[1], RulesCommand::SpawnUnit { template_id, .. } if template_id == "marine"));
+    }
+
+    #[test]
+    fn rules_engine_query_methods() {
+        let mut engine = RulesScriptEngine::new();
+        let source = r#"
+            fn on_event(ctx) {
+                let alive = query_alive_count(ctx, 0);
+                let phase = query_phase(ctx);
+                let clock = query_clock(ctx);
+                cmd_log(ctx, `alive=${alive} phase=${phase} clock=${clock}`);
+            }
+        "#;
+        engine.compile_script("query_test", source).expect("compile failed");
+
+        let game = make_game_view();
+        let ctx = RulesContext::new(game, "Tick".into(), HashMap::new(), HashMap::new());
+        let cmds = engine.run_on_event("query_test", ctx).expect("run failed");
+        assert_eq!(cmds.len(), 1);
+        if let RulesCommand::Log(msg) = &cmds[0] {
+            assert!(msg.contains("alive=1"));
+            assert!(msg.contains("phase=Exploration"));
+            assert!(msg.contains("clock=10"));
+        } else {
+            panic!("Expected Log command");
+        }
+    }
+
+    #[test]
+    fn rules_engine_missing_script() {
+        let engine = RulesScriptEngine::new();
+        let game = make_game_view();
+        let ctx = RulesContext::new(game, "GameStart".into(), HashMap::new(), HashMap::new());
+        let result = engine.run_on_event("nonexistent", ctx);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rules_engine_compile_error() {
+        let mut engine = RulesScriptEngine::new();
+        let result = engine.compile_script("bad", "fn on_event(ctx { }"); // syntax error
+        assert!(result.is_err());
     }
 }
