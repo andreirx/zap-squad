@@ -21,13 +21,14 @@
  */
 
 const DB_NAME = 'zapsquad';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 const STORE_ASSETS = 'assets';
 const STORE_LEVELS = 'levels';
 const STORE_WORLDS = 'worlds';
 const STORE_CONFIG = 'config';
 const STORE_FILES = 'files';
+const STORE_GAME_DEFS = 'game_defs';
 
 // ── Database lifecycle ──────────────────────────────────────────────
 
@@ -80,6 +81,14 @@ function openDb(): Promise<IDBDatabase> {
           db.createObjectStore(STORE_FILES);
         }
         console.log('[idb] migration v1→v2: created files store');
+      }
+
+      if (oldVersion < 3) {
+        // v3: game definitions store for the rules editor
+        if (!db.objectStoreNames.contains(STORE_GAME_DEFS)) {
+          db.createObjectStore(STORE_GAME_DEFS);
+        }
+        console.log('[idb] migration v2→v3: created game_defs store');
       }
 
       // Future migrations go here:
@@ -286,6 +295,32 @@ export const configStore = {
 
   delete: (key: string): Promise<void> =>
     idbDelete(STORE_CONFIG, key),
+};
+
+// ── Game definition store ───────────────────────────────────────────
+
+/** Stored game definition (output of the rules editor). */
+export interface GameDefRecord {
+  /** The full GameDefinition JSON (matches core/entities/game_rules/definition.rs). */
+  definition: Record<string, unknown>;
+  updatedAt: number;
+}
+
+export const gameDefStore = {
+  save: (name: string, definition: Record<string, unknown>): Promise<void> =>
+    idbPut<GameDefRecord>(STORE_GAME_DEFS, name, { definition, updatedAt: Date.now() }),
+
+  load: (name: string): Promise<GameDefRecord | undefined> =>
+    idbGet<GameDefRecord>(STORE_GAME_DEFS, name),
+
+  delete: (name: string): Promise<void> =>
+    idbDelete(STORE_GAME_DEFS, name),
+
+  list: (): Promise<string[]> =>
+    idbKeys(STORE_GAME_DEFS),
+
+  getAll: (): Promise<Array<{ key: string; value: GameDefRecord }>> =>
+    idbGetAll<GameDefRecord>(STORE_GAME_DEFS),
 };
 
 // ── File store ──────────────────────────────────────────────────────

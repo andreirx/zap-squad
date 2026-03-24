@@ -3,6 +3,7 @@ import { GamePage } from './pages/GamePage';
 import { WasmGamePage } from './pages/WasmGamePage';
 import { FreedomBoardPage } from './freedom-board/FreedomBoardPage';
 import { CharacterEditor, ObjectEditor, TileEditor, MapEditor } from './editors';
+import { RulesEditor } from './editors/RulesEditor';
 
 export default function App() {
   return (
@@ -42,6 +43,7 @@ export default function App() {
                   <Route path="object" element={<ObjectEditor />} />
                   <Route path="tile" element={<TileEditor />} />
                   <Route path="map" element={<MapEditor />} />
+                  <Route path="rules" element={<RulesEditor />} />
                 </Routes>
               </main>
             </>
@@ -95,6 +97,13 @@ function Navigation() {
       </Link>
       <Link to="/editor/map" style={linkStyle('/editor/map')}>
         Maps
+      </Link>
+      <Link to="/editor/rules" style={{
+        ...linkStyle('/editor/rules'),
+        color: location.pathname === '/editor/rules' ? '#e0a060' : '#ccc',
+        background: location.pathname === '/editor/rules' ? 'rgba(224, 160, 96, 0.1)' : 'transparent',
+      }}>
+        Game Rules
       </Link>
     </nav>
   );

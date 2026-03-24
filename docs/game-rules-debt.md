@@ -1,6 +1,7 @@
 # Game Rules Domain — Remaining Work
 
-## Status: Core types, three-scope script bindings, world binding, time model, session init implemented (2026-03-23).
+## Status: Core types, three-scope script bindings, world binding, time model, session init,
+## game rules editor, WASM validation bridge all implemented (2026-03-24).
 
 ## Resolved
 
@@ -11,24 +12,20 @@
 - ~~World binding~~ — `GameDefinition` has `WorldBinding` with zones, wave paths, world name. DONE.
 - ~~Starting resources~~ — `GameSession::from_definition()` applies schema starting amounts. DONE.
 - ~~Time model~~ — Events split: `Tick{dt}`, `TurnStart/End`, `PlanningStart/End`, `ResolutionStart/End`. DONE.
+- ~~Turn-based validation~~ — "No spawn points" is an Error when templates exist (line 117, `validation.rs`). Per-team spawn check runs independently. Tests confirm `templates_without_spawns_is_error`. DONE.
+- ~~Rules editor serialization~~ — TeamController, WinCondition, ZoneType all match serde externally tagged contract. DONE.
+- ~~Rules editor authoring surface~~ — All 10 sections: basics, teams, stats, resources, templates, win conditions, scripts, world binding, validation, JSON preview. DONE.
+- ~~WASM validation~~ — `wasm-validator` crate exposes `validate_game_json()`, Rules Editor consumes DTO. DONE.
 
-## P1 — Must fix before the rules system is usable
+## P1 — Must fix before the rules system is usable in play
 
-### WorldGenCommand cannot express zone semantics
-`WorldGenCommand::DefineZone` only carries name + rectangle. `WorldBinding::Zone` requires
-`zone_type` (SpawnPoint, EncounterArea, WaveSource, etc.) and optional `team_id`.
-A world generation script cannot create typed zones that validation can use.
-**Fix:** Extend `WorldGenCommand::DefineZone` to include `zone_type: String` and
-`team_id: Option<u32>`. The orchestrator maps the string to `ZoneType` enum.
-**Files:** `game_script_bindings.rs`, orchestrator (future wasm-canvas integration)
-
-### Turn-based validation too weak
-If no spawn points exist at all, only a generic warning fires and per-team checks
-are skipped. A turn-based game with teams and templates but zero spawn points
-validates as playable.
-**Fix:** Make "no spawn points" an Error (not Warning) when character templates exist.
-The per-team check should run regardless of global spawn presence.
-**Files:** `validation.rs`
+### WorldGenCommand zone_type is a raw String
+`WorldGenCommand::DefineZone` carries `zone_type: String` and `team_id: Option<u32>`.
+The orchestrator must map the string to the `ZoneType` enum when applying commands.
+This is not a code bug — the string transport is intentional at the script boundary.
+But the orchestrator must implement the mapping correctly, including parsing
+`"resource_producer:key:rate"` format for `ZoneType::ResourceProducer`.
+**Files:** `game_script_bindings.rs` (line 106-114), orchestrator (future)
 
 ## P2 — Important, can iterate
 
@@ -36,15 +33,21 @@ The per-team check should run regardless of global spawn presence.
 `ResourceDef` names a resource type but has no production/consumption rules.
 `ZoneType::ResourceProducer` exists but no model for rate ticking, worker assignment,
 capacity, or depletion beyond what the rules script implements manually.
-**Fix:** Production rules are intentionally script-driven (not engine-enforced).
-Document this as a design decision, not a gap. Rules scripts call
-`cmd_modify_resource()` on each `Tick` event for production.
+**Decision:** Production rules are intentionally script-driven (not engine-enforced).
+Rules scripts call `cmd_modify_resource()` on each `Tick` event for production.
+This is a design decision, not a gap.
 
 ### Mode-specific validation depth
 Validation catches structural issues but not economic closure (can resources be
 produced AND spent?), template reachability (can all templates actually spawn?),
 or script availability (do referenced scripts exist?).
 **Fix:** Incremental — add checks as real game definitions expose gaps.
+Script existence validation should be an orchestrator pre-flight check at game start.
+
+### Pre-existing IDB definitions use old serialization
+Game definitions saved before the serialization fixes (TeamController `{Human:true}`,
+WinCondition `{type:'Elimination'}`) will fail validation until re-saved. No migration
+needed — the feature is pre-release and no user data exists.
 
 ## What is solid
 
@@ -58,3 +61,5 @@ or script availability (do referenced scripts exist?).
 - Time model (Tick for real-time, TurnStart/End for discrete, Planning/Resolution for tactical)
 - Three isolated Rhai scopes (AI, Rules, WorldGen) with command-based mutation
 - All types serializable
+- Complete authoring UI with typed serde-compatible serialization
+- Authoritative WASM validation (single source of truth in Rust core)

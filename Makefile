@@ -1,10 +1,11 @@
-.PHONY: test lint build clean wasm wasm-canvas wasm-feather dev dev-canvas check pack-sprites tools-install import-hexmanos bake-atlases
+.PHONY: test lint build clean wasm wasm-canvas wasm-feather wasm-validator dev dev-canvas check pack-sprites tools-install import-hexmanos bake-atlases
 
 # Run all tests (core must pass without WASM)
 test:
 	cargo test -p zapsquad-core
 	cargo test -p zapsquad-adapters
 	cargo test -p wasm-feather
+	cargo test -p wasm-validator
 
 # Check compilation for all targets
 check:
@@ -12,6 +13,7 @@ check:
 	cargo check -p zapsquad-wasm --target wasm32-unknown-unknown
 	cargo check -p freedom-board-wasm --target wasm32-unknown-unknown
 	cargo check -p wasm-feather --target wasm32-unknown-unknown
+	cargo check -p wasm-validator --target wasm32-unknown-unknown
 
 # Lint with clippy
 lint:
@@ -24,6 +26,10 @@ wasm:
 # Build WASM for feathering atlas processing (outputs to ui/web/src/wasm)
 wasm-feather:
 	wasm-pack build infrastructure/wasm-feather --target web --out-dir ../../ui/web/src/wasm-feather
+
+# Build WASM for game definition validation (outputs to ui/web)
+wasm-validator:
+	wasm-pack build infrastructure/wasm-validator --target web --out-dir ../../ui/web/src/wasm-validator
 
 # Build WASM for freedom-board canvas (outputs to both ui/canvas and ui/web)
 wasm-canvas:
@@ -42,10 +48,10 @@ pack-sprites: tools-install
 	cd tools && npx tsx pack-sprites.ts --input ../ui/web/public/mods --output ../ui/web/public/assets
 
 # Build everything
-build: wasm wasm-canvas wasm-feather pack-sprites
+build: wasm wasm-canvas wasm-feather wasm-validator pack-sprites
 
 # Development server (unified app with freedom-board + editors)
-dev: wasm wasm-canvas
+dev: wasm wasm-canvas wasm-validator
 	cd ui/web && npm run dev
 
 # Freedom-board dev server
@@ -70,6 +76,7 @@ clean:
 	rm -rf ui/web/pkg
 	rm -rf ui/web/src/wasm
 	rm -rf ui/web/src/wasm-feather
+	rm -rf ui/web/src/wasm-validator
 	rm -rf ui/canvas/src/wasm
 	rm -rf ui/web/dist
 	rm -rf ui/canvas/dist

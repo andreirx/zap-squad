@@ -1,0 +1,15 @@
+[package]
+name = "wasm-validator"
+version = "0.1.0"
+edition = "2021"
+description = "WASM adapter for game definition validation. Exposes core validate_game() through a JSON DTO boundary."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+zapsquad-core = { path = "../../core" }
+wasm-bindgen = "0.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+console_error_panic_hook = "0.1"

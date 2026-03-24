@@ -7,184 +7,204 @@ The direction is:
 - Freedom Board as the primary runtime/editor surface
 - source-asset editors as supporting tools
 - local-first persistence
-- character-behavior scripting as the first scripting experience
+- game rules authoring and scripted gameplay as the next product milestone
 
 Support code that is not exposed as a finished feature remains incomplete.
 
 ---
 
-## Current State
+## Current State (2026-03-24)
 
-### Built
+### Complete (support + user-facing feature)
 
-- Freedom Board is the main route and active development surface.
-- Editors continue to author 128x128 source assets.
-- Infinite sparse world storage, chunking, quadtree culling, map stamping, save/load, and auto-save exist.
-- Character placement and smooth movement exist.
-- Combat primitives and Rhai script primitives exist.
-- WASM feathering crate exists.
-- Debug/profiling overlay and persisted runtime settings exist.
+- **Freedom Board** — main route, infinite canvas, sparse world, multi-layer tiles,
+  feathered rendering, character placement/movement, A* pathfinding with terrain costs,
+  undo/redo, auto-save to IDB, world list modal, save/load to disk.
+- **Editors** — Tile, Character, Object, Map editors all authoring assets via IDB.
+- **Persistence** — IDB v3 (6 stores), IdbStorage gateway, auto-save, explicit disk save/load,
+  asset export/import.
+- **Path connectivity** — Land paths cross-connect across types, water paths type-strict,
+  bridges over impassable terrain.
+- **Atlas baking + feathering** — `bake-atlases.ts`, `wasm-feather` WASM crate.
+- **Game rules domain model** — GameDefinition, GameSession, GameMode, GamePhase, teams,
+  stats, resources, character templates, events, validation. 147 core tests.
+- **Game Rules Editor** — `/editor/rules` with 10 sections, typed serde-compatible
+  serialization, complete world binding form, character templates, win conditions.
+- **WASM validation bridge** — `wasm-validator` crate (174KB), authoritative Rust validation
+  surfaced in the Rules Editor.
 
-### Deferred or incomplete
+### Support-complete but not feature-complete
 
-- User-facing script workflow
-- User-facing combat workflow
-- Multi-select and group control workflow
-- Script persistence
-- UUID-based runtime identity completion
-- Dynamic runtime asset loading for user-created assets
-- Wiring the WASM feathering step into the runtime pipeline
+- **Three-scope script DTOs** — CharacterAiContext, RulesContext, WorldGenContext with
+  command/context types. Rust methods defined but not registered in Rhai.
+- **GameSession lifecycle** — from_definition, phase transitions, turn rotation, event queue.
+  No WASM code creates or drives a session.
+- **GameEvent system** — 18 event types. No code emits events into the queue.
+- **Combat use case** — apply_damage, calculate_damage with 6 tests.
+  No targeting UI, no combat feedback.
+- **Legacy scripting** — ScriptEngine, hot reload, per-frame AI execution. Uses old
+  ScriptContext/ActorId path, not three-scope architecture.
+
+### Not started
+
+- Script Editor UI
+- WASM orchestrator (game session runtime)
+- Play Mode
+- Combat UX
+- Group commands (multi-select, commander/follower)
+- Canvas-based zone editor (form-based exists)
 
 ---
 
 ## Plan
 
-### Phase 1: Align Tile Semantics Across Freedom Board and Map Editor
+### Next Product Milestone: "Playable Scripted Game on Freedom Board"
 
-### Goal
-
-Remove semantic drift between the two world surfaces.
-
-### Tasks
-
-1. Change non-water path connectivity so all LAND paths connect to one another regardless of path asset type.
-2. Keep WATER paths strict: only same-type water paths connect.
-3. Ensure bridge connectivity follows the effective LAND-path network above water.
-4. Update Freedom Board rendering and Map Editor preview to use the same rule.
-5. Update import/export assumptions and tests for the new path rule.
-
-### Done when
-
-- Roads of different non-water types visibly connect in both Freedom Board and Map Editor
-- Rivers of different water types remain separate
-- Bridge shapes match the visible road network
+A kid can define game rules, write scripts, press Play, and watch characters
+behave according to the rules they authored.
 
 ---
 
-### Phase 2: Finish the Combat Feature Layer
+### Phase A: Orchestrator Skeleton (architectural spine)
 
-### Goal
+**Goal:** Prove the hardest boundary — load a GameDefinition into the Freedom Board
+runtime, create a GameSession, execute rules scripts, and apply commands end to end.
 
-Convert combat support into an actual usable feature.
+**Tasks:**
+1. Add `GameSession` field to `FreedomBoardGame` in wasm-canvas
+2. New WASM export: `load_game_definition(json)` — parse, store, create session
+3. Build `CharacterInstanceId <-> ActorId` mapping layer
+4. Emit `GameStart` and `Tick` events into the session EventQueue
+5. Register `RulesContext` as a Rhai type with all cmd_* and query_* methods
+6. Execute rules script on each event, collect `RulesCommand`s
+7. Apply commands: `SpawnUnit`, `KillUnit`, `ModifyStat`, `ModifyResource`, `SetPhase`, `EndGame`
+8. Add `start_game()` / `stop_game()` WASM exports
+9. Add Play/Stop controls in Freedom Board toolbar
+10. Validation gate before start (call wasm-validator, show failures)
 
-### Tasks
-
-1. Expose attack targeting in Freedom Board UI.
-2. Support ranged attacks through the object asset model.
-3. Add range validation and failure feedback.
-4. Add combat feedback: hit results, death/removal behavior, visible state changes.
-5. Ensure characters return to a stable idle state after attack completion.
-
-### Done when
-
-- A user can select a character and attack a valid target from the UI
-- Melee and ranged attacks both execute through the intended asset flow
-- Animation state returns cleanly to idle after action completion
-
----
-
-### Phase 3: Finish the Scripting Feature Layer
-
-### Goal
-
-Make scripting a first-class, teachable product feature.
-
-### Tasks
-
-1. Define the first scripting scope explicitly as character behavior scripting.
-2. Add script editor UI in Freedom Board.
-3. Add assign/unassign script workflow on characters.
-4. Add reload/apply flow and play/pause execution control.
-5. Persist `script_id` or equivalent stable script reference in world serialization.
-6. Provide starter examples for patrol, chase, guard, follow, and attack behaviors.
-
-### Done when
-
-- A user can write a script, assign it to a character, save the world, reload, and retain behavior
-- The scripting surface is narrow, understandable, and stable enough for kids
+**Done when:**
+- A saved GameDefinition with a rules script can run in the Freedom Board
+- `GameStart` fires, rules script responds, commands apply to session state
+- Play/Stop works without crashes
 
 ---
 
-### Phase 4: Group Command Features
+### Phase B: Script Editor UI
 
-### Goal
+**Goal:** Give kids a surface to write and test scripts.
 
-Turn single-character movement into squad control.
+**Tasks:**
+1. New panel or route for script editing
+2. Scope tabs: Character AI / Rules / World Gen
+3. Script list by name, textarea editor
+4. Compile button with error output (from ScriptEngine.compile_script)
+5. Save scripts to IDB
+6. Wire reload to WASM via `reload_scripts()` export
+7. Status display: loaded / compile failed / active
 
-### Tasks
+**Done when:**
+- A kid can write a rules script, save it, load it into the Freedom Board, and see it execute
+- Compilation errors are displayed in the UI, not just in the console
 
-1. Add multi-select.
-2. Add group move commands.
-3. Prevent overlap and naive pileups during group movement.
-4. Expose commander/follower assignment.
-5. Use the existing follow-state support as the core primitive, but finish the actual UX layer.
+---
 
-### Done when
+### Phase C: Character AI Migration
 
+**Goal:** Replace legacy ScriptContext/ScriptCommand/ActorId execution path with
+the three-scope CharacterAiContext/AiCommand/CharacterInstanceId path.
+
+**Tasks:**
+1. Register `CharacterAiContext` in Rhai with all cmd_* and query methods
+2. Bridge current scripted actor loop from legacy `ScriptContext` to `CharacterAiContext`
+3. Populate `GameView` snapshot for AI scripts from live session state
+4. Map AiCommand output back through CharacterInstanceId → ActorId for rendering
+5. Preserve current movement/animation functionality
+6. Retire legacy `ScriptContext` execution path
+
+**Done when:**
+- Characters execute AI scripts through the new context
+- `find_nearest_enemy`, stat queries, and movement all work
+- Legacy ScriptContext path can be removed
+
+---
+
+### Phase D: World Generation Scripting
+
+**Goal:** World gen scripts populate the map during Setup phase.
+
+**Tasks:**
+1. Register `WorldGenContext` in Rhai
+2. Run `world_gen_script` during `GamePhase::Setup`
+3. Apply `PlaceTile` → SparseWorld mutation
+4. Apply `SpawnUnit` → character placement
+5. Apply `DefineZone` → WorldBinding zone creation (map zone_type string to ZoneType enum)
+6. Transition to Exploration phase after world gen completes
+
+**Done when:**
+- A world gen script creates terrain, spawns units, and defines zones
+- The game starts from an empty board and builds itself
+
+---
+
+### Phase E: Play Mode Polish
+
+**Goal:** The game session is understandable and controllable.
+
+**Tasks:**
+1. GameHUD: team resources, turn indicator, current phase, active team
+2. Pause/Resume during play
+3. Mode-specific flow: TurnBased turn rotation, Tactical encounter auto-pause
+4. Win/lose detection and display
+5. Session reset (stop game, return to edit mode)
+
+**Done when:**
+- A kid can see what's happening (whose turn, what resources, what phase)
+- The game ends when win conditions are met
+
+---
+
+### Phase F: Combat Feature Layer
+
+**Goal:** Combat becomes a real interactive feature.
+
+**Tasks:**
+1. Attack targeting UI (click to select target)
+2. Ranged attacks through object assets
+3. Range validation and failure feedback
+4. Hit/damage/death feedback (visual + event emission)
+5. Idle state return after attack animation
+6. Events emitted into GameSession.events (UnitDamaged, UnitKilled)
+
+**Done when:**
+- A player can command a character to attack a valid target
+- Damage, death, and animation all work correctly
+- Events fire for rules scripts to react to
+
+---
+
+### Phase G: Group Commands
+
+**Goal:** Multi-character control.
+
+**Tasks:**
+1. Multi-select (shift-click, drag box)
+2. Group move
+3. Spacing / overlap avoidance
+4. Commander/follower assignment
+5. Follow behavior as a real feature
+
+**Done when:**
 - Multiple characters can be selected and moved together
-- Followers can remain bound to a commander
-- Group movement is visually and behaviorally coherent
-
----
-
-### Phase 5: Close the Persistence Architecture
-
-### Goal
-
-Finish the local-first storage direction across all tools.
-
-### Tasks
-
-1. Ensure all editors persist through the shared browser-side storage path.
-2. Keep explicit save/load to disk for worlds, levels, and assets.
-3. Complete UUID-based runtime identity so saved data is independent of manifest ordering.
-4. Support user-created assets consistently across editors and Freedom Board.
-5. Preserve settings and recent-state continuity where useful.
-
-### Done when
-
-- User-created tiles, characters, objects, maps, and worlds survive reloads
-- Export/import works without relying on positional indices
-- Freedom Board can load and render user-created assets, not just seed assets
-
----
-
-### Phase 6: Wire Feathering Into the Real Runtime Pipeline
-
-### Goal
-
-Eliminate Python-only dependence for the feathering step.
-
-### Tasks
-
-1. Invoke the WASM feathering module from the client-side asset pipeline.
-2. Cache feathered outputs locally.
-3. Keep editors working on raw 128x128 assets.
-4. Ensure Freedom Board consumes the baked feathered outputs only.
-
-### Done when
-
-- The feathering pipeline runs client-side without Python
-- Freedom Board uses the baked results
-- Editors remain unaware of feathered atlas geometry
-
----
-
-## Cross-Cutting Verification
-
-For every phase:
-- update the docs
-- add or extend automated tests where the rule lives in `core/`
-- verify both Freedom Board and Map Editor when behavior is shared
-- document technical debt created by any temporary divergence
+- Followers stay bound to a commander
 
 ---
 
 ## Immediate Priority Order
 
-1. LAND-path cross-type connectivity in both Freedom Board and Map Editor
-2. Attack feature completion, including ranged attacks through objects
-3. Script UI, assignment, and persistence
-4. Multi-select and commander/follower behavior
-5. UUID/runtime asset identity completion
-6. WASM feathering pipeline wiring
+1. **Orchestrator skeleton** — the architectural spine that connects everything
+2. **Script Editor UI** — the authoring surface for scripts
+3. **Character AI migration** — new scope replaces legacy
+4. **World gen scripting** — game = world + rules from authored data
+5. **Play Mode polish** — HUD, pause, win/lose
+6. **Combat UX** — targeting, feedback, events
+7. **Group commands** — multi-select, squads
