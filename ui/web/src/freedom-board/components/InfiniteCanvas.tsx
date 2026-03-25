@@ -303,7 +303,8 @@ export function InfiniteCanvas({
     assetBasePath: `${ASSETS_URL}/`,
     gameWidth: GAME_WIDTH,
     gameHeight: GAME_HEIGHT,
-    force2D: true, // Canvas2D until WebGPU texture size issue is resolved
+    // force2D removed — largest atlas is 2400x1536, well under WebGPU 8192 limit.
+    // Was needed when skirt atlases hit 16384. See MEMORY.md for history.
     onGameEvent: wrappedGameEvent,
     onWorkerMessage: handleWorkerMessage,
     useSabLock,

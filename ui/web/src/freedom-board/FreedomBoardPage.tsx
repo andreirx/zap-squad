@@ -3,6 +3,7 @@ import { InfiniteCanvas, tileTypeToLayer } from './components/InfiniteCanvas';
 import { FBToolbar } from './components/FBToolbar';
 import { StatusBar } from './components/StatusBar';
 import { AssetPanel } from './components/AssetPanel';
+import { ScriptPanel } from './components/ScriptPanel';
 import { WorldListModal } from './components/WorldListModal';
 import {
   loadTileManifest,
@@ -183,6 +184,13 @@ export function FreedomBoardPage() {
   const [gameDefLoaded, setGameDefLoaded] = useState(false);
   const sendEventRef = useRef<((msg: Record<string, unknown>) => void) | null>(null);
 
+  // ── Script panel state ────────────────────────────────────────────
+  const [showScripts, setShowScripts] = useState(false);
+
+  const handleReloadScripts = useCallback((scriptsJson: string) => {
+    sendEventRef.current?.({ type: 'reload_scripts', json: scriptsJson });
+  }, []);
+
   // Load saved game definitions list
   useEffect(() => {
     gameDefStore.list().then(names => {
@@ -190,6 +198,8 @@ export function FreedomBoardPage() {
       if (names.length > 0 && !selectedGameDef) {
         setSelectedGameDef(names[0]);
       }
+    }).catch(err => {
+      console.error('[freedom-board] failed to load game definitions:', err);
     });
   }, []);
 
@@ -421,6 +431,8 @@ export function FreedomBoardPage() {
         onSaveToDisk={handleSaveToDisk}
         onLoadFromDisk={handleLoadFromDisk}
         onWorldList={useCallback(() => setShowWorldList(true), [])}
+        showScripts={showScripts}
+        onToggleScripts={useCallback(() => setShowScripts(v => !v), [])}
         isPlaying={isPlaying}
         hasGameDef={gameDefLoaded}
         onPlay={handlePlay}
@@ -481,6 +493,12 @@ export function FreedomBoardPage() {
             }, [])}
           />
         </div>
+        {showScripts && (
+          <ScriptPanel
+            onReloadScripts={handleReloadScripts}
+            disabled={isPlaying}
+          />
+        )}
       </div>
       <StatusBar
         cursorTile={cursorTile}

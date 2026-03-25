@@ -1,12 +1,14 @@
 /**
  * IndexedDB persistence layer for ZapSquad.
  *
- * Shared database ("zapsquad") with five object stores:
+ * Shared database ("zapsquad") with seven object stores:
  * - assets: user-created tile/character/weapon blobs + metadata
  * - levels: LDtk JSON levels (from MapEditor)
  * - worlds: freedom-board world state (sparse tiles + characters + camera)
  * - config: application preferences and state
  * - files: raw file storage for editor persistence (path-keyed, replaces StorageGateway writes)
+ * - game_defs: game definitions (output of the rules editor)
+ * - scripts: Rhai script source code (rules, character AI, world gen)
  *
  * IndexedDB was chosen over localStorage because:
  * - Accessible from Web Workers (where WASM runs)
@@ -21,7 +23,7 @@
  */
 
 const DB_NAME = 'zapsquad';
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 
 const STORE_ASSETS = 'assets';
 const STORE_LEVELS = 'levels';
@@ -29,6 +31,7 @@ const STORE_WORLDS = 'worlds';
 const STORE_CONFIG = 'config';
 const STORE_FILES = 'files';
 const STORE_GAME_DEFS = 'game_defs';
+const STORE_SCRIPTS = 'scripts';
 
 // ── Database lifecycle ──────────────────────────────────────────────
 
@@ -91,14 +94,72 @@ function openDb(): Promise<IDBDatabase> {
         console.log('[idb] migration v2→v3: created game_defs store');
       }
 
+      if (oldVersion < 4) {
+        // v4: scripts store for Rhai source code (rules, character AI, world gen)
+        if (!db.objectStoreNames.contains(STORE_SCRIPTS)) {
+          db.createObjectStore(STORE_SCRIPTS);
+        }
+        console.log('[idb] migration v3→v4: created scripts store');
+      }
+
       // Future migrations go here:
-      // if (oldVersion < 3) { ... }
+      // if (oldVersion < 5) { ... }
+    };
+
+    // onblocked fires when another tab/worker holds an older DB version open.
+    // Without this handler, the open request hangs indefinitely — every IDB
+    // operation in the app silently deadlocks (no resolve, no reject).
+    request.onblocked = () => {
+      dbPromise = null;
+      console.error(
+        `[idb] database upgrade to v${DB_VERSION} blocked by another connection. ` +
+        'Close other tabs or refresh the page.'
+      );
+      reject(new Error(
+        `IndexedDB upgrade to v${DB_VERSION} blocked. Close other ZapSquad tabs and retry.`
+      ));
     };
 
     request.onsuccess = () => {
       const db = request.result;
+
+      // Guard against corrupted DB state: the version matches DB_VERSION
+      // but expected stores are missing (e.g., Safari recorded v4 from a
+      // partially-failed upgrade). If detected, delete the DB and reopen
+      // from scratch so all migrations run on a fresh oldVersion=0 database.
+      const EXPECTED_STORES = [
+        STORE_ASSETS, STORE_LEVELS, STORE_WORLDS, STORE_CONFIG,
+        STORE_FILES, STORE_GAME_DEFS, STORE_SCRIPTS,
+      ];
+      const missing = EXPECTED_STORES.filter(s => !db.objectStoreNames.contains(s));
+      if (missing.length > 0) {
+        console.warn(
+          `[idb] DB v${db.version} is missing stores: ${missing.join(', ')}. ` +
+          'Deleting and recreating database.'
+        );
+        db.close();
+        dbPromise = null;
+        const delReq = indexedDB.deleteDatabase(DB_NAME);
+        delReq.onsuccess = () => {
+          console.log('[idb] corrupted database deleted, reopening...');
+          resolve(openDb());
+        };
+        delReq.onerror = () => {
+          reject(new Error('[idb] failed to delete corrupted database'));
+        };
+        return;
+      }
+
       // Reset promise if connection closes so next call reopens
       db.onclose = () => { dbPromise = null; };
+      // Yield to newer versions: if another tab opens with a higher version,
+      // close this connection so its upgrade can proceed (prevents onblocked
+      // in the other tab).
+      db.onversionchange = () => {
+        db.close();
+        dbPromise = null;
+        console.log('[idb] connection closed — newer version detected in another tab');
+      };
       resolve(db);
     };
 
@@ -321,6 +382,73 @@ export const gameDefStore = {
 
   getAll: (): Promise<Array<{ key: string; value: GameDefRecord }>> =>
     idbGetAll<GameDefRecord>(STORE_GAME_DEFS),
+};
+
+// ── Script store ────────────────────────────────────────────────────
+
+/** Script scope — determines which Rhai Engine instance runs this script. */
+export type ScriptScope = 'rules' | 'character_ai' | 'world_gen';
+
+/**
+ * Stored Rhai script source code.
+ *
+ * Key is the script name (e.g., "my_rules", "patrol_ai"). This name is
+ * the foreign key used in domain objects:
+ *   - GameDefinition.rules_script
+ *   - GameDefinition.world_gen_script
+ *   - CharacterInstance.ai_script
+ *   - TeamDefinition.controller.Cpu.script_name
+ *
+ * RENAME SEMANTICS: Renaming a script requires updating ALL domain
+ * references that point to the old name. This is a real operation,
+ * not cosmetic. The scriptStore.rename() method handles the store-level
+ * copy+delete but does NOT update domain references — callers must do
+ * that themselves.
+ */
+export interface ScriptRecord {
+  /** Rhai source text. */
+  source: string;
+  /** Which scope this script targets. */
+  scope: ScriptScope;
+  updatedAt: number;
+}
+
+export const scriptStore = {
+  save: (name: string, source: string, scope: ScriptScope): Promise<void> =>
+    idbPut<ScriptRecord>(STORE_SCRIPTS, name, { source, scope, updatedAt: Date.now() }),
+
+  load: (name: string): Promise<ScriptRecord | undefined> =>
+    idbGet<ScriptRecord>(STORE_SCRIPTS, name),
+
+  delete: (name: string): Promise<void> =>
+    idbDelete(STORE_SCRIPTS, name),
+
+  list: (): Promise<string[]> =>
+    idbKeys(STORE_SCRIPTS),
+
+  getAll: (): Promise<Array<{ key: string; value: ScriptRecord }>> =>
+    idbGetAll<ScriptRecord>(STORE_SCRIPTS),
+
+  /**
+   * Rename a script (copy + delete at the store level).
+   *
+   * Throws if oldName does not exist or newName already exists.
+   * The collision guard prevents silent content destruction — script
+   * names are foreign keys referenced by GameDefinition, TeamDefinition,
+   * and CharacterInstance objects.
+   *
+   * IMPORTANT: This does NOT update domain references. The caller is
+   * responsible for finding and updating all foreign-key references
+   * to the old name.
+   */
+  rename: async (oldName: string, newName: string): Promise<void> => {
+    const record = await idbGet<ScriptRecord>(STORE_SCRIPTS, oldName);
+    if (!record) throw new Error(`Script "${oldName}" not found`);
+    const existing = await idbGet<ScriptRecord>(STORE_SCRIPTS, newName);
+    if (existing) throw new Error(`Script "${newName}" already exists`);
+    await idbPut(STORE_SCRIPTS, newName, { ...record, updatedAt: Date.now() });
+    await idbDelete(STORE_SCRIPTS, oldName);
+  },
 };
 
 // ── File store ──────────────────────────────────────────────────────

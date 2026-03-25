@@ -2350,42 +2350,67 @@ impl Game for FreedomBoardGame {
             }
         });
 
-        // 0f. Check for pending script reload (both legacy AI and rules engines)
+        // 0f. Check for pending script reload — route each script to the
+        // correct engine based on its declared scope.
         PENDING_SCRIPTS.with(|p| {
             if let Some(scripts) = p.borrow_mut().take() {
-                // Legacy AI engine
+                // Clear both engines before recompiling. Each engine only
+                // receives scripts that belong to its scope.
                 self.scripts.clear_scripts();
-                let mut ok = 0u32;
-                let mut fail = 0u32;
-                for (name, source) in &scripts {
-                    match self.scripts.compile_script(name, source) {
-                        Ok(_) => ok += 1,
-                        Err(e) => {
-                            web_sys::console::error_1(
-                                &format!("[freedom-board] AI script '{}' compile error: {:?}", name, e).into(),
-                            );
-                            fail += 1;
-                        }
-                    }
-                }
-                // Rules engine — compile the same scripts (rules scripts call on_event, not update)
                 self.rules_engine.clear_scripts();
+
+                let mut ai_ok = 0u32;
+                let mut ai_fail = 0u32;
                 let mut rules_ok = 0u32;
                 let mut rules_fail = 0u32;
-                for (name, source) in &scripts {
-                    match self.rules_engine.compile_script(name, source) {
-                        Ok(_) => rules_ok += 1,
-                        Err(e) => {
-                            web_sys::console::error_1(
-                                &format!("[freedom-board] rules script '{}' compile error: {:?}", name, e).into(),
+                let mut worldgen_count = 0u32;
+                let mut unknown_count = 0u32;
+
+                for (name, entry) in &scripts {
+                    match entry.scope.as_str() {
+                        "character_ai" => {
+                            match self.scripts.compile_script(name, &entry.source) {
+                                Ok(_) => ai_ok += 1,
+                                Err(e) => {
+                                    web_sys::console::error_1(
+                                        &format!("[freedom-board] AI script '{}' compile error: {:?}", name, e).into(),
+                                    );
+                                    ai_fail += 1;
+                                }
+                            }
+                        }
+                        "rules" => {
+                            match self.rules_engine.compile_script(name, &entry.source) {
+                                Ok(_) => rules_ok += 1,
+                                Err(e) => {
+                                    web_sys::console::error_1(
+                                        &format!("[freedom-board] rules script '{}' compile error: {:?}", name, e).into(),
+                                    );
+                                    rules_fail += 1;
+                                }
+                            }
+                        }
+                        "world_gen" => {
+                            // World gen engine not yet wired (Track E — WorldGenContext).
+                            // Script is stored in IDB but skipped at the WASM layer for now.
+                            worldgen_count += 1;
+                        }
+                        other => {
+                            web_sys::console::warn_1(
+                                &format!("[freedom-board] unknown script scope '{}' for '{}'", other, name).into(),
                             );
-                            rules_fail += 1;
+                            unknown_count += 1;
                         }
                     }
                 }
                 web_sys::console::log_1(
-                    &format!("[freedom-board] scripts reloaded: AI {}/{}, rules {}/{}",
-                        ok, ok + fail, rules_ok, rules_ok + rules_fail).into(),
+                    &format!(
+                        "[freedom-board] scripts reloaded: AI {}/{}, rules {}/{}, worldgen {} (deferred){}",
+                        ai_ok, ai_ok + ai_fail,
+                        rules_ok, rules_ok + rules_fail,
+                        worldgen_count,
+                        if unknown_count > 0 { format!(", {} unknown scope", unknown_count) } else { String::new() },
+                    ).into(),
                 );
             }
         });
@@ -2459,6 +2484,17 @@ impl Game for FreedomBoardGame {
 
 // ── WASM Exports ────────────────────────────────────────────────────────────
 
+/// Scoped script entry for hot-reload. Carries source code and the scope
+/// that determines which Rhai engine compiles it:
+/// - "rules"        → RulesScriptEngine (on_event entry point)
+/// - "character_ai" → legacy ScriptEngine (update entry point)
+/// - "world_gen"    → deferred (Track E — WorldGenContext not yet wired)
+#[derive(serde::Deserialize)]
+struct PendingScript {
+    source: String,
+    scope: String,
+}
+
 thread_local! {
     static PENDING_TILE_REGISTRY: std::cell::RefCell<Option<Vec<TileAssetInfo>>> =
         std::cell::RefCell::new(None);
@@ -2481,8 +2517,8 @@ thread_local! {
     static PENDING_IMPORT: std::cell::RefCell<Option<String>> =
         std::cell::RefCell::new(None);
     /// Queued Rhai scripts for hot-reload. Set by `reload_scripts()`, consumed by update().
-    /// Map of script name → source code.
-    static PENDING_SCRIPTS: std::cell::RefCell<Option<std::collections::HashMap<String, String>>> =
+    /// Map of script name → { source, scope }.
+    static PENDING_SCRIPTS: std::cell::RefCell<Option<std::collections::HashMap<String, PendingScript>>> =
         std::cell::RefCell::new(None);
     /// Queued game definition JSON. Set by `load_game_definition()`, consumed by update().
     static PENDING_GAME_DEF: std::cell::RefCell<Option<String>> =
@@ -2785,13 +2821,18 @@ pub fn import_world(json: &str) {
 
 /// Reload Rhai scripts. Called from React when scripts change.
 ///
-/// JSON format: `{ "script_name": "fn update(ctx) { ... }", ... }`
+/// JSON format: `{ "name": { "source": "fn ...", "scope": "rules"|"character_ai"|"world_gen" }, ... }`
+///
+/// Each script is routed to the correct engine based on its scope:
+/// - "rules"        → RulesScriptEngine
+/// - "character_ai" → legacy ScriptEngine (AI per-character)
+/// - "world_gen"    → not yet wired (logged and skipped)
 ///
 /// Scripts are compiled on the next game tick. Compilation errors are
 /// logged to the browser console but do not crash the game.
 #[wasm_bindgen]
 pub fn reload_scripts(scripts_json: &str) {
-    match serde_json::from_str::<std::collections::HashMap<String, String>>(scripts_json) {
+    match serde_json::from_str::<std::collections::HashMap<String, PendingScript>>(scripts_json) {
         Ok(scripts) => {
             let count = scripts.len();
             PENDING_SCRIPTS.with(|p| *p.borrow_mut() = Some(scripts));

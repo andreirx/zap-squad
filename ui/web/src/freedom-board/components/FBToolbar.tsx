@@ -7,6 +7,9 @@ interface FBToolbarProps {
   onSaveToDisk: () => void;
   onLoadFromDisk: () => void;
   onWorldList: () => void;
+  // Script panel toggle
+  showScripts: boolean;
+  onToggleScripts: () => void;
   // Game session controls
   isPlaying: boolean;
   hasGameDef: boolean;
@@ -26,6 +29,7 @@ const TOOLS: { id: Tool; label: string; key: string }[] = [
 
 export function FBToolbar({
   tool, onToolChange, onImport, onSaveToDisk, onLoadFromDisk, onWorldList,
+  showScripts, onToggleScripts,
   isPlaying, hasGameDef, onPlay, onStop,
 }: FBToolbarProps) {
   return (
@@ -136,6 +140,25 @@ export function FBToolbar({
         title="Manage saved worlds (list, rename, delete)"
       >
         Worlds
+      </button>
+
+      {/* Separator — Scripts */}
+      <div style={{ width: 1, height: 20, background: '#0f3460', marginLeft: 4, marginRight: 4 }} />
+
+      <button
+        onClick={onToggleScripts}
+        style={{
+          padding: '4px 10px',
+          background: showScripts ? '#0f3460' : '#1a2a4a',
+          color: showScripts ? '#e0a060' : '#8899aa',
+          border: showScripts ? '1px solid #e0a060' : '1px solid #2a3a5a',
+          borderRadius: 4,
+          cursor: 'pointer',
+          fontSize: 12,
+        }}
+        title="Toggle script editor panel"
+      >
+        Scripts
       </button>
 
       {/* Separator — Play controls */}
