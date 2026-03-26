@@ -258,6 +258,8 @@ export interface WorldCharacter {
   direction: string;
   health: number;
   maxHealth: number;
+  /** Named script from IDB scripts store (e.g., "example_chase_ai"). Optional. */
+  scriptName?: string;
 }
 
 /** Complete world state for persistence. */

@@ -17,22 +17,36 @@ The active UI surface now lives in `ui/web/src/freedom-board/`. `ui/canvas/` rem
 |                     CORE (Pure Rust, no deps)                     |
 |  core/src/entities/freedom_board/                                 |
 |    SparseWorld, Chunk, QuadTreeIndex, TilePlacement, TileCoord    |
+|  core/src/entities/game_rules/                                    |
+|    GameDefinition, GameSession, GamePhase, GameEvent, Teams,      |
+|    Stats, Resources, CharacterTemplate/Instance, Validation       |
 |  core/src/use_cases/freedom_board/                                |
 |    place_tile, erase_tile, flood_fill, query_viewport,            |
 |    connectivity_bitmask, EditResult (undo/redo)                   |
 +-------------------------------------------------------------------+
+|                     ADAPTERS (Rhai bindings)                       |
+|  adapters/src/game_script_bindings.rs                             |
+|    RulesScriptEngine, RulesContext, RulesCommand, GameView        |
+|  adapters/src/script_bindings.rs                                  |
+|    ScriptEngine (legacy AI), ScriptContext, ScriptCommand         |
++-------------------------------------------------------------------+
 |                     INFRASTRUCTURE (Volatile)                     |
 |  infrastructure/wasm-canvas/  (Rust, WASM)                        |
 |    FreedomBoardGame: Game trait impl, event dispatch,             |
-|    entity spawning, asset registry, camera state mirror           |
+|    entity spawning, asset registry, camera state mirror,          |
+|    game session orchestrator, rules script execution,             |
+|    CharacterInstanceId↔ActorId mapping, play/stop lifecycle       |
+|  infrastructure/wasm-validator/  (Rust, WASM)                     |
+|    Authoritative GameDefinition validation (174KB crate)          |
 |  ui/web/src/freedom-board/  (React + TypeScript)                  |
-|    InfiniteCanvas, Toolbar, StatusBar, manifest loader            |
+|    InfiniteCanvas, FBToolbar, StatusBar, AssetPanel,              |
+|    ScriptPanel, WorldListModal, manifest loader                   |
 +-------------------------------------------------------------------+
 ```
 
-Dependency direction: `ui/web/src/freedom-board/ --> wasm-canvas --> core/`. Core never imports from infrastructure.
+Dependency direction: `ui/web/ --> wasm-canvas --> adapters/ --> core/`. Core never imports from adapters or infrastructure.
 
-There is no adapters layer for freedom-board currently. The WASM crate directly imports core entities and use cases. This is acceptable because freedom-board's "adapter" concerns (sprite mapping, event translation) are thin enough to live in the infrastructure layer without violating the dependency rule. If the adapter logic grows (e.g., Rhai scripting bridge, persistence gateway), it should be extracted.
+The adapters layer was introduced for Rhai scripting. `RulesScriptEngine` and `ScriptEngine` register core domain types as Rhai functions. The WASM crate imports both core and adapters.
 
 ---
 
@@ -207,7 +221,9 @@ Read-only. No mutations.
 
 **Crate**: `infrastructure/wasm-canvas/` (Cargo package: `freedom-board-wasm`)
 
-**Role**: Thin adapter between React UI and core SparseWorld. Implements zap-engine's `Game` trait. Contains **zero business logic**.
+**Role**: Bridge between React UI and core. Implements zap-engine's `Game` trait.
+Handles both edit mode (tile/character manipulation) and play mode (game session
+orchestration with rules script execution).
 
 ### FreedomBoardGame
 
@@ -233,6 +249,17 @@ struct FreedomBoardGame {
     // Editor state
     active_asset_id: u16, active_layer: u8, active_variant: u8,
     tool: Tool,
+
+    // Game session (play mode)
+    game_definition: Option<GameDefinition>,
+    game_session: Option<GameSession>,
+    rules_engine: RulesScriptEngine,
+    actor_to_instance: HashMap<ActorId, CharacterInstanceId>,
+    pre_play_snapshot: Option<PrePlaySnapshot>,
+    pending_session_events: Vec<u32>,
+
+    // Legacy character AI
+    scripts: ScriptEngine,
 }
 ```
 
@@ -240,15 +267,21 @@ struct FreedomBoardGame {
 
 ```
 init()   -- check for pending tile registry, log startup
-update() -- process custom events, rebuild entities if dirty, emit stats
+update() -- process pending game session ops, process custom events,
+            run orchestrator (if playing), rebuild entities, emit stats,
+            drain session events
 render() -- no-op (engine draws spawned entities automatically)
 ```
 
 The `update()` loop:
-1. Check `PENDING_TILE_REGISTRY` thread-local for registry updates
-2. Process all `InputEvent::Custom` from the input queue
-3. If `generation` changed or `camera_dirty`, call `rebuild_visible_entities()`
-4. Emit world stats to React if tile count changed
+1. Check `PENDING_GAME_DEF`, `PENDING_START_GAME`, `PENDING_STOP_GAME` thread-locals
+2. Check `PENDING_TILE_REGISTRY` and `PENDING_SCRIPTS` thread-locals
+3. Process all `InputEvent::Custom` from the input queue
+4. If game session active: `run_orchestrator(dt)` — emit Tick, drain events, execute
+   rules script, apply RulesCommands
+5. If `generation` changed or `camera_dirty`, call `rebuild_visible_entities()`
+6. Emit world stats to React if tile count changed
+7. Drain `pending_session_events` as GameEvents (kind=2) to React
 
 ### Rendering Model
 
@@ -309,6 +342,17 @@ The array index IS the asset_id. React and WASM must sort tiles identically (alp
 | kind | a | b | c | Description |
 |------|---|---|---|-------------|
 | 1 | tile_count | chunk_count | -- | World stats update |
+| 2 | code | -- | -- | Session state acknowledgment |
+
+**Session state codes (kind=2):**
+| Code | Meaning |
+|------|---------|
+| 1 | `def_loaded` — GameDefinition parsed and stored |
+| 2 | `playing` — GameSession started successfully |
+| 3 | `stopped` — GameSession stopped, edit mode restored |
+| 4 | `start_failed` — Validation failed, session not started |
+
+React reads these events authoritatively instead of setting local state optimistically.
 
 Events travel through `f32` fields. Integer values (tile coords, IDs) are cast. This is safe for values up to 2^24 (16 million) -- the mantissa width of f32. Tile coordinates within ~8 million on either axis are exact. Beyond that, precision degrades. This is not a concern for practical map sizes.
 
@@ -355,15 +399,18 @@ Creates a single undo entry for the entire stamp.
 
 **Location**: `ui/canvas/`
 
-### Components
+### Components (ui/web/src/freedom-board/)
 
 | Component | Role |
 |-----------|------|
-| `App.tsx` | State container: tool, activeAssetId, worldStats, camera, tiles, LDtk stamp parsing |
-| `InfiniteCanvas.tsx` | Canvas host, camera control, input dispatch to WASM, stamp dispatch |
-| `Toolbar.tsx` | Tool buttons (Pan/Draw/Erase/Fill), tile selector, Import Map button |
-| `DebugPanel.tsx` | Collapsible profiling overlay: TimingBars, FPS, debug flag toggles (grid/crosshair/quadtree) |
+| `FreedomBoardPage.tsx` | Page-level state: tool, game session, script panel toggle, game def selector, Play/Stop dispatch |
+| `InfiniteCanvas.tsx` | Canvas host, camera control, input dispatch to WASM, sendEvent exposure to parent |
+| `FBToolbar.tsx` | Tool buttons, Import/Save/Load/Worlds, Scripts toggle, Play/Stop controls |
+| `AssetPanel.tsx` | Categorized tile/character/weapon selector with sprite previews |
+| `ScriptPanel.tsx` | Right sidebar: script CRUD, scope selector, monospace editor, IDB persistence, WASM reload |
 | `StatusBar.tsx` | Cursor coords, camera state, world stats |
+| `WorldListModal.tsx` | Manage saved worlds: list, rename, delete |
+| `DebugPanel.tsx` | Collapsible profiling overlay: TimingBars, FPS, debug flag toggles |
 
 ### InfiniteCanvas
 
@@ -443,7 +490,7 @@ Assets are **never copied**. They stay in `ui/web/public/assets/` (the single so
 
 Sprite naming convention: `{tile_name}_{index}` where index is typically the variation number (0-based). The engine looks up the sprite in `assets.json` which maps names to atlas coordinates.
 
-**Currently using Canvas2D** (`force2D: true`) due to WebGPU texture size limitation. See MEMORY.md for details. When fixed, remove `force2D` flag.
+**WebGPU rendering restored** (2026-03-26). `force2D: true` removed — largest atlas is 2400x1536, well under the 8192 default WebGPU texture limit. Was required when skirt atlases exceeded 16384.
 
 ---
 
@@ -499,17 +546,23 @@ Total: **77 tests** covering core entities and use cases.
 
 ## Maturity Level
 
-**PROTOTYPE**
+**PROTOTYPE → MATURE** (editor is mature; runtime shell is prototype)
 
 ### What Works
 - Full CRUD on infinite sparse grid with correct negative coordinates
 - Quadtree spatial indexing with dynamic growth
 - LOD aggregation infrastructure in core (not yet wired to WASM)
 - Complete undo/redo delta system
-- WASM rendering via zap-engine entity spawning
+- WASM rendering via zap-engine entity spawning (WebGPU)
 - Camera pan/zoom with cursor-centered zoom
 - Tile registry transport from React to WASM
 - Environment-based asset URL configuration
+- Game session orchestrator: load GameDefinition, validate, start/stop with snapshot restore
+- Rules script execution: event emission, script dispatch, command application
+- Script Panel: create/edit/rename/delete scripts, IDB persistence, scoped WASM reload
+- Play/Stop controls with authoritative SESSION_STATE acknowledgment events
+- IDB v4 with 7 stores including dedicated scripts store
+- Corrupted-database recovery (missing stores → auto-delete and recreate)
 
 ### Known Technical Debt
 
@@ -519,10 +572,10 @@ Total: **77 tests** covering core entities and use cases.
 | **LOD rendering not wired** | Low | `query_viewport_lod()` exists in core and quadtree supports it, but WASM always uses `query_viewport()`. Wire when infinite zoom-out is needed. |
 | **Undo stack unbounded** | Medium | `Vec<Vec<EditResult>>` grows without limit. Need max depth (e.g., 1000 operations) with tail truncation. |
 | ~~No persistence~~ | ~~High~~ | IN PROGRESS (2026-03-22). IDB module done. WASM serialize/deserialize done. Worker bridge and React wiring pending. See `docs/storage-architecture.md`. |
-| **No Rhai scripting** | High | Play mode not implemented. SparseWorld is ready to be read/mutated by scripts but the scripting bridge doesn't exist yet. |
+| ~~No Rhai scripting~~ | ~~High~~ | DONE (2026-03-26). Rules scripting fully wired: RulesScriptEngine, orchestrator, Play/Stop lifecycle, Script Panel with IDB persistence, scoped reload. Character AI via legacy path. |
 | **f32 event precision** | Low | Tile coordinates and asset IDs travel as f32 in the custom event protocol. Safe up to 2^24 (~16M). Not a concern for practical use but worth documenting. |
 | **Deterministic registry ordering** | Medium | Alphabetical sort of tile IDs for asset_id assignment means adding a tile can shift all IDs. Serialized maps must store tile names, not IDs. |
-| **Force2D rendering** | Low | Using Canvas2D fallback due to WebGPU texture size limit. Fix: request `maxTextureDimension2D: 16384` in `requestDevice()`. |
+| ~~Force2D rendering~~ | ~~Low~~ | DONE (2026-03-26). `force2D` removed. Largest atlas 2400x1536, under WebGPU 8192 default. |
 | **Feathered tiles not in production pipeline** | Medium | `feather_atlases.py` is Python; AWS Lambda/production needs a WASM-based equivalent. Currently a local dev tool only. |
 | ~~Path connectivity not wired~~ | ~~Medium~~ | DONE (2026-03-21). WASM uses `connectivity_bitmask()` for PATH and BRIDGE tiles. |
 | ~~Bridge auto-placement not wired~~ | ~~Medium~~ | DONE (2026-03-21). WASM auto-spawns bridge entities under LAND PATHs over water. |
@@ -545,6 +598,11 @@ Total: **77 tests** covering core entities and use cases.
 | **SAB lock flag for data consistency** | Medium | SharedArrayBuffer has no read-side lock. Worker writes + renderer reads concurrently. Causes occasional tile position glitches during pan/zoom. Fix: HEADER_LOCK check in frame reader. |
 | **Chunk-level serialization** | High | Large worlds (10M+ tiles) need chunk-level save/load (stream chunks as camera moves) rather than monolithic JSON. WASM memory ceiling is ~4GB. |
 | **movementCost not in AssetPanel** | Low | Tile passable/movementCost lives in per-tile `properties.json` files under `/mods/tiles/`, not in `manifest.json`. AssetPanel shows terrainType (LAND/WATER) only. Fix: either merge properties into manifest during bake, or batch-fetch properties.json files on startup (18 requests). |
+| **Character script assignment UI** | High | No Freedom Board UI to bind a named script from IDB to a placed character. Legacy runtime uses numeric `script_id`, not named scripts. Blocks character AI from being testable through the Script Panel. |
+| **Compile error feedback to UI** | Medium | Script compilation errors logged to browser console only. WASM does not emit compile errors as game events or return them from reload_scripts. Script Panel has no compile status display. |
+| **wasm-canvas has zero tests** | High | The orchestrator, session lifecycle, command application, event emission, and snapshot/restore have no automated tests. All verification is manual. Headless test seam needed. |
+| **Play HUD does not exist** | Medium | No visible indication of current phase, game mode, team resources, turn number, or session status during play mode. Validation failures only surface in console. |
+| **World gen scripts not compiled** | Low | WASM explicitly skips `world_gen` scope during `reload_scripts`. Scripts stored in IDB but not executable. Track D. |
 
 ### Assumptions
 
@@ -556,7 +614,7 @@ Total: **77 tests** covering core entities and use cases.
 
 ### Divergences from Original Plan
 
-1. **No adapters layer**: The WASM crate imports core directly. If Rhai scripting or persistence gateways are added, an adapters layer should be introduced.
+1. ~~**No adapters layer**~~: RESOLVED (2026-03-26). The adapters layer was introduced for Rhai scripting (`adapters/src/game_script_bindings.rs`, `adapters/src/script_bindings.rs`). WASM imports both core and adapters.
 2. **Camera owned by React**: Originally considered WASM-owned camera. React-owned was chosen because the infinite canvas pan/zoom is a UI concern, and React already handles pointer events natively.
 3. **Multi-layer tiles**: ADR-007 (2026-03-21). `MAX_LAYERS=8`. Chunk stores `[[Option<TP>; 8]; 1024]` (64KB). Layer auto-derived from tile type in React via `tileTypeToLayer()`. Ground=0, Water=1, Bridge=2, Path=3, Objects=4, Reserved=5-7.
 4. **Feathered tile edges replace transitions**: ADR-006. Terrain blending uses pre-baked alpha feathering instead of 8-directional transition sprites. See `docs/tile-rendering-system.md` and `docs/architecture_decisions.md`.

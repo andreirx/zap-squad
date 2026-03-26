@@ -115,6 +115,9 @@ mod game_events {
     pub const WORLD_STATS: u32 = 1;
     /// Session state acknowledgment. a=state_code: 1=def_loaded, 2=playing, 3=stopped, 4=start_failed.
     pub const SESSION_STATE: u32 = 2;
+    /// Character selection changed. a=1 (selected), a=0 (deselected).
+    /// When a=1: b=actor_id (f32). Detailed info sent via take_selected_character_info().
+    pub const CHARACTER_SELECTED: u32 = 3;
 }
 
 /// Editor tool modes.
@@ -604,6 +607,7 @@ impl FreedomBoardGame {
                 // a=tile_x, b=tile_y — select character at this tile
                 let tx = a as f32 + 0.5;
                 let ty = b as f32 + 0.5;
+                let prev = self.selected_character;
                 self.selected_character = self
                     .characters
                     .iter()
@@ -611,7 +615,32 @@ impl FreedomBoardGame {
                         (c.position.x - tx).abs() < 0.5 && (c.position.y - ty).abs() < 0.5
                     })
                     .map(|(id, _)| *id);
-                self.characters_dirty = true; // redraw selection indicator
+                self.characters_dirty = true;
+
+                // Write selection info for React character panel.
+                // React reads this via take_selected_character_info() after each frame.
+                if self.selected_character != prev {
+                    if let Some(sel_id) = self.selected_character {
+                        if let Some(actor) = self.characters.get(&sel_id) {
+                            let info = serde_json::json!({
+                                "actorId": sel_id.0,
+                                "bodyDefId": actor.body_def_id,
+                                "scriptName": actor.script_name,
+                                "x": actor.position.x,
+                                "y": actor.position.y,
+                                "health": actor.health,
+                                "maxHealth": actor.max_health,
+                            });
+                            SELECTED_CHARACTER_INFO.with(|p| {
+                                *p.borrow_mut() = Some(info.to_string());
+                            });
+                        }
+                    } else {
+                        SELECTED_CHARACTER_INFO.with(|p| {
+                            *p.borrow_mut() = Some(String::new());
+                        });
+                    }
+                }
             }
             events::MOVE_CHARACTER => {
                 // a=tile_x, b=tile_y — command selected character to walk here.
@@ -762,11 +791,22 @@ impl FreedomBoardGame {
     fn run_scripts(&mut self) {
         const DT: f32 = 1.0 / 60.0;
 
-        // Collect actor IDs that have scripts (can't borrow self mutably during iteration)
-        let scripted: Vec<(ActorId, ScriptId)> = self
+        // Collect actor IDs that have scripts (can't borrow self mutably during iteration).
+        // Prefer script_name (named scripts from IDB) over legacy numeric script_id.
+        let scripted: Vec<(ActorId, String)> = self
             .characters
             .values()
-            .filter_map(|a| a.script_id.map(|sid| (a.id, sid)))
+            .filter_map(|a| {
+                // script_name takes precedence — it's the IDB-stored name
+                if let Some(ref name) = a.script_name {
+                    return Some((a.id, name.clone()));
+                }
+                // Legacy fallback: numeric script_id → "script_{id}"
+                if let Some(sid) = a.script_id {
+                    return Some((a.id, format!("script_{}", sid.0)));
+                }
+                None
+            })
             .collect();
 
         if scripted.is_empty() {
@@ -782,13 +822,12 @@ impl FreedomBoardGame {
         // Run each script and collect commands
         let mut all_commands: Vec<(ActorId, Vec<ScriptCommand>)> = Vec::new();
 
-        for (actor_id, script_id) in &scripted {
+        for (actor_id, script_name) in &scripted {
             let actor = match self.characters.get(actor_id) {
                 Some(a) => a,
                 None => continue,
             };
 
-            let script_name = format!("script_{}", script_id.0);
             let ctx = zapsquad_adapters::script_bindings::ScriptContext::new(
                 *actor_id,
                 actor.position,
@@ -796,7 +835,7 @@ impl FreedomBoardGame {
                 query.clone(),
             );
 
-            match self.scripts.run_update_with_context(&script_name, ctx) {
+            match self.scripts.run_update_with_context(script_name, ctx) {
                 Ok(commands) => {
                     if !commands.is_empty() {
                         all_commands.push((*actor_id, commands));
@@ -1878,6 +1917,8 @@ impl FreedomBoardGame {
             direction: String,
             health: i32,
             max_health: i32,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            script_name: Option<String>,
         }
 
         #[derive(serde::Serialize)]
@@ -1937,6 +1978,7 @@ impl FreedomBoardGame {
                     direction: dir_str.to_string(),
                     health: actor.health,
                     max_health: actor.max_health,
+                    script_name: actor.script_name.clone(),
                 }
             })
             .collect();
@@ -2006,6 +2048,7 @@ impl FreedomBoardGame {
             direction: String,
             health: i32,
             max_health: i32,
+            script_name: Option<String>,
         }
 
         #[derive(serde::Deserialize)]
@@ -2086,6 +2129,7 @@ impl FreedomBoardGame {
             actor.direction = direction;
             actor.health = ch.health;
             actor.max_health = ch.max_health;
+            actor.script_name = ch.script_name.clone();
             self.characters.insert(id, actor);
         }
         self.character_generation += 1;
@@ -2418,6 +2462,46 @@ impl Game for FreedomBoardGame {
         // 0g. Check for pending game session operations (load def, start, stop)
         self.check_pending_game_session();
 
+        // 0h. Process pending character script assignments
+        PENDING_SCRIPT_ASSIGNMENT.with(|p| {
+            let assignments = std::mem::take(&mut *p.borrow_mut());
+            for (actor_id_u32, script_name) in assignments {
+                let actor_id = ActorId(actor_id_u32);
+                if let Some(actor) = self.characters.get_mut(&actor_id) {
+                    let old = actor.script_name.clone();
+                    actor.script_name = script_name.clone();
+                    web_sys::console::log_1(
+                        &format!(
+                            "[freedom-board] character {} script: {:?} → {:?}",
+                            actor_id_u32, old, script_name
+                        ).into(),
+                    );
+                    self.characters_dirty = true;
+
+                    // Refresh selected-character info so the React panel
+                    // sees the updated script_name without a re-select.
+                    if self.selected_character == Some(actor_id) {
+                        let info = serde_json::json!({
+                            "actorId": actor_id.0,
+                            "bodyDefId": actor.body_def_id,
+                            "scriptName": actor.script_name,
+                            "x": actor.position.x,
+                            "y": actor.position.y,
+                            "health": actor.health,
+                            "maxHealth": actor.max_health,
+                        });
+                        SELECTED_CHARACTER_INFO.with(|si| {
+                            *si.borrow_mut() = Some(info.to_string());
+                        });
+                    }
+                } else {
+                    web_sys::console::warn_1(
+                        &format!("[freedom-board] assign_script: actor {} not found", actor_id_u32).into(),
+                    );
+                }
+            }
+        });
+
         // 1. Process all custom events from React
         for event in input.iter() {
             if let InputEvent::Custom { kind, a, b, c } = event {
@@ -2529,6 +2613,14 @@ thread_local! {
     /// Flag to stop the active game session. Set by `stop_game()`, consumed by update().
     static PENDING_STOP_GAME: std::cell::RefCell<bool> =
         std::cell::RefCell::new(false);
+    /// Queued script assignments: (actor_id_u32, Option<script_name>).
+    /// Set by `assign_character_script()`, consumed by update().
+    static PENDING_SCRIPT_ASSIGNMENT: std::cell::RefCell<Vec<(u32, Option<String>)>> =
+        std::cell::RefCell::new(Vec::new());
+    /// JSON string describing the currently selected character.
+    /// Written by update() when selection changes, read by `take_selected_character_info()`.
+    static SELECTED_CHARACTER_INFO: std::cell::RefCell<Option<String>> =
+        std::cell::RefCell::new(None);
 }
 
 /// Load the tile asset registry. Called by the engine worker via `reload_game_manifest` dispatch.
@@ -2871,6 +2963,33 @@ pub fn start_game() {
 pub fn stop_game() {
     PENDING_STOP_GAME.with(|p| *p.borrow_mut() = true);
     web_sys::console::log_1(&"[freedom-board] game stop requested".into());
+}
+
+// ── Character script assignment WASM exports ────────────────────────────────
+
+/// Assign a named script to a character. Called from React when the user
+/// selects a script in the character property panel.
+///
+/// `actor_id_f32`: The ActorId as f32 (safe up to 2^24).
+/// `script_name`: Script name from IDB scripts store, or empty string to clear.
+#[wasm_bindgen]
+pub fn assign_character_script(actor_id_f32: f32, script_name: &str) {
+    PENDING_SCRIPT_ASSIGNMENT.with(|p| {
+        let actor_id = actor_id_f32 as u32;
+        let name = if script_name.is_empty() { None } else { Some(script_name.to_string()) };
+        p.borrow_mut().push((actor_id, name));
+    });
+}
+
+/// Return JSON info about the currently selected character, or empty string
+/// if none is selected. Called by the worker after each frame to provide
+/// selection data to React.
+///
+/// Returns: `{ "actorId": 5, "bodyDefId": "marine", "scriptName": "patrol_ai", "x": 3.5, "y": 7.5 }`
+/// or `""` if no character is selected.
+#[wasm_bindgen]
+pub fn take_selected_character_info() -> String {
+    SELECTED_CHARACTER_INFO.with(|p| p.borrow_mut().take().unwrap_or_default())
 }
 
 // Export the game using zap-web macro.

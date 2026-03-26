@@ -46,17 +46,21 @@ Editors continue to work with raw 128x128 source sprites.
 
 Freedom Board uses baked feathered atlases. Feathering is an intermediate transformation step, ultimately performed in WASM in the client/runtime pipeline, not in Python-only infrastructure and not inside the editors themselves.
 
-### 5. Scripting starts with character behavior
+### 5. Scripting has three scopes, rules shipped first
 
-The first scripting model for kids is character behavior scripting:
-- patrol
-- chase
-- flee
-- guard
-- follow
-- attack
+The scripting model has three isolated scopes:
+- **Rules scripts** (`fn on_event(ctx)`) — game-level logic: spawning, resources, win conditions
+- **Character AI scripts** (`fn update(ctx)`) — per-character behavior: patrol, chase, attack
+- **World gen scripts** (`fn generate(ctx)`) — procedural map setup
 
-World generation scripts and game-rule scripts remain valid future directions, but the first user-facing scripting milestone is character AI and behavior.
+The first user-facing scripting milestone delivered was **rules scripting** — the orchestrator
+runs rules scripts during Play mode, executing commands that mutate game state. Character AI
+scripting exists through a legacy path but lacks a UI for assigning named scripts to placed
+characters. World gen scripting remains deferred.
+
+The original plan assumed character behavior would ship first. In practice, rules scripting
+was the natural first scope because it validates the entire orchestrator spine: event emission,
+script execution, command application, and session lifecycle.
 
 ### 6. Asset model simplification
 
@@ -137,13 +141,15 @@ The remaining work is no longer about proving that the engine can render. It is 
 
 ### Feature track
 
-1. Character scripting UI
-2. Script assignment and reload flow
-3. Script persistence
-4. Attack UI and ranged-attack flow
-5. Multi-select and group commands
-6. Commander/follower behavior
-7. Reliable idle/attack/return animation state behavior
+1. ~~Script authoring/persistence~~ — DONE: Script Panel, IDB v4 `scripts` store, scoped reload
+2. ~~Rules scripting~~ — DONE: orchestrator, Play/Stop lifecycle, rules command application
+3. Character script assignment to placed characters (by name, not numeric id)
+4. Play HUD and compile/runtime error visibility
+5. World generation execution
+6. Character AI migration to `CharacterAiContext`
+7. Attack UI and ranged-attack flow
+8. Multi-select and group commands
+9. Commander/follower behavior
 
 ### Platform track
 

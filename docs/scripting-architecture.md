@@ -45,7 +45,8 @@ emit commands that the orchestrator applies after execution completes.
 │    PENDING_SCRIPTS  ── thread_local hot-reload queue           │
 │    reload_scripts() ── WASM export for React → WASM            │
 │    run_scripts()    ── per-frame script execution loop         │
-│    Orchestrator     ── (FUTURE) drives GameSession + 3 scopes  │
+│    Orchestrator     ── LIVE: drives GameSession + rules scope   │
+│                        (AI = legacy path, world gen = deferred) │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -177,15 +178,22 @@ The orchestrator must map the string to the `ZoneType` enum. See `docs/game-rule
 ### Phase A: Script Text → WASM
 
 ```
-React UI (textarea or file load)
+Script Panel (IDB scripts store)
     │
-    ▼
-JavaScript: JSON.stringify({ "my_ai": "fn update(ctx) { ... }", ... })
+    ├── User edits script in textarea
+    ├── Saves to IDB: scriptStore.save(name, source, scope)
     │
+    ▼  Reload button
+JavaScript: JSON.stringify({
+    "my_rules": { "source": "fn on_event(ctx) { ... }", "scope": "rules" },
+    "patrol_ai": { "source": "fn update(ctx) { ... }", "scope": "character_ai" }
+})
+    │  (editor buffer overlaid for dirty scripts — WASM runs what user sees)
     ▼
 WASM export: reload_scripts(json_string)
     │  [wasm-canvas/src/lib.rs]
-    │  Parses JSON into HashMap<String, String>
+    │  Parses JSON into HashMap<String, PendingScript>
+    │  PendingScript = { source: String, scope: String }
     │  Stores in thread_local PENDING_SCRIPTS
     ▼
 (Queued — not compiled yet)
@@ -198,12 +206,17 @@ FreedomBoardGame::update()
     │
     ├── Check PENDING_SCRIPTS thread_local
     │   If Some(scripts):
-    │     ├── self.scripts.clear_scripts()         — wipe old ASTs
-    │     ├── For each (name, source):
-    │     │     self.scripts.compile_script(name, source)
+    │     ├── self.scripts.clear_scripts()           — wipe old AI ASTs
+    │     ├── self.rules_engine.clear_scripts()      — wipe old rules ASTs
+    │     ├── For each (name, entry):
+    │     │     match entry.scope:
+    │     │       "character_ai" → self.scripts.compile_script(name, source)
+    │     │       "rules"        → self.rules_engine.compile_script(name, source)
+    │     │       "world_gen"    → skipped (Track D — WorldGenContext not yet wired)
+    │     │       _              → warning logged
     │     │     └── Engine::compile(source) → AST
-    │     │         Stored in HashMap<String, CompiledScript>
-    │     └── Log success/failure per script
+    │     │         Stored in HashMap<String, CompiledScript> per engine
+    │     └── Log success/failure counts per scope
     │
     └── Continue to run_scripts()
 ```
@@ -240,28 +253,35 @@ FreedomBoardGame::run_scripts()
         └── SetVelocity → override velocity directly
 ```
 
-### Phase D: Event-Driven Execution (Rules Scripts) — FUTURE
+### Phase D: Event-Driven Execution (Rules Scripts) — LIVE (2026-03-26)
 
 ```
-Orchestrator (future, in wasm-canvas)
+FreedomBoardGame::run_orchestrator(dt)   [wasm-canvas/src/lib.rs]
     │
+    ├── Push Tick { dt } event to GameSession
     ├── GameSession.events.drain()
     │   └── For each GameEvent:
+    │       ├── event_to_dto() → (event_name, event_data, event_strings)
     │       ├── Create RulesContext {
-    │       │     game: GameView (read-only DTO),
-    │       │     event_name, event_data,
+    │       │     game: GameView (read-only snapshot),
+    │       │     event_name, event_data, event_strings,
     │       │     commands: Vec<RulesCommand>
     │       │   }
-    │       ├── Engine::call_fn(&rules_ast, "on_event", (ctx,))
+    │       ├── rules_engine.run_on_event(script_name, ctx)
+    │       │   └── Engine::call_fn(&ast, "on_event", (ctx,))
     │       └── ctx.take_commands() → Vec<RulesCommand>
     │
-    └── Apply all RulesCommands:
-        ├── SpawnUnit → CharacterInstance::from_template(), attach actor
-        ├── KillUnit → mark dead, detach actor
+    └── apply_rules_command() for each command:
+        ├── SpawnUnit → CharacterInstance::from_template(), CompositeActor,
+        │               actor_to_instance mapping
+        ├── KillUnit → mark dead, remove actor, clean up mapping
         ├── ModifyStat → CharacterInstance.modify_stat()
+        ├── SetStat → CharacterInstance.set_stat()
         ├── ModifyResource → TeamState.resources mutation
         ├── SetPhase → GameSession.phase transition
-        └── EndGame → GameSession.phase = Ended { winner }
+        ├── EndGame → GameSession.phase = Ended { winner }
+        ├── EmitEvent → push Custom event to GameSession.events
+        └── Log → web_sys::console::log_1
 ```
 
 ### Phase E: World Generation — FUTURE

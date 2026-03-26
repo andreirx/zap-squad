@@ -148,6 +148,10 @@ pub struct CompositeActor {
 
     // Gameplay
     pub script_id: Option<ScriptId>,
+    /// Named script reference (e.g., "patrol_ai"). Foreign key into the
+    /// compiled script cache. Persisted in world saves. Takes precedence
+    /// over `script_id` (numeric legacy path) when both are set.
+    pub script_name: Option<String>,
     pub tag: String,
 
     // Animation timing
@@ -169,6 +173,7 @@ impl CompositeActor {
             health: 100,
             max_health: 100,
             script_id: None,
+            script_name: None,
             tag: String::new(),
             animation_frame: 0,
             animation_timer: 0.0,
@@ -188,9 +193,15 @@ impl CompositeActor {
         self
     }
 
-    /// Builder: set script
+    /// Builder: set script (legacy numeric ID)
     pub fn with_script(mut self, script_id: ScriptId) -> Self {
         self.script_id = Some(script_id);
+        self
+    }
+
+    /// Builder: set script by name (preferred over numeric ID)
+    pub fn with_script_name(mut self, name: impl Into<String>) -> Self {
+        self.script_name = Some(name.into());
         self
     }
 

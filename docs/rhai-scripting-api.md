@@ -322,17 +322,23 @@ Current state of the game session.
 
 ## Loading Scripts
 
-Scripts are loaded via the WASM `reload_scripts(json)` export. The JSON format is:
+Scripts are persisted in IndexedDB (v4, `scripts` store) and loaded into WASM via
+the `reload_scripts(json)` export. The wire format is scoped:
 
 ```json
 {
-  "my_rules": "fn on_event(ctx) { ... }",
-  "patrol_ai": "fn update(ctx) { ... }",
-  "worldgen": "fn generate(ctx) { ... }"
+  "my_rules": { "source": "fn on_event(ctx) { ... }", "scope": "rules" },
+  "patrol_ai": { "source": "fn update(ctx) { ... }", "scope": "character_ai" },
+  "worldgen": { "source": "fn generate(ctx) { ... }", "scope": "world_gen" }
 }
 ```
 
-All scripts are compiled to AST on load. Compilation errors are logged to the
+Each script is routed to the correct Rhai Engine based on its `scope`:
+- `"rules"` → `RulesScriptEngine` (isolated engine for rules scope)
+- `"character_ai"` → legacy `ScriptEngine` (per-character AI)
+- `"world_gen"` → not yet compiled (deferred to Track D)
+
+Scripts are compiled to Rhai AST on load. Compilation errors are logged to the
 browser console. Scripts that fail to compile are silently skipped during execution.
 
 Script names are referenced by:
@@ -352,6 +358,8 @@ Script names are referenced by:
 | Rules queries (all 6) | Working — read from GameView snapshot |
 | Event DTO (numeric + string channels) | Working — no data loss at boundary |
 | Character AI execution (update) | Working — legacy path via ScriptContext |
-| World gen execution (generate) | Not yet wired — Track E |
-| Script hot-reload | Working — reload_scripts() WASM export |
-| Script persistence in IDB | Not yet implemented — Track C |
+| World gen execution (generate) | Not yet wired — Track D |
+| Script hot-reload | Working — scoped reload_scripts() WASM export |
+| Script persistence in IDB | Working — IDB v4 `scripts` store, Script Panel UI |
+| Scoped routing at WASM boundary | Working — rules → RulesScriptEngine, AI → ScriptEngine |
+| Compile error feedback to UI | Not yet — console only |

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { scriptStore } from '../../lib/idb';
 import type { ScriptScope, ScriptRecord } from '../../lib/idb';
+import { RhaiEditor } from './RhaiEditor';
 
 // ── Types ─────────────────────────────────────────────────────────────
 
@@ -214,7 +215,6 @@ export function ScriptPanel({ onReloadScripts, disabled = false }: ScriptPanelPr
   const [renaming, setRenaming] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
 
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const statusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── Helpers ──────────────────────────────────────────────────────
@@ -456,6 +456,13 @@ export function ScriptPanel({ onReloadScripts, disabled = false }: ScriptPanelPr
     }
   }, [onReloadScripts, selectedName, editSource, editScope, dirty, flash, flashError]);
 
+  // ── Editor change handler ──────────────────────────────────────
+
+  const handleEditorChange = useCallback((newValue: string) => {
+    setEditSource(newValue);
+    setDirty(true);
+  }, []);
+
   // ── Keyboard shortcuts ──────────────────────────────────────────
 
   const handleKeyDown = useCallback((ev: React.KeyboardEvent) => {
@@ -676,30 +683,13 @@ export function ScriptPanel({ onReloadScripts, disabled = false }: ScriptPanelPr
         </div>
       )}
 
-      {/* ── Editor textarea ────────────────────────────────────── */}
+      {/* ── Editor (CodeMirror 6 via RhaiEditor) ────────────────── */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
         {selectedName ? (
-          <textarea
-            ref={textareaRef}
+          <RhaiEditor
             value={editSource}
-            onChange={e => { setEditSource(e.target.value); setDirty(true); }}
-            disabled={disabled}
-            spellCheck={false}
-            style={{
-              flex: 1,
-              resize: 'none',
-              background: '#080c14',
-              color: '#c8d0dc',
-              border: 'none',
-              padding: '8px 10px',
-              fontFamily: '"JetBrains Mono", "Fira Code", "Cascadia Code", "Consolas", monospace',
-              fontSize: 12,
-              lineHeight: 1.5,
-              tabSize: 4,
-              outline: 'none',
-              opacity: disabled ? 0.5 : 1,
-            }}
-            placeholder="// Write your Rhai script here..."
+            onChange={handleEditorChange}
+            readOnly={disabled}
           />
         ) : (
           <div style={{

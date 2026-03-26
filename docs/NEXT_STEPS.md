@@ -7,13 +7,13 @@ The direction is:
 - Freedom Board as the primary runtime/editor surface
 - source-asset editors as supporting tools
 - local-first persistence
-- game rules authoring and scripted gameplay as the next product milestone
+- game rules authoring and scripted gameplay as the current product milestone
 
 Support code that is not exposed as a finished feature remains incomplete.
 
 ---
 
-## Current State (2026-03-24)
+## Current State (2026-03-26)
 
 ### Complete (support + user-facing feature)
 
@@ -21,8 +21,9 @@ Support code that is not exposed as a finished feature remains incomplete.
   feathered rendering, character placement/movement, A* pathfinding with terrain costs,
   undo/redo, auto-save to IDB, world list modal, save/load to disk.
 - **Editors** — Tile, Character, Object, Map editors all authoring assets via IDB.
-- **Persistence** — IDB v3 (6 stores), IdbStorage gateway, auto-save, explicit disk save/load,
-  asset export/import.
+- **Persistence** — IDB v4 (7 stores: assets, levels, worlds, config, files, game_defs,
+  scripts), IdbStorage gateway, auto-save, explicit disk save/load, asset export/import.
+  Corrupted-state recovery (missing stores → auto-delete and recreate).
 - **Path connectivity** — Land paths cross-connect across types, water paths type-strict,
   bridges over impassable terrain.
 - **Atlas baking + feathering** — `bake-atlases.ts`, `wasm-feather` WASM crate.
@@ -32,27 +33,49 @@ Support code that is not exposed as a finished feature remains incomplete.
   serialization, complete world binding form, character templates, win conditions.
 - **WASM validation bridge** — `wasm-validator` crate (174KB), authoritative Rust validation
   surfaced in the Rules Editor.
+- **Orchestrator skeleton** — `FreedomBoardGame` owns `GameSession`, `RulesScriptEngine`,
+  `CharacterInstanceId↔ActorId` mapping. Loads `GameDefinition` via WASM export, validates
+  before start, emits `GameStart`/`Tick` events, drains events through rules script,
+  applies `RulesCommand`s (spawn, kill, modify stat/resource, set phase, end game).
+  `PrePlaySnapshot` for idempotent start/stop. SESSION_STATE acknowledgment events
+  (kind=2) drive React UI authoritatively.
+- **Script Panel** — Right sidebar in Freedom Board. Scripts persisted in IDB `scripts`
+  store. Create, rename (with dangling-reference warning), delete. Scope-aware
+  (rules/character_ai/world_gen). Monospace textarea editor with dirty tracking.
+  Reload to WASM via scoped wire format `{ name: { source, scope } }`. Editor buffer
+  overlay on reload (WASM runs what the user sees). Error handling on all IDB operations.
+  Example scripts (rules + two AI patterns) via Examples button.
+- **Play/Stop controls** — FBToolbar Play/Stop buttons. Game definition selector dropdown.
+  Edit tools disabled during play. State driven by WASM acknowledgment events.
+- **Scoped script routing** — WASM `reload_scripts()` parses scoped format and routes
+  `rules` → `RulesScriptEngine`, `character_ai` → legacy `ScriptEngine`. `world_gen`
+  scripts stored in IDB but skipped at WASM layer (Track D).
+- **WebGPU rendering** — `force2D` removed. Largest atlas is 2400x1536, under 8192 limit.
 
 ### Support-complete but not feature-complete
 
-- **Three-scope script DTOs** — CharacterAiContext, RulesContext, WorldGenContext with
-  command/context types. Rust methods defined but not registered in Rhai.
-- **GameSession lifecycle** — from_definition, phase transitions, turn rotation, event queue.
-  No WASM code creates or drives a session.
-- **GameEvent system** — 18 event types. No code emits events into the queue.
-- **Combat use case** — apply_damage, calculate_damage with 6 tests.
+- **Three-scope script DTOs** — `CharacterAiContext`, `RulesContext`, `WorldGenContext` with
+  command/context types. `RulesContext` fully registered in Rhai. `CharacterAiContext` and
+  `WorldGenContext` not yet registered.
+- **Character AI (legacy path)** — `ScriptEngine` + `ScriptContext` + `ActorId` runs
+  per-frame AI. Works but uses old `script_id` assignment, not named scripts from IDB.
+  No Freedom Board UI to assign a script name to a placed character.
+- **GameEvent system** — 18 event types. `GameStart`, `Tick` emitted by orchestrator.
+  Other events (`UnitDamaged`, `UnitKilled`, etc.) emitted by `apply_rules_command`.
+- **Combat use case** — `apply_damage`, `calculate_damage` with 6 tests.
   No targeting UI, no combat feedback.
-- **Legacy scripting** — ScriptEngine, hot reload, per-frame AI execution. Uses old
-  ScriptContext/ActorId path, not three-scope architecture.
 
 ### Not started
 
-- Script Editor UI
-- WASM orchestrator (game session runtime)
-- Play Mode
-- Combat UX
+- Play Mode HUD (phase, resources, turns, team indicators)
+- Character script assignment UI (bind named script to placed character)
+- World generation execution (run `fn generate(ctx)` during Setup phase)
+- Character AI migration to `CharacterAiContext` (replace legacy `ScriptContext`)
+- Combat UX (targeting, ranged attacks, feedback)
 - Group commands (multi-select, commander/follower)
-- Canvas-based zone editor (form-based exists)
+- Canvas-based zone editor (form-based exists in Rules Editor)
+- Compile error feedback from WASM to UI (currently console-only)
+- Headless orchestrator tests (wasm-canvas has zero tests)
 
 ---
 
@@ -65,59 +88,71 @@ behave according to the rules they authored.
 
 ---
 
-### Phase A: Orchestrator Skeleton (architectural spine)
+### Phase A: Orchestrator Skeleton — COMPLETE (2026-03-26)
 
-**Goal:** Prove the hardest boundary — load a GameDefinition into the Freedom Board
-runtime, create a GameSession, execute rules scripts, and apply commands end to end.
-
-**Tasks:**
-1. Add `GameSession` field to `FreedomBoardGame` in wasm-canvas
-2. New WASM export: `load_game_definition(json)` — parse, store, create session
-3. Build `CharacterInstanceId <-> ActorId` mapping layer
-4. Emit `GameStart` and `Tick` events into the session EventQueue
-5. Register `RulesContext` as a Rhai type with all cmd_* and query_* methods
-6. Execute rules script on each event, collect `RulesCommand`s
-7. Apply commands: `SpawnUnit`, `KillUnit`, `ModifyStat`, `ModifyResource`, `SetPhase`, `EndGame`
-8. Add `start_game()` / `stop_game()` WASM exports
-9. Add Play/Stop controls in Freedom Board toolbar
-10. Validation gate before start (call wasm-validator, show failures)
-
-**Done when:**
-- A saved GameDefinition with a rules script can run in the Freedom Board
-- `GameStart` fires, rules script responds, commands apply to session state
-- Play/Stop works without crashes
+Load GameDefinition, validate, create GameSession, emit events, execute rules
+script, apply commands, start/stop with snapshot restore. Scoped script routing.
+SESSION_STATE acknowledgment events. Script Panel with IDB persistence.
 
 ---
 
-### Phase B: Script Editor UI
+### Phase B: Script Editor + Play Controls — COMPLETE (2026-03-26)
 
-**Goal:** Give kids a surface to write and test scripts.
-
-**Tasks:**
-1. New panel or route for script editing
-2. Scope tabs: Character AI / Rules / World Gen
-3. Script list by name, textarea editor
-4. Compile button with error output (from ScriptEngine.compile_script)
-5. Save scripts to IDB
-6. Wire reload to WASM via `reload_scripts()` export
-7. Status display: loaded / compile failed / active
-
-**Done when:**
-- A kid can write a rules script, save it, load it into the Freedom Board, and see it execute
-- Compilation errors are displayed in the UI, not just in the console
+Script Panel in Freedom Board sidebar. IDB v4 `scripts` store. Scoped reload
+to WASM. Example scripts. Play/Stop toolbar controls. Game definition selector.
+Error handling on all IDB operations. WebGPU rendering restored.
 
 ---
 
-### Phase C: Character AI Migration
+### Phase C: Character Script Assignment + Play HUD
 
-**Goal:** Replace legacy ScriptContext/ScriptCommand/ActorId execution path with
-the three-scope CharacterAiContext/AiCommand/CharacterInstanceId path.
+**Goal:** Connect the existing character AI runtime to named scripts from IDB,
+and give the player visible feedback during play mode.
+
+**Tasks:**
+1. UI to assign a script name to a placed character (dropdown from `scriptStore.list()`)
+2. Store script_name on character in world state (serialize/deserialize)
+3. WASM reads script_name from character, looks up compiled AST by name
+4. GameHUD component: current phase, game mode, team resources, turn indicator
+5. Surface validation/start failures in HUD, not console only
+6. Surface script compile errors in Script Panel status
+
+**Done when:**
+- A placed character runs its assigned AI script during Play mode
+- The HUD shows phase, resources, and game status
+- Compile errors are visible in the Script Panel
+
+---
+
+### Phase D: World Generation Scripting
+
+**Goal:** World gen scripts populate the map during Setup phase.
+
+**Tasks:**
+1. Register `WorldGenContext` in Rhai with `cmd_place_tile`, `cmd_spawn`, `cmd_define_zone`, `cmd_log`
+2. Compile `world_gen` scope scripts in WASM (currently skipped)
+3. Run `world_gen_script` during `GamePhase::Setup`
+4. Apply `PlaceTile` → SparseWorld mutation, `SpawnUnit` → character placement
+5. Apply `DefineZone` → WorldBinding zone creation
+6. Transition to Exploration phase after world gen completes
+7. Add world gen example script to Examples button
+
+**Done when:**
+- A world gen script creates terrain, spawns units, and defines zones
+- The game starts from an empty board and builds itself
+
+---
+
+### Phase E: Character AI Migration
+
+**Goal:** Replace legacy `ScriptContext`/`ScriptCommand`/`ActorId` execution path with
+`CharacterAiContext`/`AiCommand`/`CharacterInstanceId`.
 
 **Tasks:**
 1. Register `CharacterAiContext` in Rhai with all cmd_* and query methods
-2. Bridge current scripted actor loop from legacy `ScriptContext` to `CharacterAiContext`
+2. Bridge from legacy scripted actor loop to `CharacterAiContext`
 3. Populate `GameView` snapshot for AI scripts from live session state
-4. Map AiCommand output back through CharacterInstanceId → ActorId for rendering
+4. Map `AiCommand` output through `CharacterInstanceId → ActorId` for rendering
 5. Preserve current movement/animation functionality
 6. Retire legacy `ScriptContext` execution path
 
@@ -128,34 +163,16 @@ the three-scope CharacterAiContext/AiCommand/CharacterInstanceId path.
 
 ---
 
-### Phase D: World Generation Scripting
-
-**Goal:** World gen scripts populate the map during Setup phase.
-
-**Tasks:**
-1. Register `WorldGenContext` in Rhai
-2. Run `world_gen_script` during `GamePhase::Setup`
-3. Apply `PlaceTile` → SparseWorld mutation
-4. Apply `SpawnUnit` → character placement
-5. Apply `DefineZone` → WorldBinding zone creation (map zone_type string to ZoneType enum)
-6. Transition to Exploration phase after world gen completes
-
-**Done when:**
-- A world gen script creates terrain, spawns units, and defines zones
-- The game starts from an empty board and builds itself
-
----
-
-### Phase E: Play Mode Polish
+### Phase F: Play Mode Polish
 
 **Goal:** The game session is understandable and controllable.
 
 **Tasks:**
-1. GameHUD: team resources, turn indicator, current phase, active team
-2. Pause/Resume during play
-3. Mode-specific flow: TurnBased turn rotation, Tactical encounter auto-pause
-4. Win/lose detection and display
-5. Session reset (stop game, return to edit mode)
+1. Pause/Resume during play
+2. Mode-specific flow: TurnBased turn rotation, Tactical encounter auto-pause
+3. Win/lose detection and display
+4. Session reset (stop game, return to edit mode)
+5. Resource/turn HUD polish
 
 **Done when:**
 - A kid can see what's happening (whose turn, what resources, what phase)
@@ -163,7 +180,7 @@ the three-scope CharacterAiContext/AiCommand/CharacterInstanceId path.
 
 ---
 
-### Phase F: Combat Feature Layer
+### Phase G: Combat Feature Layer
 
 **Goal:** Combat becomes a real interactive feature.
 
@@ -182,7 +199,7 @@ the three-scope CharacterAiContext/AiCommand/CharacterInstanceId path.
 
 ---
 
-### Phase G: Group Commands
+### Phase H: Group Commands
 
 **Goal:** Multi-character control.
 
@@ -201,10 +218,10 @@ the three-scope CharacterAiContext/AiCommand/CharacterInstanceId path.
 
 ## Immediate Priority Order
 
-1. **Orchestrator skeleton** — the architectural spine that connects everything
-2. **Script Editor UI** — the authoring surface for scripts
+1. **Character script assignment + Play HUD** — connect AI to named scripts, show game state
+2. **World gen scripting** — game = world + rules from authored data
 3. **Character AI migration** — new scope replaces legacy
-4. **World gen scripting** — game = world + rules from authored data
-5. **Play Mode polish** — HUD, pause, win/lose
-6. **Combat UX** — targeting, feedback, events
-7. **Group commands** — multi-select, squads
+4. **Play Mode polish** — pause, win/lose, mode-specific flow
+5. **Combat UX** — targeting, feedback, events
+6. **Group commands** — multi-select, squads
+7. **Headless orchestrator tests** — wasm-canvas test seam
