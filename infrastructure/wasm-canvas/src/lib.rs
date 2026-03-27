@@ -456,6 +456,39 @@ impl FreedomBoardGame {
         self.redo_stack.clear();
     }
 
+    /// Clear the selected character and write an empty payload to
+    /// SELECTED_CHARACTER_INFO so React clears the CharacterPanel.
+    fn clear_character_selection(&mut self) {
+        self.selected_character = None;
+        SELECTED_CHARACTER_INFO.with(|p| {
+            *p.borrow_mut() = Some(String::new());
+        });
+    }
+
+    /// Write the currently selected character's info to SELECTED_CHARACTER_INFO
+    /// so the worker can forward it to React for the CharacterPanel.
+    fn write_selected_character_info(&self) {
+        if let Some(sel_id) = self.selected_character {
+            if let Some(actor) = self.characters.get(&sel_id) {
+                web_sys::console::log_1(
+                    &format!("[freedom-board] writing selected char info: actor={}, body={}", sel_id.0, actor.body_def_id).into(),
+                );
+                let info = serde_json::json!({
+                    "actorId": sel_id.0,
+                    "bodyDefId": actor.body_def_id,
+                    "scriptName": actor.script_name,
+                    "x": actor.position.x,
+                    "y": actor.position.y,
+                    "health": actor.health,
+                    "maxHealth": actor.max_health,
+                });
+                SELECTED_CHARACTER_INFO.with(|p| {
+                    *p.borrow_mut() = Some(info.to_string());
+                });
+            }
+        }
+    }
+
     fn handle_custom_event(&mut self, kind: u32, a: f32, b: f32, c: f32) {
         match kind {
             events::PLACE_TILE => {
@@ -575,6 +608,8 @@ impl FreedomBoardGame {
                     self.selected_character = Some(id); // auto-select newly placed
                     self.character_generation += 1;
                 }
+                // Write selection info for React CharacterPanel
+                self.write_selected_character_info();
                 self.characters_dirty = true;
             }
             events::REMOVE_CHARACTER => {
@@ -597,7 +632,7 @@ impl FreedomBoardGame {
                     self.movement_targets.remove(&id);
                     self.waypoint_queues.remove(&id);
                     if self.selected_character == Some(id) {
-                        self.selected_character = None;
+                        self.clear_character_selection();
                     }
                     self.character_generation += 1;
                     self.characters_dirty = true;
@@ -617,28 +652,11 @@ impl FreedomBoardGame {
                     .map(|(id, _)| *id);
                 self.characters_dirty = true;
 
-                // Write selection info for React character panel.
-                // React reads this via take_selected_character_info() after each frame.
                 if self.selected_character != prev {
-                    if let Some(sel_id) = self.selected_character {
-                        if let Some(actor) = self.characters.get(&sel_id) {
-                            let info = serde_json::json!({
-                                "actorId": sel_id.0,
-                                "bodyDefId": actor.body_def_id,
-                                "scriptName": actor.script_name,
-                                "x": actor.position.x,
-                                "y": actor.position.y,
-                                "health": actor.health,
-                                "maxHealth": actor.max_health,
-                            });
-                            SELECTED_CHARACTER_INFO.with(|p| {
-                                *p.borrow_mut() = Some(info.to_string());
-                            });
-                        }
+                    if self.selected_character.is_some() {
+                        self.write_selected_character_info();
                     } else {
-                        SELECTED_CHARACTER_INFO.with(|p| {
-                            *p.borrow_mut() = Some(String::new());
-                        });
+                        self.clear_character_selection();
                     }
                 }
             }
@@ -910,7 +928,7 @@ impl FreedomBoardGame {
             self.movement_targets.remove(dead_id);
             self.waypoint_queues.remove(dead_id);
             if self.selected_character == Some(*dead_id) {
-                self.selected_character = None;
+                self.clear_character_selection();
             }
             self.character_generation += 1;
             self.characters_dirty = true;
@@ -1785,19 +1803,31 @@ impl FreedomBoardGame {
                 .with_scale(scale)
                 .with_layer(RenderLayer::UI);
 
-            if let Some(sprite) = ctx.sprite(&sprite_key) {
-                entity.sprite = Some(sprite);
-            } else {
-                // Fallback chain: try frame 0, then without frame index
-                let fallback0 = format!("{}/{}_{}/0", actor.body_def_id, anim_name, dir_name);
-                if let Some(sprite) = ctx.sprite(&fallback0) {
-                    entity.sprite = Some(sprite);
-                } else {
-                    let fallback_idle = format!("{}/idle_{}/0", actor.body_def_id, dir_name);
-                    if let Some(sprite) = ctx.sprite(&fallback_idle) {
-                        entity.sprite = Some(sprite);
-                    }
-                }
+            // Sprite fallback chain:
+            // 1. Exact key: {body}/{anim}_{dir}/{frame}
+            // 2. Frame 0 of same anim+dir
+            // 3. Idle of same dir, frame 0
+            // 4. Same anim, south direction, frame 0
+            // 5. Idle south, frame 0 (guaranteed minimum by schema)
+            let sprite = ctx.sprite(&sprite_key)
+                .or_else(|| {
+                    let k = format!("{}/{}_{}/0", actor.body_def_id, anim_name, dir_name);
+                    ctx.sprite(&k)
+                })
+                .or_else(|| {
+                    let k = format!("{}/idle_{}/0", actor.body_def_id, dir_name);
+                    ctx.sprite(&k)
+                })
+                .or_else(|| {
+                    let k = format!("{}/{}_{}/0", actor.body_def_id, anim_name, "south");
+                    ctx.sprite(&k)
+                })
+                .or_else(|| {
+                    let k = format!("{}/idle_south/0", actor.body_def_id);
+                    ctx.sprite(&k)
+                });
+            if let Some(s) = sprite {
+                entity.sprite = Some(s);
             }
 
             ctx.scene.spawn(entity);
@@ -2079,6 +2109,16 @@ impl FreedomBoardGame {
             return;
         }
 
+        // Clear current state — imported state becomes the new baseline.
+        // Must happen before building the tile registry borrow below.
+        self.world.clear();
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.characters.clear();
+        self.movement_targets.clear();
+        self.waypoint_queues.clear();
+        self.clear_character_selection();
+
         // Build reverse lookup: tile name → u16 asset_id
         let name_to_id: std::collections::HashMap<&str, u16> = self
             .tile_registry
@@ -2086,15 +2126,6 @@ impl FreedomBoardGame {
             .enumerate()
             .map(|(i, info)| (info.name.as_str(), i as u16))
             .collect();
-
-        // Clear current state — imported state becomes the new baseline
-        self.world.clear();
-        self.undo_stack.clear();
-        self.redo_stack.clear();
-        self.characters.clear();
-        self.movement_targets.clear();
-        self.waypoint_queues.clear();
-        self.selected_character = None;
 
         // Import tiles
         let mut imported = 0u32;
@@ -2467,7 +2498,7 @@ impl Game for FreedomBoardGame {
             let assignments = std::mem::take(&mut *p.borrow_mut());
             for (actor_id_u32, script_name) in assignments {
                 let actor_id = ActorId(actor_id_u32);
-                if let Some(actor) = self.characters.get_mut(&actor_id) {
+                let found = if let Some(actor) = self.characters.get_mut(&actor_id) {
                     let old = actor.script_name.clone();
                     actor.script_name = script_name.clone();
                     web_sys::console::log_1(
@@ -2477,24 +2508,17 @@ impl Game for FreedomBoardGame {
                         ).into(),
                     );
                     self.characters_dirty = true;
-
-                    // Refresh selected-character info so the React panel
-                    // sees the updated script_name without a re-select.
-                    if self.selected_character == Some(actor_id) {
-                        let info = serde_json::json!({
-                            "actorId": actor_id.0,
-                            "bodyDefId": actor.body_def_id,
-                            "scriptName": actor.script_name,
-                            "x": actor.position.x,
-                            "y": actor.position.y,
-                            "health": actor.health,
-                            "maxHealth": actor.max_health,
-                        });
-                        SELECTED_CHARACTER_INFO.with(|si| {
-                            *si.borrow_mut() = Some(info.to_string());
-                        });
-                    }
+                    true
                 } else {
+                    false
+                };
+                // Refresh selected-character info after the mutable borrow
+                // is released, so write_selected_character_info can borrow
+                // self.characters immutably.
+                if found && self.selected_character == Some(actor_id) {
+                    self.write_selected_character_info();
+                }
+                if !found {
                     web_sys::console::warn_1(
                         &format!("[freedom-board] assign_script: actor {} not found", actor_id_u32).into(),
                     );

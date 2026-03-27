@@ -17,6 +17,10 @@ pub mod freedom_board;
 /// The domain model for playable games built on the freedom board substrate.
 pub mod game_rules;
 
+/// Asset schemas — the single source of truth for asset data formats.
+/// Mirrors the JSON schemas in `schemas/`. Storage-independent.
+pub mod asset_schema;
+
 pub use actor::{Actor, ActorId};
 pub use composite_actor::{AnimationState, CompositeActor, Direction, VisualState};
 pub use game_state::GameState;

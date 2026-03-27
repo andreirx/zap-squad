@@ -272,6 +272,22 @@ export class IdbStorage implements StorageGateway {
       URL.revokeObjectURL(blobUrl);
       this.blobUrls.delete(key);
     }
+
+    // In dev mode, also delete the mirrored file on disk.
+    // Without this, stale legacy files on disk re-enter through the
+    // CDN/file-list fallback and defeat authoritative saves.
+    if (import.meta.env.DEV) {
+      try {
+        const fullPath = `public/${this.basePath}/${path}`;
+        await fetch('/__delete-file', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: fullPath }),
+        });
+      } catch {
+        // Disk delete failed — IDB entry already removed, not critical
+      }
+    }
   }
 
   async getUploadUrl(path: string, _contentType: string): Promise<UploadUrl> {

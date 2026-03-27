@@ -4,9 +4,10 @@ import { FBToolbar } from './components/FBToolbar';
 import { StatusBar } from './components/StatusBar';
 import { AssetPanel } from './components/AssetPanel';
 import { ScriptPanel } from './components/ScriptPanel';
+import { CharacterPanel } from './components/CharacterPanel';
 import { WorldListModal } from './components/WorldListModal';
 import {
-  loadTileManifest,
+  loadFreedomBoardAssets,
   TileDefinition,
   TileRegistryEntry,
   CharacterDefinition,
@@ -15,6 +16,7 @@ import {
 import type { Tool, WorldStats, PendingPlacement, StampTile } from './types';
 import { worldStore, gameDefStore } from '../lib/idb';
 import type { WorldData } from '../lib/idb';
+import { onCharacterAssetsChanged } from '../lib/asset-events';
 
 // ── LDtk grid tile (matches MapEditor output) ────────────────────────
 interface LdtkGridTile {
@@ -160,6 +162,8 @@ export function FreedomBoardPage() {
   const [tileRegistry, setTileRegistry] = useState<TileRegistryEntry[]>([]);
   const [characters, setCharacters] = useState<CharacterDefinition[]>([]);
   const [weapons, setWeapons] = useState<WeaponDefinition[]>([]);
+  const charactersRef = useRef<CharacterDefinition[]>([]);
+  const activeCharacterIdRef = useRef(0);
 
   // Stamp state — set when user imports a map file, cleared after dispatch to WASM
   const [pendingStamp, setPendingStamp] = useState<string | null>(null);
@@ -189,6 +193,17 @@ export function FreedomBoardPage() {
 
   const handleReloadScripts = useCallback((scriptsJson: string) => {
     sendEventRef.current?.({ type: 'reload_scripts', json: scriptsJson });
+  }, []);
+
+  // ── Selected character state ──────────────────────────────────────
+  const [selectedCharacterJson, setSelectedCharacterJson] = useState<string | null>(null);
+
+  const handleSelectedCharacter = useCallback((json: string | null) => {
+    setSelectedCharacterJson(json);
+  }, []);
+
+  const handleSendCharacterEvent = useCallback((msg: Record<string, unknown>) => {
+    sendEventRef.current?.(msg);
   }, []);
 
   // Load saved game definitions list
@@ -254,18 +269,66 @@ export function FreedomBoardPage() {
   }, []);
 
   useEffect(() => {
-    loadTileManifest()
-      .then(({ tiles, registry, characters, weapons }) => {
-        setTiles(tiles);
-        setTileRegistry(registry);
-        setCharacters(characters);
-        setWeapons(weapons);
-        console.log(`[freedom-board] loaded ${tiles.length} tiles, ${characters.length} characters, ${weapons.length} weapons`);
-      })
-      .catch(err => {
-        console.error('[freedom-board] failed to load manifest:', err);
-      });
+    charactersRef.current = characters;
+  }, [characters]);
+
+  useEffect(() => {
+    activeCharacterIdRef.current = activeCharacterId;
+  }, [activeCharacterId]);
+
+  const revokeCharacterAtlasUrls = useCallback((defs: CharacterDefinition[]) => {
+    for (const def of defs) {
+      if (def.atlasUrl?.startsWith('blob:')) {
+        URL.revokeObjectURL(def.atlasUrl);
+      }
+    }
   }, []);
+
+  const reloadAssetCatalog = useCallback(async () => {
+    const previousCharacters = charactersRef.current;
+    const currentCharacterId =
+      previousCharacters[activeCharacterIdRef.current]?.id ?? null;
+    const { tiles, registry, characters: nextCharacters, weapons } = await loadFreedomBoardAssets();
+
+    setTiles(tiles);
+    setTileRegistry(registry);
+    charactersRef.current = nextCharacters;
+    setCharacters(nextCharacters);
+    setWeapons(weapons);
+    revokeCharacterAtlasUrls(previousCharacters);
+
+    if (currentCharacterId) {
+      const nextIndex = nextCharacters.findIndex(c => c.id === currentCharacterId);
+      const resolvedIndex = nextIndex >= 0 ? nextIndex : 0;
+      activeCharacterIdRef.current = resolvedIndex;
+      setActiveCharacterId(resolvedIndex);
+    } else if (nextCharacters.length === 0) {
+      activeCharacterIdRef.current = 0;
+      setActiveCharacterId(0);
+    }
+
+    console.log(
+      `[freedom-board] loaded ${tiles.length} tiles, ${nextCharacters.length} characters, ${weapons.length} weapons`
+    );
+  }, [revokeCharacterAtlasUrls]);
+
+  useEffect(() => {
+    reloadAssetCatalog().catch(err => {
+      console.error('[freedom-board] failed to load asset catalog:', err);
+    });
+
+    const off = onCharacterAssetsChanged(({ characterId }) => {
+      console.log(`[freedom-board] character assets changed: "${characterId}"`);
+      reloadAssetCatalog().catch(err => {
+        console.error('[freedom-board] failed to refresh character catalog:', err);
+      });
+    });
+
+    return () => {
+      off();
+      revokeCharacterAtlasUrls(charactersRef.current);
+    };
+  }, [reloadAssetCatalog, revokeCharacterAtlasUrls]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleGameEvent = useCallback((events: Array<{ kind: number; a: number; b: number; c: number }>) => {
     for (const e of events) {
@@ -491,6 +554,7 @@ export function FreedomBoardPage() {
             onSendEventReady={useCallback((fn: (msg: Record<string, unknown>) => void) => {
               sendEventRef.current = fn;
             }, [])}
+            onSelectedCharacter={handleSelectedCharacter}
           />
         </div>
         {showScripts && (
@@ -500,6 +564,13 @@ export function FreedomBoardPage() {
           />
         )}
       </div>
+      {selectedCharacterJson && (
+        <CharacterPanel
+          characterJson={selectedCharacterJson}
+          sendEvent={handleSendCharacterEvent}
+          disabled={isPlaying}
+        />
+      )}
       <StatusBar
         cursorTile={cursorTile}
         camera={cameraState}

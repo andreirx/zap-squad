@@ -11,3 +11,6 @@ glam = { workspace = true }
 serde = { workspace = true }
 
 # NO external game engine deps here - core is pure business logic
+
+[dev-dependencies]
+serde_json = "1"

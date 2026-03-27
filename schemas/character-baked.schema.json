@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zapsquad.dev/schemas/character-baked.schema.json",
+  "title": "CharacterBakedDefinition",
+  "description": "Authoritative schema for a baked character asset. Produced by the baker crate from a CharacterSourceDefinition + frame blobs. Consumed by the game runtime (WASM) and the engine sprite registry. This is derived data — never hand-edited.",
+  "type": "object",
+  "required": ["version", "id", "name", "atlas", "atlasWidth", "atlasHeight", "spriteSize", "animations"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "const": 1,
+      "description": "Schema version. Must be 1."
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "description": "Character identifier. Matches the source definition id."
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable display name."
+    },
+    "atlas": {
+      "type": "string",
+      "description": "Relative path to the atlas PNG from the assets root. E.g., 'characters/hotdogguy.png'."
+    },
+    "atlasWidth": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Atlas image width in pixels."
+    },
+    "atlasHeight": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Atlas image height in pixels."
+    },
+    "spriteSize": {
+      "type": "integer",
+      "description": "Width and height of each sprite cell in the atlas."
+    },
+    "frameDuration": {
+      "type": "number",
+      "minimum": 0.01,
+      "description": "Default seconds per frame for animation playback."
+    },
+    "animations": {
+      "type": "object",
+      "description": "Map of animation key to atlas position. Key format: '{animation}_{direction}' (e.g., 'idle_south', 'walk_east'). This is the sprite registry lookup key used by the WASM runtime.",
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]+$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/BakedAnimation"
+      }
+    },
+    "weaponDefId": {
+      "type": ["string", "null"],
+      "default": null,
+      "description": "Optional weapon/object reference, passed through from source."
+    },
+    "throwableDefId": {
+      "type": ["string", "null"],
+      "default": null,
+      "description": "Optional throwable/object reference, passed through from source."
+    }
+  },
+  "$defs": {
+    "BakedAnimation": {
+      "type": "object",
+      "required": ["row", "frames", "loop"],
+      "additionalProperties": false,
+      "properties": {
+        "row": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Row index in the atlas (0-based). Each row contains frames for one animation+direction."
+        },
+        "frames": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8,
+          "description": "Number of frames in this row. Frames occupy columns 0..frames-1."
+        },
+        "loop": {
+          "type": "boolean",
+          "description": "Whether this animation loops."
+        }
+      }
+    }
+  }
+}

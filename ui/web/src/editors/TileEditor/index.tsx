@@ -1,9 +1,10 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { Plus, Copy, ChevronLeft, ChevronRight, Trash2 } from 'lucide-react';
+import { Plus, Copy, ChevronLeft, ChevronRight, Trash2, Upload } from 'lucide-react';
 import { PixelCanvas, type PixelCanvasRef } from '../PixelCanvas';
 import { ColorPicker } from '../ColorPicker';
 import { Toolbar } from '../Toolbar';
 import { createStorage } from '../../storage';
+import { importImageToImageData } from '../importImage';
 import type { Color, Tool } from '../types';
 
 /** Canvas size for tile sprites - EVERYTHING IS 128x128 */
@@ -384,6 +385,15 @@ export function TileEditor() {
     setVariationCount(prev => prev - 1);
     setCurrentVariation(prev => Math.max(0, prev - 1));
   }, [tileType, variationCount, currentVariation, saveCurrentVariation]);
+
+  // Import image from file (PNG/JPG) into current variation
+  const handleImportImage = useCallback(async () => {
+    console.log('[TileEditor] import image requested, variation:', currentVariation);
+    const result = await importImageToImageData(TILE_SIZE);
+    if (!result) { console.log('[TileEditor] import cancelled or failed'); return; }
+    console.log('[TileEditor] setting imported image on canvas:', result.fileName);
+    canvasRef.current?.setImageData(result.imageData);
+  }, [currentVariation]);
 
   // Generate random fill for current variation
   const generateRandomFill = useCallback(() => {
@@ -767,6 +777,11 @@ export function TileEditor() {
                 <ChevronRight size={16} />
               </button>
 
+              <button onClick={handleImportImage}
+                title="Import image from file (PNG/JPG)"
+                style={{ width: 28, height: 28, border: 'none', borderRadius: '4px', background: '#16213e', color: '#60a0e0', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <Upload size={16} />
+              </button>
               {tileType === 'TILE' && (
                 <>
                   <button onClick={addVariation} disabled={variationCount >= MAX_VARIATIONS}

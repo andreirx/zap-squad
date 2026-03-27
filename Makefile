@@ -6,6 +6,7 @@ test:
 	cargo test -p zapsquad-adapters
 	cargo test -p wasm-feather
 	cargo test -p wasm-validator
+	cargo test -p wasm-baker
 
 # Check compilation for all targets
 check:
@@ -14,6 +15,7 @@ check:
 	cargo check -p freedom-board-wasm --target wasm32-unknown-unknown
 	cargo check -p wasm-feather --target wasm32-unknown-unknown
 	cargo check -p wasm-validator --target wasm32-unknown-unknown
+	cargo check -p wasm-baker --target wasm32-unknown-unknown
 
 # Lint with clippy
 lint:
@@ -30,6 +32,10 @@ wasm-feather:
 # Build WASM for game definition validation (outputs to ui/web)
 wasm-validator:
 	wasm-pack build infrastructure/wasm-validator --target web --out-dir ../../ui/web/src/wasm-validator
+
+# Build WASM for asset baking (outputs to ui/web)
+wasm-baker:
+	wasm-pack build infrastructure/wasm-baker --target web --out-dir ../../ui/web/src/wasm-baker
 
 # Build WASM for freedom-board canvas (outputs to both ui/canvas and ui/web)
 wasm-canvas:
@@ -48,10 +54,10 @@ pack-sprites: tools-install
 	cd tools && npx tsx pack-sprites.ts --input ../ui/web/public/mods --output ../ui/web/public/assets
 
 # Build everything
-build: wasm wasm-canvas wasm-feather wasm-validator pack-sprites
+build: wasm wasm-canvas wasm-feather wasm-validator wasm-baker pack-sprites
 
 # Development server (unified app with freedom-board + editors)
-dev: wasm wasm-canvas wasm-validator
+dev: wasm wasm-canvas wasm-validator wasm-baker
 	cd ui/web && npm run dev
 
 # Freedom-board dev server

@@ -78,6 +78,43 @@ function fileWritePlugin(): Plugin {
         }
       });
 
+      // Endpoint to delete a file (dev only, for authoritative save/migration)
+      server.middlewares.use('/__delete-file', async (req, res) => {
+        res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+        if (req.method !== 'POST') {
+          res.statusCode = 405;
+          res.end('Method not allowed');
+          return;
+        }
+
+        let body = '';
+        for await (const chunk of req) {
+          body += chunk;
+        }
+
+        try {
+          const { path: filePath } = JSON.parse(body);
+          const normalizedPath = path.normalize(filePath);
+          if (!normalizedPath.startsWith('public/mods/')) {
+            res.statusCode = 403;
+            res.end(JSON.stringify({ error: 'Can only delete from public/mods/' }));
+            return;
+          }
+
+          if (fs.existsSync(normalizedPath)) {
+            fs.unlinkSync(normalizedPath);
+          }
+
+          res.statusCode = 200;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ success: true, path: normalizedPath }));
+        } catch (error) {
+          res.statusCode = 500;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ error: String(error) }));
+        }
+      });
+
       // Endpoint to list files in a directory
       server.middlewares.use('/__list-files', async (req, res) => {
         // Required for COEP require-corp — Safari blocks without this

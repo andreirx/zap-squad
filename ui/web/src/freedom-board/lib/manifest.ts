@@ -1,4 +1,7 @@
 import { ASSETS_URL } from '../../lib/config';
+import { createStorage } from '../../storage';
+import type { CharacterSourceDef } from '../../schemas/character';
+import { readBakedAtlasUrl, readBakedDef } from '../../lib/character-baker';
 
 /**
  * Tile metadata from manifest.json, matching the bake-atlases output format.
@@ -26,11 +29,16 @@ export interface CharacterDefinition {
   id: string;
   name: string;
   atlas: string;
+  atlasUrl?: string;
+  atlasWidth?: number;
+  atlasHeight?: number;
   spriteSize: number;
   /** Equipped weapon ID (from editor). */
   weaponDefId?: string;
   /** Equipped throwable/ranged object ID (from editor). */
   throwableDefId?: string;
+  /** Source of this entry in the Freedom Board palette. */
+  source?: 'seed' | 'user';
 }
 
 /**
@@ -101,7 +109,7 @@ export interface TileRegistryEntry {
  * Load manifest.json and extract tile definitions, characters, and weapons.
  * Returns tiles sorted alphabetically by id for deterministic asset_id assignment.
  */
-export async function loadTileManifest(): Promise<{
+export async function loadFreedomBoardAssets(): Promise<{
   tiles: TileDefinition[];
   registry: TileRegistryEntry[];
   characters: CharacterDefinition[];
@@ -153,13 +161,16 @@ export async function loadTileManifest(): Promise<{
   });
 
   // Characters — sorted by id for consistency
-  const characters: CharacterDefinition[] = Object.keys(manifest.characters ?? {}).sort().map(id => {
+  const seedCharacters: CharacterDefinition[] = Object.keys(manifest.characters ?? {}).sort().map(id => {
     const c = manifest.characters![id];
     return {
       id: c.id,
       name: c.name,
       atlas: c.atlas,
+      atlasWidth: c.atlasWidth,
+      atlasHeight: c.atlasHeight,
       spriteSize: c.spriteSize,
+      source: 'seed',
       ...(c.weaponDefId ? { weaponDefId: c.weaponDefId } : {}),
       ...(c.throwableDefId ? { throwableDefId: c.throwableDefId } : {}),
     };
@@ -171,5 +182,76 @@ export async function loadTileManifest(): Promise<{
     return { id: w.id, name: w.name, atlas: w.atlas, spriteSize: w.spriteSize };
   });
 
+  const userCharacters = await loadUserCharacters(new Set(seedCharacters.map(c => c.id)));
+  const characters = [...seedCharacters, ...userCharacters].sort((a, b) => a.id.localeCompare(b.id));
+
   return { tiles, registry, characters, weapons };
+}
+
+/**
+ * User-authored characters for Freedom Board.
+ *
+ * Source definitions are authoritative for identity and equipment metadata.
+ * Baked outputs are required for Freedom Board inclusion because the board
+ * renders only baked atlases. If the baked cache is missing, the character
+ * is skipped until the save+bake pipeline completes successfully.
+ */
+async function loadUserCharacters(seedIds: Set<string>): Promise<CharacterDefinition[]> {
+  const storage = createStorage();
+  const files = await storage.list('characters');
+  const ids = [
+    ...new Set(
+      files
+        .filter((f) => f.includes('/') && f.endsWith('definition.json'))
+        .map((f) => f.split('/')[1]),
+    ),
+  ].sort();
+
+  const characters: CharacterDefinition[] = [];
+  for (const id of ids) {
+    if (seedIds.has(id)) {
+      console.warn(`[freedom-board] skipping user character "${id}" because a seed character with the same id exists`);
+      continue;
+    }
+
+    let atlasUrl: string | null = null;
+    try {
+      const defJson = await storage.readText(`characters/${id}/definition.json`);
+      const def = JSON.parse(defJson) as CharacterSourceDef;
+      const [bakedDef, loadedAtlasUrl] = await Promise.all([
+        readBakedDef(id),
+        readBakedAtlasUrl(id),
+      ]);
+      atlasUrl = loadedAtlasUrl;
+
+      if (!bakedDef || !atlasUrl) {
+        if (atlasUrl?.startsWith('blob:')) {
+          URL.revokeObjectURL(atlasUrl);
+        }
+        console.warn(`[freedom-board] skipping user character "${id}" because baked outputs are missing`);
+        continue;
+      }
+
+      const baked = bakedDef as Record<string, unknown>;
+      characters.push({
+        id: def.id,
+        name: def.name,
+        atlas: typeof baked.atlas === 'string' ? baked.atlas : `baked/characters/${id}/atlas.png`,
+        atlasUrl,
+        atlasWidth: typeof baked.atlasWidth === 'number' ? baked.atlasWidth : def.spriteSize,
+        atlasHeight: typeof baked.atlasHeight === 'number' ? baked.atlasHeight : def.spriteSize,
+        spriteSize: def.spriteSize,
+        source: 'user',
+        ...(def.weaponDefId ? { weaponDefId: def.weaponDefId } : {}),
+        ...(def.throwableDefId ? { throwableDefId: def.throwableDefId } : {}),
+      });
+    } catch (err) {
+      if (atlasUrl?.startsWith('blob:')) {
+        URL.revokeObjectURL(atlasUrl);
+      }
+      console.warn(`[freedom-board] failed to load user character "${id}":`, err);
+    }
+  }
+
+  return characters;
 }

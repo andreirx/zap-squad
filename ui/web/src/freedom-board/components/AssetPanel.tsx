@@ -46,13 +46,16 @@ function SpritePreview({ atlas, spriteSize, atlasWidth, atlasHeight }: {
   const scale = THUMB / spriteSize;
   const bgW = (atlasWidth ?? spriteSize) * scale;
   const bgH = (atlasHeight ?? spriteSize) * scale;
+  const backgroundImageUrl = atlas.startsWith('blob:') || atlas.startsWith('data:')
+    ? atlas
+    : `${ASSETS_URL}/${atlas}`;
 
   return (
     <div
       style={{
         width: THUMB,
         height: THUMB,
-        backgroundImage: `url(${ASSETS_URL}/${atlas})`,
+        backgroundImage: `url(${backgroundImageUrl})`,
         backgroundSize: `${bgW}px ${bgH}px`,
         backgroundPosition: '0 0',
         backgroundRepeat: 'no-repeat',
@@ -270,7 +273,12 @@ export function AssetPanel({
                 textAlign: 'left',
               }}
             >
-              <SpritePreview atlas={c.atlas} spriteSize={c.spriteSize} />
+              <SpritePreview
+                atlas={c.atlasUrl ?? c.atlas}
+                spriteSize={c.spriteSize}
+                atlasWidth={c.atlasWidth}
+                atlasHeight={c.atlasHeight}
+              />
               <div style={{
                 color: activeCharacterId === index ? '#60a0e0' : '#c0c8d0',
                 fontSize: 11,

@@ -1,9 +1,10 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { Plus, Copy, ChevronLeft, ChevronRight, Trash2, Play, Pause, ArrowLeft, ArrowRight } from 'lucide-react';
+import { Plus, Copy, ChevronLeft, ChevronRight, Trash2, Play, Pause, ArrowLeft, ArrowRight, Upload } from 'lucide-react';
 import { PixelCanvas, type PixelCanvasRef } from '../PixelCanvas';
 import { ColorPicker } from '../ColorPicker';
 import { Toolbar } from '../Toolbar';
 import { createStorage } from '../../storage';
+import { importImageToImageData } from '../importImage';
 import type { Color, Tool } from '../types';
 
 /** Canvas size for object sprites - EVERYTHING IS 128x128 */
@@ -338,6 +339,15 @@ export function ObjectEditor() {
     setCurrentFrame(prev => Math.max(0, prev - 1));
   }, [animation, currentFrame, currentFrameCount, saveCurrentSprite]);
 
+  // Import image from file (PNG/JPG) into current frame
+  const handleImportImage = useCallback(async () => {
+    console.log('[ObjectEditor] import image requested, animation:', animation, 'frame:', currentFrame);
+    const result = await importImageToImageData(SPRITE_SIZE);
+    if (!result) { console.log('[ObjectEditor] import cancelled or failed'); return; }
+    console.log('[ObjectEditor] setting imported image on canvas:', result.fileName);
+    canvasRef.current?.setImageData(result.imageData);
+  }, [animation, currentFrame]);
+
   // Move current frame left
   const moveFrameLeft = useCallback(() => {
     if (currentFrame <= 0) return;
@@ -606,6 +616,11 @@ export function ObjectEditor() {
                 <ChevronRight size={16} />
               </button>
 
+              <button onClick={handleImportImage}
+                title="Import image from file (PNG/JPG)"
+                style={{ width: 28, height: 28, border: 'none', borderRadius: '4px', background: '#16213e', color: '#60a0e0', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <Upload size={16} />
+              </button>
               <button onClick={addFrame} disabled={currentFrameCount >= MAX_FRAMES}
                 title="Add Frame"
                 style={{ width: 28, height: 28, border: 'none', borderRadius: '4px', background: '#16213e', color: currentFrameCount >= MAX_FRAMES ? '#555' : '#4ecca3', cursor: currentFrameCount >= MAX_FRAMES ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>

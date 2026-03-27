@@ -157,25 +157,41 @@ async function bakeCharacterAtlas(id: string, charDir: string): Promise<Characte
   // Scan for sprites - only use "full" visual state (primary)
   const files = fs.readdirSync(charDir).filter(f => f.endsWith('.png'));
 
-  // Parse sprite filenames to find animations and frame counts
-  // Format: {id}_{visualState}_{animation}_{frame}.png
-  // We only take "full" visual state
+  // Parse sprite filenames to find animations and frame counts.
+  // Two formats supported:
+  //   Old: {id}_full_{animation}_{direction}_{frame}.png  (visual state prefix)
+  //   New: {id}_{animation}_{direction}_{frame}.png       (no visual state)
+  // Animation key in the atlas is "{animation}_{direction}" (e.g., "idle_south").
   const animationFrames: Record<string, number> = {};
+  let usesOldFormat = false;
 
   for (const file of files) {
     const basename = file.replace('.png', '');
     const withoutId = basename.startsWith(id + '_') ? basename.slice(id.length + 1) : basename;
 
-    // Only match "full" visual state
-    const match = withoutId.match(/^full_(\w+)_(\d+)$/);
-    if (match) {
-      const [, animationPart, frameStr] = match;
+    // Try old format first: full_{animation}_{direction}_{frame}
+    const oldMatch = withoutId.match(/^full_(\w+)_(\d+)$/);
+    if (oldMatch) {
+      const [, animationPart, frameStr] = oldMatch;
       const frame = parseInt(frameStr, 10);
-
-      // Cap at MAX_FRAMES
       if (frame < MAX_FRAMES) {
         const currentMax = animationFrames[animationPart] || 0;
         animationFrames[animationPart] = Math.max(currentMax, frame + 1);
+        usesOldFormat = true;
+      }
+      continue;
+    }
+
+    // Try new format: {animation}_{direction}_{frame}
+    // Direction is one of: north, south, east, west
+    const newMatch = withoutId.match(/^(\w+?)_(north|south|east|west)_(\d+)$/);
+    if (newMatch) {
+      const [, animation, dir, frameStr] = newMatch;
+      const frame = parseInt(frameStr, 10);
+      if (frame < MAX_FRAMES) {
+        const animKey = `${animation}_${dir}`;
+        const currentMax = animationFrames[animKey] || 0;
+        animationFrames[animKey] = Math.max(currentMax, frame + 1);
       }
     }
   }
@@ -206,13 +222,18 @@ async function bakeCharacterAtlas(id: string, charDir: string): Promise<Characte
   const atlasBuffer = await createEmptyImage(atlasWidth, atlasHeight);
   const composites: { input: Buffer; left: number; top: number }[] = [];
 
-  // Only use "full" visual state
+  // Composite sprites into atlas — try old format then new format
   for (const [anim, info] of Object.entries(animations)) {
     for (let frame = 0; frame < info.frames; frame++) {
-      const spriteName = `${id}_full_${anim}_${frame}.png`;
-      const spritePath = path.join(charDir, spriteName);
+      // Old format: {id}_full_{anim}_{frame}.png
+      // New format: {id}_{anim}_{frame}.png  (anim already includes direction for new format)
+      const oldName = `${id}_full_${anim}_${frame}.png`;
+      const newName = `${id}_${anim}_${frame}.png`;
+      const oldPath = path.join(charDir, oldName);
+      const newPath = path.join(charDir, newName);
+      const spritePath = fs.existsSync(oldPath) ? oldPath : fs.existsSync(newPath) ? newPath : null;
 
-      if (fs.existsSync(spritePath)) {
+      if (spritePath) {
         const spriteBuffer = await sharp(spritePath)
           .resize(spriteSize, spriteSize, { kernel: sharp.kernel.nearest })
           .png()

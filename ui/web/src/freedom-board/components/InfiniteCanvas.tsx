@@ -1,5 +1,6 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
 import { useZapEngine } from '@zap/web/react';
+import type { AssetManifest } from '@zap/web';
 import type { Tool, PendingPlacement } from '../types';
 import type { TileRegistryEntry, CharacterDefinition as ManifestCharDef } from '../lib/manifest';
 import { DebugPanel } from './DebugPanel';
@@ -7,6 +8,8 @@ import type { DebugFlags } from './DebugPanel';
 import { ASSETS_URL } from '../../lib/config';
 import { worldStore, configStore } from '../../lib/idb';
 import type { WorldData } from '../../lib/idb';
+import { loadMergedRegistry } from '../../lib/asset-registry-merge';
+import { onCharacterAssetsChanged } from '../../lib/asset-events';
 
 /** Custom event kinds matching WASM-side `events` module. */
 const EVENTS = {
@@ -108,6 +111,8 @@ interface InfiniteCanvasProps {
   /** Called once the WASM sendEvent function is available. Parent uses this to send
    *  messages to WASM (e.g., load_game_definition, start_game, stop_game). */
   onSendEventReady?: (sendEvent: (msg: Record<string, unknown>) => void) => void;
+  /** Called when the selected character changes in WASM. JSON string or null to deselect. */
+  onSelectedCharacter?: (json: string | null) => void;
 }
 
 /**
@@ -155,6 +160,7 @@ export function InfiniteCanvas({
   onGameEvent,
   onWorldExport,
   onSendEventReady,
+  onSelectedCharacter,
 }: InfiniteCanvasProps) {
   // ── Camera state (local, sent to WASM on change) ──────────────────
   const cameraRef = useRef({ x: -5, y: -5, zoom: 64 });
@@ -194,6 +200,96 @@ export function InfiniteCanvas({
 
   // ── SAB lock toggle (loaded from IDB on mount) ─────────────────────
   const [useSabLock, setUseSabLock] = useState(false);
+
+  // ── Merged runtime asset registry (seed + IDB-baked overlay) ────────
+  //
+  // The engine starts immediately with seed-only assets (manifestOverride
+  // and extraAtlasBlobs both undefined → useZapEngine fetches assetsUrl).
+  //
+  // In parallel, loadMergedRegistry scans IDB for baked characters.
+  // If baked characters exist, state is updated with the merged manifest
+  // + blob map, which changes useZapEngine's deps and triggers an engine
+  // restart with the full overlay.  If there are no baked characters,
+  // state is never updated — no deps change, no restart, no flash.
+  //
+  // On failure (seed manifest unreachable), state stays undefined and
+  // the engine continues its own attempt to fetch the seed manifest,
+  // which will also fail — correct behavior (no silent swallowing).
+  //
+  // When a character is saved+baked while the board is open, the
+  // character-assets-changed event triggers a re-merge.  If the new
+  // baked set differs from what the engine is currently running, state
+  // updates and the engine restarts with the updated overlay.
+  const [mergedManifest, setMergedManifest] = useState<AssetManifest | undefined>();
+  const [mergedAtlasBlobs, setMergedAtlasBlobs] = useState<Map<string, Blob> | undefined>();
+
+  // Track which baked character IDs are currently in the running manifest
+  // so we can skip pointless engine restarts when nothing changed.
+  const activeBakedIdsRef = useRef<string[]>([]);
+
+  // Generation counter for async race prevention.  Each call to
+  // refreshMergedRegistry increments the counter.  When a promise
+  // resolves, it checks whether its generation is still current.
+  // Stale results (from an earlier call that resolved after a newer one)
+  // are discarded.
+  const mergeGenerationRef = useRef(0);
+
+  const refreshMergedRegistry = useCallback(() => {
+    const gen = ++mergeGenerationRef.current;
+
+    loadMergedRegistry(`${ASSETS_URL}/assets_feathered.json`)
+      .then((result) => {
+        // Discard stale result — a newer refresh was launched after us.
+        if (gen !== mergeGenerationRef.current) {
+          console.log(
+            `[freedom-board] discarding stale registry merge (gen ${gen}, current ${mergeGenerationRef.current})`,
+          );
+          return;
+        }
+
+        const newIds = result.bakedCharacterIds;
+        const prevIds = activeBakedIdsRef.current;
+
+        if (newIds.length === 0 && prevIds.length === 0) {
+          // No baked characters before or after — nothing to do.
+          return;
+        }
+
+        // Always update state when baked characters are involved.
+        // Even when the ID set is unchanged, atlas blobs may differ
+        // (re-bake of an existing character).  New object references
+        // ensure useZapEngine's deps change and the engine restarts
+        // with the latest atlas data.
+        activeBakedIdsRef.current = newIds;
+        setMergedManifest(result.manifest);
+        setMergedAtlasBlobs(
+          result.extraAtlasBlobs.size > 0 ? result.extraAtlasBlobs : undefined,
+        );
+        console.log(
+          `[freedom-board] merged registry refreshed (gen ${gen}): ${newIds.length} baked character(s)`,
+        );
+      })
+      .catch((err) => {
+        if (gen !== mergeGenerationRef.current) return; // stale, ignore
+        // Seed manifest fetch failure.  Engine is already running (or
+        // failing) with whatever it had — don't clobber state.
+        console.error('[freedom-board] merged registry refresh failed:', err);
+      });
+  }, []);
+
+  // Initial load + subscribe to character-assets-changed for live refresh.
+  useEffect(() => {
+    refreshMergedRegistry();
+
+    const off = onCharacterAssetsChanged(({ characterId }) => {
+      console.log(
+        `[freedom-board] character "${characterId}" baked, refreshing runtime registry`,
+      );
+      refreshMergedRegistry();
+    });
+
+    return off;
+  }, [refreshMergedRegistry]);
 
   // ── Settings loaded flag (prevents saving defaults before load completes) ──
   const settingsLoadedRef = useRef(false);
@@ -259,13 +355,15 @@ export function InfiniteCanvas({
       try {
         const worldData = JSON.parse(data.json) as WorldData;
         latestExportRef.current = worldData;
-        // Notify parent (for save-to-disk flow)
         onWorldExport?.(worldData);
       } catch (err) {
         console.error('[freedom-board] export parse error:', err);
       }
+    } else if (data.type === 'selected_character') {
+      const json = data.json as string | undefined;
+      onSelectedCharacter?.(json && json.length > 0 ? json : null);
     }
-  }, [onWorldExport]);
+  }, [onWorldExport, onSelectedCharacter]);
 
   // Wrap onGameEvent to detect world changes and schedule saves
   const wrappedGameEvent = useCallback((events: Array<{ kind: number; a: number; b: number; c: number }>) => {
@@ -297,14 +395,18 @@ export function InfiniteCanvas({
   }, [onGameEvent, cancelPendingSave]);
 
   // ── zap-engine hook ───────────────────────────────────────────────
+  // Pass the merged manifest (seed + IDB baked overlay) when available.
+  // The engine's loadAssetBlobs now skips network fetches for atlas
+  // names already present in extraAtlasBlobs, so IDB-backed baked
+  // atlases participate in init without fake fetches.
   const { canvasRef, sendEvent, isReady, fps, timing, canvasKey } = useZapEngine({
     wasmUrl: '/src/wasm/freedom_board_wasm.js',
     assetsUrl: `${ASSETS_URL}/assets_feathered.json`,
     assetBasePath: `${ASSETS_URL}/`,
+    manifestOverride: mergedManifest,
+    extraAtlasBlobs: mergedAtlasBlobs,
     gameWidth: GAME_WIDTH,
     gameHeight: GAME_HEIGHT,
-    // force2D removed — largest atlas is 2400x1536, well under WebGPU 8192 limit.
-    // Was needed when skirt atlases hit 16384. See MEMORY.md for history.
     onGameEvent: wrappedGameEvent,
     onWorkerMessage: handleWorkerMessage,
     useSabLock,
@@ -313,6 +415,13 @@ export function InfiniteCanvas({
   // Stable ref for sendEvent (used in timer callback to avoid stale closure)
   const sendEventRef = useRef(sendEvent);
   sendEventRef.current = sendEvent;
+
+  // Each engine restart needs a fresh manifest push into WASM.
+  useEffect(() => {
+    if (!isReady) {
+      registrySentRef.current = false;
+    }
+  }, [isReady]);
 
   // Expose sendEvent to parent for game session control
   useEffect(() => {

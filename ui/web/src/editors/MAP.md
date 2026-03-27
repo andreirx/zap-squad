@@ -6,13 +6,15 @@ This directory contains the tools used to create content for the game (Levels, C
 ## Editors
 
 ### CharacterEditor
-Creates character sprites with visual states and animations.
-- **Visual States:** full, hurt1, hurt2, critical (health-based appearance)
-- **Animations:** idle, walk, melee_attack, throw_attack
+Creates character source assets and triggers browser-side baking.
+- **Authoritative source contract:** logical path `characters/{id}/definition.json` in `CharacterSourceDef` shape
+- **Authoritative frame blobs:** logical path `characters/{id}/frames/{animation}/{direction}/{frame}.png`
+- **Default physical storage:** IDB `files` store keys under `mods/characters/{id}/...` via `IdbStorage(basePath='mods')`
+- **Animations authored directly:** `idle`, `walk`, `melee_attack`, `throw_attack`
 - **Directions:** north, east, south, west
-- **Output (mods):** `mods/characters/{id}/{id}_{visualState}_{animation}_{direction}_{frame}.png`
-- **Output (atlas):** `assets/characters/{id}.png` + updates `assets/manifest.json`
-- **TODO:** Integrate with atlas baking system (Task #25)
+- **Save flow:** write source definition + frame blobs → invoke `character-baker.ts` → emit character-assets-changed UI event
+- **Derived baked cache:** `baked/characters/{id}/atlas.png`, `baked.json`, `sprites.json`
+- **Legacy filename scan:** retained only as migration on load, not as the main save format
 
 ### ObjectEditor
 Creates object sprites used for world objects and ranged/throwable visuals.

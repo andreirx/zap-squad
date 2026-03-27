@@ -7,6 +7,7 @@ members = [
     "infrastructure/wasm-canvas",
     "infrastructure/wasm-feather",
     "infrastructure/wasm-validator",
+    "infrastructure/wasm-baker",
 ]
 
 [workspace.dependencies]

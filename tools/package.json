@@ -8,6 +8,7 @@
     "pack:watch": "nodemon --watch ../infrastructure/web/public/mods -e png,json --exec 'tsx pack-sprites.ts'"
   },
   "dependencies": {
+    "canvas": "^3.2.2",
     "sharp": "^0.33.5"
   },
   "devDependencies": {

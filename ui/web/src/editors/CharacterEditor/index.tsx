@@ -1,9 +1,18 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { Plus, Copy, Trash2, ChevronLeft, ChevronRight, Play, Pause } from 'lucide-react';
+import { Plus, Copy, Trash2, ChevronLeft, ChevronRight, Play, Pause, Upload } from 'lucide-react';
 import { PixelCanvas, type PixelCanvasRef } from '../PixelCanvas';
 import { ColorPicker } from '../ColorPicker';
 import { Toolbar } from '../Toolbar';
 import { createStorage } from '../../storage';
+import { importImageToImageData } from '../importImage';
+import { bakeCharacter } from '../../lib/character-baker';
+import { emitCharacterAssetsChanged } from '../../lib/asset-events';
+import type {
+  CharacterSourceDef,
+  AnimationDirections,
+  DirectionFrames,
+} from '../../schemas/character';
+import { framePath as schemaFramePath } from '../../schemas/character';
 import type {
   Color,
   Tool,
@@ -35,15 +44,15 @@ const DIRECTION_LABELS: Record<Direction, string> = {
   west: 'W',
 };
 
-/** Character definition - frame count discovered from files, not stored */
-interface CharacterDefinition {
+/** Legacy definition format (pre-schema). Detected by absence of `version` field. */
+interface LegacyCharacterDefinition {
   id: string;
   name: string;
   frameDuration: number;
   weaponDefId?: string;
   throwableDefId?: string;
-  createdAt: string;
-  updatedAt: string;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 /** Character sprite editor - frame count discovered, not configured */
@@ -59,13 +68,10 @@ export function CharacterEditor() {
   const [availableWeapons, setAvailableWeapons] = useState<{ id: string; name: string }[]>([]);
   const [availableObjects, setAvailableObjects] = useState<{ id: string; name: string }[]>([]);
 
-  // Discovered frame counts per animation (from existing sprites)
-  const [frameCounts, setFrameCounts] = useState<Record<AnimationState, number>>({
-    idle: 1,
-    walk: 1,
-    melee_attack: 1,
-    throw_attack: 1,
-  });
+  // Frame counts per animation+direction. Key: `${animation}_${direction}`.
+  // Each animation+direction pair has an independent frame count.
+  // Frame operations never cross direction boundaries.
+  const [frameCounts, setFrameCounts] = useState<Record<string, number>>({});
 
   // Current editing state
   const [animationState, setAnimationState] = useState<AnimationState>('idle');
@@ -83,6 +89,10 @@ export function CharacterEditor() {
   // All sprite data: [animationState][direction][frame] -> ImageData
   const spritesRef = useRef<Map<string, ImageData>>(new Map());
 
+  // Last loaded CharacterSourceDef — used to preserve custom animations
+  // that the editor doesn't author but should not destroy on save.
+  const loadedDefRef = useRef<CharacterSourceDef | null>(null);
+
   // Canvas ref
   const canvasRef = useRef<PixelCanvasRef>(null);
 
@@ -99,8 +109,10 @@ export function CharacterEditor() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [previewFrame, setPreviewFrame] = useState(0);
 
-  // Current frame count for selected animation
-  const currentFrameCount = frameCounts[animationState];
+  // Composite key for current animation+direction
+  const frameCountKey = `${animationState}_${direction}`;
+  // Current frame count for this specific animation+direction
+  const currentFrameCount = frameCounts[frameCountKey] ?? 1;
 
   // Build sprite key
   const getSpriteKey = useCallback(
@@ -137,13 +149,14 @@ export function CharacterEditor() {
     (as: AnimationState) => {
       saveCurrentSprite();
       setAnimationState(as);
-      // Reset frame if exceeds this animation's frame count
-      const newFrameCount = frameCounts[as];
+      // Reset frame if exceeds this animation+direction's frame count
+      const newKey = `${as}_${direction}`;
+      const newFrameCount = frameCounts[newKey] ?? 1;
       if (frame >= newFrameCount) {
         setFrame(0);
       }
     },
-    [saveCurrentSprite, frame, frameCounts]
+    [saveCurrentSprite, frame, direction, frameCounts]
   );
 
   // Change direction handler
@@ -151,8 +164,14 @@ export function CharacterEditor() {
     (dir: Direction) => {
       saveCurrentSprite();
       setDirection(dir);
+      // Reset frame if exceeds this animation+direction's frame count
+      const newKey = `${animationState}_${dir}`;
+      const newFrameCount = frameCounts[newKey] ?? 1;
+      if (frame >= newFrameCount) {
+        setFrame(0);
+      }
     },
-    [saveCurrentSprite]
+    [saveCurrentSprite, animationState, frame, frameCounts]
   );
 
   // Change frame handler
@@ -164,125 +183,107 @@ export function CharacterEditor() {
     [saveCurrentSprite]
   );
 
-  // Add a new frame to current animation (up to MAX_FRAMES)
+  // Add a new empty frame to current animation+direction (up to MAX_FRAMES)
   const addFrame = useCallback(() => {
     if (currentFrameCount >= MAX_FRAMES) return;
-
     saveCurrentSprite();
-    setFrameCounts(prev => ({
-      ...prev,
-      [animationState]: prev[animationState] + 1,
-    }));
-    // Switch to the new frame
-    setFrame(currentFrameCount);
-  }, [currentFrameCount, animationState, saveCurrentSprite]);
+    setFrameCounts(prev => ({ ...prev, [frameCountKey]: currentFrameCount + 1 }));
+    setFrame(currentFrameCount); // switch to the new empty frame
+  }, [currentFrameCount, frameCountKey, saveCurrentSprite]);
 
-  // Duplicate current frame as a new frame
+  // Duplicate current frame as a new frame (current animation+direction only)
   const duplicateFrame = useCallback(() => {
     if (currentFrameCount >= MAX_FRAMES) return;
-
     saveCurrentSprite();
+
     const sourceData = spritesRef.current.get(currentKey);
-
-    // Add new frame
     const newFrameIndex = currentFrameCount;
-    setFrameCounts(prev => ({
-      ...prev,
-      [animationState]: prev[animationState] + 1,
-    }));
 
-    // Copy current frame to new frame for all directions
     if (sourceData) {
-      for (const dir of DIRECTIONS) {
-        const sourceKey = getSpriteKey(animationState, dir, frame);
-        const destKey = getSpriteKey(animationState, dir, newFrameIndex);
-        const srcData = spritesRef.current.get(sourceKey);
-        if (srcData) {
-          const copy = new ImageData(
-            new Uint8ClampedArray(srcData.data),
-            srcData.width,
-            srcData.height
-          );
-          spritesRef.current.set(destKey, copy);
-        }
-      }
+      const copy = new ImageData(
+        new Uint8ClampedArray(sourceData.data),
+        sourceData.width,
+        sourceData.height
+      );
+      spritesRef.current.set(getSpriteKey(animationState, direction, newFrameIndex), copy);
     }
 
-    // Switch to the new frame
+    setFrameCounts(prev => ({ ...prev, [frameCountKey]: currentFrameCount + 1 }));
     setFrame(newFrameIndex);
-  }, [currentFrameCount, animationState, currentKey, frame, getSpriteKey, saveCurrentSprite]);
+  }, [currentFrameCount, frameCountKey, animationState, direction, currentKey, getSpriteKey, saveCurrentSprite]);
 
-  // Delete current frame
+  // Delete current frame (current animation+direction only)
   const deleteFrame = useCallback(() => {
     if (currentFrameCount <= 1) return;
     saveCurrentSprite();
 
-    // Shift all frames after current one down
-    for (const dir of DIRECTIONS) {
-      for (let f = frame; f < currentFrameCount - 1; f++) {
-        const srcKey = getSpriteKey(animationState, dir, f + 1);
-        const destKey = getSpriteKey(animationState, dir, f);
-        const srcData = spritesRef.current.get(srcKey);
-        if (srcData) {
-          spritesRef.current.set(destKey, srcData);
-        } else {
-          spritesRef.current.delete(destKey);
-        }
+    // Shift frames after the deleted one down — current direction only
+    for (let f = frame; f < currentFrameCount - 1; f++) {
+      const srcKey = getSpriteKey(animationState, direction, f + 1);
+      const destKey = getSpriteKey(animationState, direction, f);
+      const srcData = spritesRef.current.get(srcKey);
+      if (srcData) {
+        spritesRef.current.set(destKey, srcData);
+      } else {
+        spritesRef.current.delete(destKey);
       }
-      // Delete the last frame slot
-      spritesRef.current.delete(getSpriteKey(animationState, dir, currentFrameCount - 1));
     }
+    // Remove the now-orphaned last slot
+    spritesRef.current.delete(getSpriteKey(animationState, direction, currentFrameCount - 1));
 
-    setFrameCounts(prev => ({
-      ...prev,
-      [animationState]: prev[animationState] - 1,
-    }));
+    setFrameCounts(prev => ({ ...prev, [frameCountKey]: currentFrameCount - 1 }));
     setFrame(prev => Math.max(0, prev - 1));
-  }, [currentFrameCount, animationState, frame, getSpriteKey, saveCurrentSprite]);
+  }, [currentFrameCount, frameCountKey, animationState, direction, frame, getSpriteKey, saveCurrentSprite]);
 
   // Move current frame left
+  // Import image from file (PNG/JPG) into current frame
+  const handleImportImage = useCallback(async () => {
+    console.log('[CharacterEditor] import image requested, animation:', animationState, 'direction:', direction, 'frame:', frame);
+    const result = await importImageToImageData(SPRITE_WIDTH);
+    if (!result) { console.log('[CharacterEditor] import cancelled or failed'); return; }
+    console.log('[CharacterEditor] setting imported image on canvas:', result.fileName);
+    canvasRef.current?.setImageData(result.imageData);
+    // Commit to spritesRef immediately so the import persists across
+    // frame switches and saves. setImageData only updates the canvas
+    // buffer — it does not call onChange, so spritesRef would stay stale.
+    spritesRef.current.set(currentKey, result.imageData);
+  }, [animationState, direction, frame, currentKey]);
+
+  // Move current frame left (current animation+direction only)
   const moveFrameLeft = useCallback(() => {
     if (frame <= 0) return;
     saveCurrentSprite();
 
-    // Swap frame and frame-1 for all directions
-    for (const dir of DIRECTIONS) {
-      const currentKey = getSpriteKey(animationState, dir, frame);
-      const prevKey = getSpriteKey(animationState, dir, frame - 1);
-      const currentData = spritesRef.current.get(currentKey);
-      const prevData = spritesRef.current.get(prevKey);
+    const keyA = getSpriteKey(animationState, direction, frame);
+    const keyB = getSpriteKey(animationState, direction, frame - 1);
+    const dataA = spritesRef.current.get(keyA);
+    const dataB = spritesRef.current.get(keyB);
 
-      if (currentData) spritesRef.current.set(prevKey, currentData);
-      else spritesRef.current.delete(prevKey);
-
-      if (prevData) spritesRef.current.set(currentKey, prevData);
-      else spritesRef.current.delete(currentKey);
-    }
+    if (dataA) spritesRef.current.set(keyB, dataA);
+    else spritesRef.current.delete(keyB);
+    if (dataB) spritesRef.current.set(keyA, dataB);
+    else spritesRef.current.delete(keyA);
 
     setFrame(frame - 1);
-  }, [frame, animationState, getSpriteKey, saveCurrentSprite]);
+  }, [frame, animationState, direction, getSpriteKey, saveCurrentSprite]);
 
-  // Move current frame right
+  // Move current frame right (current animation+direction only)
   const moveFrameRight = useCallback(() => {
     if (frame >= currentFrameCount - 1) return;
     saveCurrentSprite();
 
-    // Swap frame and frame+1 for all directions
-    for (const dir of DIRECTIONS) {
-      const currentKey = getSpriteKey(animationState, dir, frame);
-      const nextKey = getSpriteKey(animationState, dir, frame + 1);
-      const currentData = spritesRef.current.get(currentKey);
-      const nextData = spritesRef.current.get(nextKey);
+    const keyA = getSpriteKey(animationState, direction, frame);
+    const keyB = getSpriteKey(animationState, direction, frame + 1);
+    const dataA = spritesRef.current.get(keyA);
+    const dataB = spritesRef.current.get(keyB);
 
-      if (currentData) spritesRef.current.set(nextKey, currentData);
-      else spritesRef.current.delete(nextKey);
-
-      if (nextData) spritesRef.current.set(currentKey, nextData);
-      else spritesRef.current.delete(currentKey);
-    }
+    if (dataA) spritesRef.current.set(keyB, dataA);
+    else spritesRef.current.delete(keyB);
+    if (dataB) spritesRef.current.set(keyA, dataB);
+    else spritesRef.current.delete(keyA);
 
     setFrame(frame + 1);
-  }, [frame, currentFrameCount, animationState, getSpriteKey, saveCurrentSprite]);
+  }, [frame, currentFrameCount, animationState, direction, getSpriteKey, saveCurrentSprite]);
 
   // Load sprite when state changes
   useEffect(() => {
@@ -353,83 +354,106 @@ export function CharacterEditor() {
       setSaveError(null);
       try {
         const storage = createStorage();
-
-        // Load definition
         const defJson = await storage.readText(`characters/${id}/definition.json`);
-        const def: CharacterDefinition = JSON.parse(defJson);
-        setCharacterId(def.id);
-        setCharacterName(def.name);
-        setFrameDuration(def.frameDuration || DEFAULT_FRAME_DURATION);
-        setWeaponDefId(def.weaponDefId || '');
-        setThrowableDefId(def.throwableDefId || '');
+        const raw = JSON.parse(defJson);
 
-        // Clear existing sprites
+        // Detect format: new schema has `version` and `animations` fields
+        const isNewFormat = raw.version === 1 && raw.animations;
+
         spritesRef.current.clear();
+        const newFrameCounts: Record<string, number> = {};
 
-        // Discover frame counts by checking which files exist
-        const discoveredFrameCounts: Record<AnimationState, number> = {
-          idle: 1,
-          walk: 1,
-          melee_attack: 1,
-          throw_attack: 1,
-        };
+        if (isNewFormat) {
+          // ── New format: load from CharacterSourceDef ────────────────
+          const def = raw as CharacterSourceDef;
+          loadedDefRef.current = def;
+          setCharacterId(def.id);
+          setCharacterName(def.name);
+          setFrameDuration(def.frameDuration || DEFAULT_FRAME_DURATION);
+          setWeaponDefId(def.weaponDefId || '');
+          setThrowableDefId(def.throwableDefId || '');
 
-        // Load all sprite images and discover frame counts
-        // Try both new format (no visual state) and old format (with _full_)
-        for (const as of ANIMATION_STATES) {
-          let maxFrame = 0;
-          for (const dir of DIRECTIONS) {
-            for (let f = 0; f < MAX_FRAMES; f++) {
-              // Try new format first: {id}_{anim}_{dir}_{frame}.png
-              const newFilename = `${id}_${as}_${dir}_${f}.png`;
-              // Try old format with visual state: {id}_full_{anim}_{dir}_{frame}.png
-              const oldFilename = `${id}_full_${as}_${dir}_${f}.png`;
-
-              let loaded = false;
-
-              // Try new format
-              try {
-                const url = storage.getReadUrl(`characters/${id}/${newFilename}`);
-                const img = await loadImage(url);
-                const data = imageToImageData(img, SPRITE_WIDTH, SPRITE_HEIGHT);
-                spritesRef.current.set(getSpriteKey(as, dir, f), data);
-                maxFrame = Math.max(maxFrame, f + 1);
-                loaded = true;
-              } catch {
-                // New format doesn't exist, try old format
-              }
-
-              // Try old format if new didn't work
-              if (!loaded) {
+          for (const [as, animDirs] of Object.entries(def.animations)) {
+            for (const dir of DIRECTIONS) {
+              const df = animDirs[dir];
+              if (!df) continue;
+              for (let f = 0; f < df.frames; f++) {
+                const path = schemaFramePath(id, as, dir, f);
                 try {
-                  const url = storage.getReadUrl(`characters/${id}/${oldFilename}`);
+                  const url = storage.getReadUrl(path);
                   const img = await loadImage(url);
                   const data = imageToImageData(img, SPRITE_WIDTH, SPRITE_HEIGHT);
-                  spritesRef.current.set(getSpriteKey(as, dir, f), data);
-                  maxFrame = Math.max(maxFrame, f + 1);
-                  loaded = true;
+                  spritesRef.current.set(getSpriteKey(as as AnimationState, dir, f), data);
                 } catch {
-                  // Neither format exists - stop looking for more frames
+                  // Declared frame missing — leave empty (will show blank canvas)
+                  console.warn(`[CharacterEditor] declared frame missing: ${path}`);
                 }
               }
+              newFrameCounts[`${as}_${dir}`] = df.frames;
+            }
+          }
+        } else {
+          // ── Legacy format: discovery-based migration ─────────────────
+          loadedDefRef.current = null;
+          const legacy = raw as LegacyCharacterDefinition;
+          setCharacterId(legacy.id || id);
+          setCharacterName(legacy.name || id);
+          setFrameDuration(legacy.frameDuration || DEFAULT_FRAME_DURATION);
+          setWeaponDefId(legacy.weaponDefId || '');
+          setThrowableDefId(legacy.throwableDefId || '');
 
-              if (!loaded) {
-                break; // No more frames in this direction
+          console.log(`[CharacterEditor] legacy format detected for "${id}", migrating on next save`);
+
+          // Discover frames by scanning for old filename patterns:
+          //   {id}_full_{anim}_{dir}_{frame}.png  (old visual-state format)
+          //   {id}_{anim}_{dir}_{frame}.png       (intermediate format)
+          for (const as of ANIMATION_STATES) {
+            for (const dir of DIRECTIONS) {
+              let dirFrameCount = 0;
+              for (let f = 0; f < MAX_FRAMES; f++) {
+                const patterns = [
+                  `characters/${id}/${id}_full_${as}_${dir}_${f}.png`,
+                  `characters/${id}/${id}_${as}_${dir}_${f}.png`,
+                ];
+                let loaded = false;
+                for (const pattern of patterns) {
+                  try {
+                    const url = storage.getReadUrl(pattern);
+                    const img = await loadImage(url);
+                    const data = imageToImageData(img, SPRITE_WIDTH, SPRITE_HEIGHT);
+                    spritesRef.current.set(getSpriteKey(as, dir, f), data);
+                    dirFrameCount = f + 1;
+                    loaded = true;
+                    break;
+                  } catch {
+                    // Try next pattern
+                  }
+                }
+                if (!loaded) break;
+              }
+              if (dirFrameCount > 0) {
+                newFrameCounts[`${as}_${dir}`] = dirFrameCount;
               }
             }
           }
-          discoveredFrameCounts[as] = Math.max(1, maxFrame);
         }
 
-        setFrameCounts(discoveredFrameCounts);
+        // Ensure every animation+direction has at least 1 in frameCounts
+        // for directions where we found frames
+        setFrameCounts(newFrameCounts);
 
-        // Reset to initial state and load sprite
+        // Reset to initial state
         setAnimationState('idle');
         setDirection('south');
         setFrame(0);
         loadSprite('idle', 'south', 0);
+
+        if (!isNewFormat) {
+          setSaveError('Legacy format — save to migrate to new schema');
+        }
       } catch (e) {
         setSaveError(`Failed to load character: ${e}`);
+        console.error('[CharacterEditor] load error:', e);
       } finally {
         setIsLoading(false);
       }
@@ -437,14 +461,16 @@ export function CharacterEditor() {
     [getSpriteKey, loadSprite]
   );
 
-  // Save character to storage
+  // Save character to storage using CharacterSourceDef schema.
+  // Authoritative: deletes all existing files for this character first,
+  // then writes the definition + declared frame blobs. No orphans survive.
   const saveCharacter = useCallback(async () => {
     if (!characterId.trim()) {
       setSaveError('Character ID is required');
       return;
     }
 
-    // Save current canvas first
+    // Commit current canvas to spritesRef before building the definition
     saveCurrentSprite();
 
     setIsSaving(true);
@@ -453,31 +479,117 @@ export function CharacterEditor() {
       const storage = createStorage();
       const now = new Date().toISOString();
 
-      // Save definition (frame counts are discovered, not stored)
-      const def: CharacterDefinition = {
+      // Build CharacterSourceDef from editor state.
+      // Also preserve any non-standard animations from a previously loaded
+      // definition so the editor doesn't destroy data it can't author yet.
+      const animations: Record<string, AnimationDirections> = {};
+      const droppedWarnings: string[] = [];
+
+      for (const as of ANIMATION_STATES) {
+        const dirs: Partial<Record<Direction, DirectionFrames>> = {};
+        let hasAnyDirection = false;
+        for (const dir of DIRECTIONS) {
+          const fcKey = `${as}_${dir}`;
+          const fc = frameCounts[fcKey] ?? 0;
+          const hasContent = fc > 0 && Array.from({ length: fc }, (_, f) =>
+            spritesRef.current.has(getSpriteKey(as, dir, f))
+          ).some(Boolean);
+          if (hasContent) {
+            dirs[dir] = { frames: fc, loop: !as.includes('attack') };
+            hasAnyDirection = true;
+          }
+        }
+        if (hasAnyDirection) {
+          if (!dirs.south) {
+            // Has work in other directions but no south — warn, don't silently drop
+            droppedWarnings.push(`"${as}" has no south frames and will not be saved (schema requires south)`);
+            continue;
+          }
+          animations[as] = {
+            south: dirs.south!,
+            north: dirs.north,
+            east: dirs.east,
+            west: dirs.west,
+          };
+        }
+      }
+
+      // Preserve non-standard animations from the loaded definition.
+      // The editor can only author the 4 standard states; custom animations
+      // pass through unchanged so save doesn't destroy them.
+      if (loadedDefRef.current) {
+        for (const [key, value] of Object.entries(loadedDefRef.current.animations)) {
+          if (!ANIMATION_STATES.includes(key as AnimationState) && !animations[key]) {
+            animations[key] = value;
+          }
+        }
+      }
+
+      if (droppedWarnings.length > 0) {
+        const proceed = window.confirm(
+          'Some animations will not be saved:\n\n' +
+          droppedWarnings.join('\n') +
+          '\n\nContinue saving?'
+        );
+        if (!proceed) {
+          setIsSaving(false);
+          return;
+        }
+      }
+
+      const def: CharacterSourceDef = {
+        version: 1,
         id: characterId,
         name: characterName || characterId,
+        spriteSize: SPRITE_WIDTH,
         frameDuration,
-        ...(weaponDefId ? { weaponDefId } : {}),
-        ...(throwableDefId ? { throwableDefId } : {}),
-        createdAt: now,
+        weaponDefId: weaponDefId || null,
+        throwableDefId: throwableDefId || null,
+        animations,
+        createdAt: loadedDefRef.current?.createdAt ?? now,
         updatedAt: now,
       };
+
+      // Validate before any destructive operation
+      const { validateSourceDef } = await import('../../schemas/character');
+      const validationErrors = validateSourceDef(def);
+      if (validationErrors.length > 0) {
+        setSaveError('Validation failed:\n' + validationErrors.join('\n'));
+        setIsSaving(false);
+        return;
+      }
+
+      // Delete ALL existing files for this character (authoritative save).
+      // This removes orphaned frames from previous saves, legacy format
+      // files, and any stale data that would confuse future loads.
+      const prefix = `characters/${characterId}/`;
+      const existingFiles = await storage.list(prefix);
+      for (const file of existingFiles) {
+        await storage.delete(file);
+      }
+
+      // Write definition
       await storage.writeText(
         `characters/${characterId}/definition.json`,
         JSON.stringify(def, null, 2)
       );
 
-      // Save all sprites
-      for (const [key, data] of spritesRef.current.entries()) {
-        const [as, dir, f] = key.split('_');
-        const filename = `${characterId}_${as}_${dir}_${f}.png`;
-        const blob = await imageDataToPng(data);
-        await storage.writeBytes(
-          `characters/${characterId}/${filename}`,
-          await blob.arrayBuffer(),
-          'image/png'
-        );
+      // Write frame blobs to stable logical paths
+      let written = 0;
+      for (const [as, animDirs] of Object.entries(animations)) {
+        for (const dir of DIRECTIONS) {
+          const df = animDirs[dir];
+          if (!df) continue;
+          for (let f = 0; f < df.frames; f++) {
+            const spriteData = spritesRef.current.get(getSpriteKey(as as AnimationState, dir as Direction, f));
+            if (spriteData) {
+              const blob = await imageDataToPng(spriteData);
+              const path = schemaFramePath(characterId, as, dir, f);
+              await storage.writeBytes(path, await blob.arrayBuffer(), 'image/png');
+              written++;
+            }
+          }
+        }
       }
 
       // Update existing characters list
@@ -485,20 +597,40 @@ export function CharacterEditor() {
         setExistingCharacters([...existingCharacters, characterId]);
       }
 
-      console.log(`Saved character ${characterId} with ${spritesRef.current.size} sprites`);
+      // Save establishes the authoritative source definition.
+      // Bake is a derived-cache step required for Freedom Board rendering.
+      const bakeResult = await bakeCharacter(characterId);
+      loadedDefRef.current = def;
+      if (!bakeResult.success) {
+        setSaveError(
+          `Saved source definition, but bake failed:\n${bakeResult.errors.join('\n')}`
+        );
+        return;
+      }
+
+      emitCharacterAssetsChanged({
+        characterId,
+        bakedAt: now,
+      });
+
+      console.log(`[CharacterEditor] saved ${characterId}: ${written} frames, ${Object.keys(animations).length} animations`);
     } catch (e) {
       setSaveError(`Failed to save: ${e}`);
+      console.error('[CharacterEditor] save error:', e);
     } finally {
       setIsSaving(false);
     }
-  }, [characterId, characterName, frameDuration, saveCurrentSprite, existingCharacters]);
+  }, [characterId, characterName, frameDuration, weaponDefId, throwableDefId,
+      frameCounts, saveCurrentSprite, existingCharacters, getSpriteKey]);
 
-  // Copy current frame to all directions
+  // Copy current frame to all directions (explicit user action).
+  // Ensures target directions have enough frames to hold the copied frame.
   const copyToAllDirections = useCallback(() => {
     saveCurrentSprite();
     const sourceData = spritesRef.current.get(currentKey);
     if (!sourceData) return;
 
+    const updates: Record<string, number> = {};
     for (const dir of DIRECTIONS) {
       if (dir !== direction) {
         const key = getSpriteKey(animationState, dir, frame);
@@ -508,9 +640,18 @@ export function CharacterEditor() {
           sourceData.height
         );
         spritesRef.current.set(key, copy);
+        // Ensure target direction has enough frames
+        const targetKey = `${animationState}_${dir}`;
+        const targetCount = frameCounts[targetKey] ?? 1;
+        if (frame >= targetCount) {
+          updates[targetKey] = frame + 1;
+        }
       }
     }
-  }, [currentKey, direction, animationState, frame, getSpriteKey, saveCurrentSprite]);
+    if (Object.keys(updates).length > 0) {
+      setFrameCounts(prev => ({ ...prev, ...updates }));
+    }
+  }, [currentKey, direction, animationState, frame, frameCounts, getSpriteKey, saveCurrentSprite]);
 
   // Copy current frame to all frames in animation
   const copyToAllFrames = useCallback(() => {
@@ -622,18 +763,17 @@ export function CharacterEditor() {
   const newCharacter = useCallback(() => {
     setCharacterId('');
     setCharacterName('');
-    setFrameCounts({
-      idle: 1,
-      walk: 1,
-      melee_attack: 1,
-      throw_attack: 1,
-    });
+    setWeaponDefId('');
+    setThrowableDefId('');
+    setFrameCounts({ idle_south: 1 });
     setFrameDuration(DEFAULT_FRAME_DURATION);
     spritesRef.current.clear();
+    loadedDefRef.current = null;
     canvasRef.current?.clear();
     setAnimationState('idle');
     setDirection('south');
     setFrame(0);
+    setSaveError(null);
   }, []);
 
   return (
@@ -886,7 +1026,7 @@ export function CharacterEditor() {
                       fontSize: '0.75rem',
                     }}
                   >
-                    {ANIMATION_STATE_LABELS[as]} ({frameCounts[as]})
+                    {ANIMATION_STATE_LABELS[as]} ({frameCounts[`${as}_${direction}`] ?? 0})
                   </button>
                 ))}
               </div>
@@ -940,6 +1080,26 @@ export function CharacterEditor() {
                   {i + 1}
                 </button>
               ))}
+
+              {/* Import image from file */}
+              <button
+                onClick={handleImportImage}
+                title="Import image from file (PNG/JPG)"
+                style={{
+                  width: 32,
+                  height: 32,
+                  border: 'none',
+                  borderRadius: '4px',
+                  background: '#16213e',
+                  color: '#60a0e0',
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}
+              >
+                <Upload size={16} />
+              </button>
 
               {/* Add Frame button */}
               <button

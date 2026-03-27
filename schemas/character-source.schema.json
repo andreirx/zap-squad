@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zapsquad.dev/schemas/character-source.schema.json",
+  "title": "CharacterSourceDefinition",
+  "description": "Authoritative schema for a character asset before baking. Defines what animations, directions, and frames exist. Frame image blobs are stored separately under stable logical keys derived from this schema: characters/{id}/frames/{animation}/{direction}/{frame}.png. The baker validates that every declared frame has a corresponding blob — missing blobs are hard errors.",
+  "type": "object",
+  "required": ["version", "id", "name", "spriteSize", "animations"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "const": 1,
+      "description": "Schema version. Must be 1."
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "description": "Unique identifier. Lowercase alphanumeric + underscores. Used as the storage key prefix and body_def_id in the game runtime."
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable display name."
+    },
+    "spriteSize": {
+      "type": "integer",
+      "enum": [64, 128, 256],
+      "description": "Width and height of each frame image in pixels. All frames must be this size."
+    },
+    "frameDuration": {
+      "type": "number",
+      "minimum": 0.01,
+      "maximum": 10.0,
+      "default": 0.1,
+      "description": "Seconds per frame for animation playback."
+    },
+    "weaponDefId": {
+      "type": ["string", "null"],
+      "default": null,
+      "description": "Optional reference to a weapon/object asset for melee equipment rendering."
+    },
+    "throwableDefId": {
+      "type": ["string", "null"],
+      "default": null,
+      "description": "Optional reference to a weapon/object asset for ranged/throwable rendering."
+    },
+    "animations": {
+      "type": "object",
+      "description": "Map of animation name to per-direction frame declarations. Each animation can have independent frame counts per direction.",
+      "minProperties": 1,
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*$",
+        "description": "Animation name: idle, walk, melee_attack, throw_attack, or custom."
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/AnimationDirections"
+      }
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 creation timestamp."
+    },
+    "updatedAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 last modification timestamp."
+    }
+  },
+  "$defs": {
+    "AnimationDirections": {
+      "type": "object",
+      "description": "Per-direction frame counts for one animation. Each direction has an independent frame count.",
+      "required": ["south"],
+      "additionalProperties": false,
+      "properties": {
+        "north": { "$ref": "#/$defs/DirectionFrames" },
+        "east": { "$ref": "#/$defs/DirectionFrames" },
+        "south": { "$ref": "#/$defs/DirectionFrames" },
+        "west": { "$ref": "#/$defs/DirectionFrames" }
+      }
+    },
+    "DirectionFrames": {
+      "type": "object",
+      "required": ["frames"],
+      "additionalProperties": false,
+      "properties": {
+        "frames": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8,
+          "description": "Number of frames for this animation+direction. Frame blobs are stored at indices 0..frames-1."
+        },
+        "loop": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether this animation loops or plays once and holds the last frame."
+        }
+      }
+    }
+  }
+}

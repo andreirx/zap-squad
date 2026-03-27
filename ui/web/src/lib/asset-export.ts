@@ -36,13 +36,14 @@ export async function exportAsset(
     id: string;
     name: string;
     atlas: string;
+    atlasUrl?: string;
     atlasWidth?: number;
     atlasHeight?: number;
     spriteSize: number;
   },
 ): Promise<void> {
   // Fetch the atlas PNG
-  const atlasUrl = `${ASSETS_URL}/${def.atlas}`;
+  const atlasUrl = def.atlasUrl ?? `${ASSETS_URL}/${def.atlas}`;
   const resp = await fetch(atlasUrl);
   if (!resp.ok) {
     throw new Error(`Failed to fetch atlas: ${resp.status} ${atlasUrl}`);
