@@ -16,7 +16,8 @@ use zapsquad_adapters::{
     engine_gateway::RenderRequest,
     asset_gateway::TileDefinition,
     AssetGateway, AssetManifest, CompositeRenderer, EngineGateway, InputAdapter,
-    InputEvent as AdapterInputEvent, ScriptCommand, ScriptContext, ScriptEngine, WorldQuery,
+    InputEvent as AdapterInputEvent,
+    script_bindings::{ScriptCommand, ScriptContext, ScriptEngine, WorldQuery},
     TileInstance,
 };
 use zapsquad_core::{ActorId, AnimationState, CompositeActor, GameState, ScriptId};

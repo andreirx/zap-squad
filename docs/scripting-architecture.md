@@ -22,13 +22,10 @@ emit commands that the orchestrator applies after execution completes.
                                │ depends inward
 ┌──────────────────────────────▼─────────────────────────────────┐
 │                      ADAPTERS LAYER                            │
-│  script_bindings.rs                                            │
-│    ScriptEngine    ─── Rhai Engine + compiled AST cache        │
-│    ScriptContext    ─── per-character context for AI scripts   │
-│    ScriptCommand   ─── MoveTo, Attack, SetDirection, ...       │
-│    WorldQuery      ─── read-only snapshot of all actors        │
-│                                                                │
 │  game_script_bindings.rs                                       │
+│    AiScriptEngine    ── character AI (legacy-compatible names) │
+│    RulesScriptEngine ── rules scope                            │
+│    WorldGenScriptEngine ── world gen scope                     │
 │    CharacterAiContext ── per-character, per-frame behavior     │
 │    RulesContext       ── game-level event handling             │
 │    WorldGenContext    ── setup-time world creation             │
@@ -36,17 +33,20 @@ emit commands that the orchestrator applies after execution completes.
 │    RulesCommand      ── spawn, kill, modify stats/resources    │
 │    WorldGenCommand   ── place tiles, spawn units, define zones │
 │    GameView / CharacterView / TeamView ── read-only DTOs       │
+│                                                                │
+│  script_bindings.rs  (legacy, retained for standalone WASM)    │
+│    ScriptEngine    ─── old Rhai Engine, not used by FreedomBoard│
 └──────────────────────────────┬─────────────────────────────────┘
                                │ depends inward
 ┌──────────────────────────────▼─────────────────────────────────┐
 │                   INFRASTRUCTURE LAYER                         │
 │  wasm-canvas/src/lib.rs                                        │
-│    FreedomBoardGame ── owns ScriptEngine instance              │
+│    FreedomBoardGame ── owns AiScriptEngine + RulesScriptEngine + WorldGenScriptEngine │
 │    PENDING_SCRIPTS  ── thread_local hot-reload queue           │
 │    reload_scripts() ── WASM export for React → WASM            │
 │    run_scripts()    ── per-frame script execution loop         │
-│    Orchestrator     ── LIVE: drives GameSession + rules scope   │
-│                        (AI = legacy path, world gen = deferred) │
+│    Orchestrator     ── LIVE: drives GameSession + all three scopes │
+│                        (all three scopes live)                  │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -80,10 +80,10 @@ game state, resources, other characters' stats, or game phase. Only controls its
 movement and animation.
 
 **Note on legacy bindings:** `script_bindings.rs` contains an older `ScriptContext` /
-`ScriptCommand` / `ActorId`-based system that is currently wired into `wasm-canvas`
-for per-frame execution. The `CharacterAiContext` / `AiCommand` / `CharacterInstanceId`
-system in `game_script_bindings.rs` is the target architecture. The orchestrator (Phase 3)
-will migrate execution from the legacy path to the new one.
+`ScriptCommand` / `ActorId`-based system retained only for the standalone WASM renderer
+(not used by Freedom Board). Freedom Board uses `AiScriptEngine` from
+`game_script_bindings.rs` with legacy-compatible function names (`move_to`, `attack`,
+`find_nearest`, etc.) bridged through `CharacterInstanceId → ActorId` mapping.
 
 **Script entry point:**
 ```rhai
@@ -206,13 +206,14 @@ FreedomBoardGame::update()
     │
     ├── Check PENDING_SCRIPTS thread_local
     │   If Some(scripts):
-    │     ├── self.scripts.clear_scripts()           — wipe old AI ASTs
+    │     ├── self.ai_engine.clear_scripts()         — wipe old AI ASTs
     │     ├── self.rules_engine.clear_scripts()      — wipe old rules ASTs
+    │     ├── self.worldgen_engine.clear_scripts()   — wipe old world gen ASTs
     │     ├── For each (name, entry):
     │     │     match entry.scope:
-    │     │       "character_ai" → self.scripts.compile_script(name, source)
+    │     │       "character_ai" → self.ai_engine.compile_script(name, source)
     │     │       "rules"        → self.rules_engine.compile_script(name, source)
-    │     │       "world_gen"    → skipped (Track D — WorldGenContext not yet wired)
+    │     │       "world_gen"    → self.worldgen_engine.compile_script(name, source)
     │     │       _              → warning logged
     │     │     └── Engine::compile(source) → AST
     │     │         Stored in HashMap<String, CompiledScript> per engine
@@ -229,26 +230,22 @@ pre-compiled AST — no string eval at runtime.
 ```
 FreedomBoardGame::run_scripts()
     │
-    ├── Collect all actors with script_id ≠ None
-    ├── Build WorldQuery { actors: Vec<(ActorId, Vec2, String)> }
-    │   (snapshot of all actor positions and tags)
+    ├── Only runs when game_session is active (characters inert in edit mode)
+    ├── Build CharacterAiContext from GameSession.characters + GameView
+    │   (read-only snapshot of all teams, characters, positions, stats)
     │
-    ├── For each scripted actor:
-    │   ├── [CURRENT — legacy path via script_bindings.rs]
-    │   │   Create ScriptContext { self_id, self_pos, dt, world: WorldQuery }
-    │   │   → Engine::call_fn(&ast, "update", (ctx,))
-    │   │   → ctx.take_commands() → Vec<ScriptCommand>
-    │   │
-    │   ├── [TARGET — via game_script_bindings.rs, orchestrator Phase 3]
-    │   │   Create CharacterAiContext { self_id, self_team, self_pos, self_stats, dt, game: GameView }
+    ├── For each scripted character:
+    │   ├── Create CharacterAiContext { self_id, self_team, self_pos, self_stats, dt, game: GameView }
+    │   ├── AiScriptEngine.run_update(script_name, ctx)
     │   │   → Engine::call_fn(&ast, "update", (ctx,))
     │   │   → ctx.take_commands() → Vec<AiCommand>
+    │   └── AiCommand variants applied via CharacterInstanceId → ActorId bridge
     │
     └── Apply all commands:
         ├── MoveTo → insert into movement_targets HashMap
         │   (A* pathfinding runs, waypoint queue populated)
         ├── Attack → apply_damage(), set MeleeAttack animation
-        ├── SetDirection → update CompositeActor.direction
+        ├── Face → update CompositeActor.direction
         ├── SetAnimation → update CompositeActor.animation_state
         └── SetVelocity → override velocity directly
 ```
@@ -284,49 +281,43 @@ FreedomBoardGame::run_orchestrator(dt)   [wasm-canvas/src/lib.rs]
         └── Log → web_sys::console::log_1
 ```
 
-### Phase E: World Generation — FUTURE
+### Phase E: World Generation — LIVE (2026-03-29)
 
 ```
-GamePhase::Setup
+start_game_session()
+    │
+    ├── Pre-flight validation passes (all referenced scripts compiled)
+    ├── RNG: xorshift32, reset to seed 42 before each run
     │
     ├── Create WorldGenContext { commands: Vec<WorldGenCommand> }
-    ├── Engine::call_fn(&worldgen_ast, "generate", (ctx,))
+    ├── WorldGenScriptEngine.run_generate(script_name, ctx)
+    │   → Engine::call_fn(&worldgen_ast, "generate", (ctx,))
     ├── ctx.take_commands()
     │
     └── Apply:
-        ├── PlaceTile → SparseWorld.set(x, y, layer, tile)
-        ├── SpawnUnit → place starting characters
-        └── DefineZone → add to WorldBinding.zones
+        ├── PlaceTile → name→id resolution, SparseWorld.set(x, y, layer, tile)
+        ├── SpawnUnit → template-matched character placement
+        ├── DefineZone → session.zones (Zone struct)
+        └── Log → web_sys::console::log_1
+    │
+    └── On failure: abort startup, restore pre-play snapshot
 ```
 
-## ScriptEngine Internals
+## Script Engine Internals
 
-### Struct
+All three engines share the same structure: a Rhai `Engine` instance with scope-specific
+registered functions and a `HashMap<String, CompiledScript>` AST cache.
 
 ```rust
-pub struct ScriptEngine {
-    engine: Engine,                              // Rhai interpreter instance
-    scripts: HashMap<String, CompiledScript>,    // AST cache
-}
-
 pub struct CompiledScript {
     pub ast: AST,       // Pre-compiled Rhai AST
     pub name: String,   // Script identifier
 }
 ```
 
-### Registered Types (Legacy — script_bindings.rs)
+### AiScriptEngine (game_script_bindings.rs)
 
-These are registered in the current `ScriptEngine::new()` and used by the legacy
-per-frame execution path in wasm-canvas:
-
-| Rhai Name | Rust Type | Properties |
-|-----------|-----------|------------|
-| `Vec2` | `glam::Vec2` | `.x`, `.y` (get/set, f64↔f32 conversion) |
-| `ActorId` | `ActorId(u32)` | Opaque, passed as i64 |
-| `Context` | `ScriptContext` | Passed to `update(ctx)` |
-
-### Registered Functions (Legacy — script_bindings.rs)
+Registers legacy-compatible function names for character AI scripts:
 
 | Function | Signature | Category |
 |----------|-----------|----------|
@@ -337,9 +328,12 @@ per-frame execution path in wasm-canvas:
 | `set_velocity` | `(ctx, x: f64, y: f64)` | Command |
 | `play_sound` | `(ctx, name: &str)` | Command |
 | `find_nearest` | `(ctx, tag: &str) → i64` | Query |
+| `find_nearest_enemy` | `(ctx) → i64` | Query |
 | `get_position` | `(ctx, id: i64) → Vec2` | Query |
 | `self_pos` | `(ctx) → Vec2` | Query |
 | `self_id` | `(ctx) → i64` | Query |
+| `self_team` | `(ctx) → i64` | Query |
+| `self_stat` | `(ctx, key: &str) → f64` | Query |
 | `dt` | `(ctx) → f64` | Query |
 | `dist` | `(x1, y1, x2, y2) → f64` | Utility |
 | `dist_vec` | `(a: Vec2, b: Vec2) → f64` | Utility |
@@ -347,30 +341,34 @@ per-frame execution path in wasm-canvas:
 | `lerp` | `(a, b, t) → f64` | Utility |
 | `vec2` | `(x, y) → Vec2` | Constructor |
 
-### Target API (game_script_bindings.rs — not yet registered in Rhai)
+Also registers `Vec2` type with `.x`, `.y` get/set properties.
 
-The context types in `game_script_bindings.rs` define Rust methods that will be
-registered as Rhai functions when the orchestrator (Phase 3) creates a new `Engine`
-instance. These are **not yet registered** — they exist as Rust methods only.
+### RulesScriptEngine (game_script_bindings.rs)
 
-**CharacterAiContext methods:**
-- `cmd_move_to(x, y)`, `cmd_attack(target_id)`, `cmd_face(direction)`
-- `cmd_set_animation(state)`, `cmd_set_velocity(x, y)`, `cmd_play_sound(name)`
-- `find_nearest_enemy() → (f64, f64)`, `get_pos(instance_id) → (f64, f64)`
+Registers `cmd_*` / `query_*` functions for rules scripts:
 
-**RulesContext methods:**
-- `cmd_spawn(template_id, team_id, x, y)`, `cmd_spawn_individual(template_id, team_id, x, y)`
-- `cmd_kill(character_id)`, `cmd_modify_stat(character_id, stat_key, delta)`
-- `cmd_set_stat(character_id, stat_key, value)`, `cmd_modify_resource(team_id, resource_key, delta)`
-- `cmd_end_game(winner_team_id)`, `cmd_log(msg)`
-- `query_team_resource(team_id, key)`, `query_unit_stat(character_id, key)`
-- `query_alive_count(team_id)`, `query_phase()`, `query_clock()`, `query_turn()`
+**Commands:**
+- `cmd_spawn(ctx, template_id, team_id, x, y)`, `cmd_spawn_individual(ctx, template_id, team_id, x, y)`
+- `cmd_kill(ctx, character_id)`, `cmd_modify_stat(ctx, character_id, stat_key, delta)`
+- `cmd_set_stat(ctx, character_id, stat_key, value)`, `cmd_modify_resource(ctx, team_id, resource_key, delta)`
+- `cmd_end_game(ctx, winner_team_id)`, `cmd_log(ctx, msg)`
 
-**WorldGenContext methods:**
-- `cmd_place_tile(x, y, asset_id, layer, variant)`
-- `cmd_spawn(template_id, team_id, x, y)`
-- `cmd_define_zone(name, x, y, width, height, zone_type, team_id)`
-- `cmd_log(msg)`
+**Queries:**
+- `query_team_resource(ctx, team_id, key)`, `query_unit_stat(ctx, character_id, key)`
+- `query_alive_count(ctx, team_id)`, `query_phase(ctx)`, `query_clock(ctx)`, `query_turn(ctx)`
+
+### WorldGenScriptEngine (game_script_bindings.rs)
+
+Registers world creation functions:
+
+| Function | Signature | Category |
+|----------|-----------|----------|
+| `place_tile` | `(ctx, x, y, asset_id, layer, variant)` | Command |
+| `spawn_unit` | `(ctx, template_id, team_id, x, y)` | Command |
+| `define_zone` | `(ctx, name, x, y, w, h, zone_type, team_id)` | Command |
+| `log` | `(ctx, message)` | Debug |
+| `rand` | `(ctx) → f64` | RNG |
+| `seed` | `(ctx, value)` | RNG |
 
 ### Compilation & Caching
 
@@ -385,8 +383,10 @@ instance. These are **not yet registered** — they exist as Rust methods only.
 The hot-reload mechanism decouples script text changes from the game loop:
 
 1. React calls `reload_scripts(json)` via WASM binding
-2. JSON parsed to `HashMap<String, String>`, stored in `thread_local PENDING_SCRIPTS`
-3. Next `update()` tick: `PENDING_SCRIPTS.take()` → clear old ASTs → recompile all
+2. JSON parsed to `HashMap<String, PendingScript>`, stored in `thread_local PENDING_SCRIPTS`
+3. Next `update()` tick: `PENDING_SCRIPTS.take()` → clear all three engines → recompile all
+   - `ai_engine.clear_scripts()` + `rules_engine.clear_scripts()` + `worldgen_engine.clear_scripts()`
+   - Each script routed to the correct engine by scope
 4. Scripts execute with new ASTs from that tick onward
 
 This prevents mid-update recompilation races. The thread_local queue is the synchronization
@@ -402,11 +402,12 @@ point between the JavaScript thread (which calls `reload_scripts`) and the game 
 | `CharacterInstance` | `ai_script: Option<String>` | Per-character AI behavior |
 | `TeamDefinition` | `controller: Cpu { script_name }` | Team-level AI script |
 
-Scripts are referenced by **name** (string key). The `ScriptEngine` stores compiled ASTs
+Scripts are referenced by **name** (string key). Each engine stores compiled ASTs
 keyed by name. The orchestrator resolves names to ASTs at execution time.
 
-**Known gap:** Validation does not check that referenced script names actually exist as
-compiled ASTs. This should be an orchestrator pre-flight check at game start.
+**Pre-flight validation:** `start_game_session()` verifies all referenced scripts (rules,
+world_gen, team controller AI, per-character AI) are compiled before allowing play. Missing
+scripts abort startup with `start_failed` event.
 
 ## Architectural Invariants
 
@@ -425,29 +426,33 @@ compiled ASTs. This should be an orchestrator pre-flight check at game start.
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| ScriptEngine (compile, cache, execute) | DONE | `adapters/script_bindings.rs` — legacy API |
-| Legacy AI execution (ScriptContext/ScriptCommand) | DONE | Wired in wasm-canvas `run_scripts()` |
-| Hot reload (PENDING_SCRIPTS → recompile) | DONE | `reload_scripts()` WASM export |
-| Three-scope command/context DTOs | DONE | `game_script_bindings.rs` — Rust methods defined |
+| AiScriptEngine (compile, cache, execute) | DONE | `game_script_bindings.rs` — legacy-compatible API |
+| RulesScriptEngine (compile, cache, execute) | DONE | `game_script_bindings.rs` — cmd_*/query_* functions |
+| WorldGenScriptEngine (compile, cache, execute) | DONE | `game_script_bindings.rs` — place_tile, spawn_unit, etc. |
+| Hot reload (PENDING_SCRIPTS → recompile) | DONE | `reload_scripts()` WASM export, all three engines |
+| Three-scope command/context DTOs | DONE | `game_script_bindings.rs` — all three registered in Rhai |
 | Game event system (GameEvent enum) | DONE | `core/entities/game_rules/event.rs` |
 | Game rules editor + validation | DONE | `ui/web/src/editors/RulesEditor/` + `wasm-validator` |
-| Rhai registration for three-scope API | NOT STARTED | Orchestrator must register context types + functions |
-| CharacterAiContext execution path | NOT STARTED | Replace legacy ScriptContext in orchestrator |
-| Rules script execution | NOT STARTED | Needs orchestrator (Phase 3) |
-| World gen script execution | NOT STARTED | Needs orchestrator (Phase 3) |
-| Script Editor UI | NOT STARTED | Phase 2: textarea with scope tabs |
-| Script persistence in IDB | NOT STARTED | Scripts not yet saved to IDB |
-| Script existence validation | NOT STARTED | Orchestrator pre-flight check |
+| Character AI execution (AiScriptEngine) | DONE | CharacterAiContext + AiCommand, per-frame |
+| Rules script execution (orchestrator) | DONE | Event-driven, per-event dispatch |
+| World gen script execution | DONE | Runs at play start via WorldGenScriptEngine |
+| Script Editor UI | DONE | Script Panel with textarea, scope tabs, examples |
+| Script persistence in IDB | DONE | IDB v4 `scripts` store, Script Panel UI |
+| Pre-flight script validation | DONE | `start_game_session()` checks all referenced scripts |
+| Character script assignment UI | DONE | CharacterPanel dropdown |
+| Compile error feedback to UI | NOT DONE | Console only — not surfaced in Script Panel |
+| Play Mode HUD | NOT DONE | No visible phase/resource/turn indicators |
+| Combat depth | NOT DONE | Damage is placeholder `calculate_damage(10)` |
 
 ## Files
 
 | File | Layer | Role |
 |------|-------|------|
-| `adapters/src/script_bindings.rs` | Adapters | ScriptEngine, Rhai registration, compile/execute |
-| `adapters/src/game_script_bindings.rs` | Adapters | Three-scope contexts, command enums, DTOs |
-| `infrastructure/wasm-canvas/src/lib.rs` | Infrastructure | PENDING_SCRIPTS, reload_scripts, run_scripts |
+| `adapters/src/script_bindings.rs` | Adapters | Legacy ScriptEngine, retained for standalone WASM only |
+| `adapters/src/game_script_bindings.rs` | Adapters | Three-scope engines (AiScriptEngine, RulesScriptEngine, WorldGenScriptEngine), contexts, command enums, DTOs |
+| `infrastructure/wasm-canvas/src/lib.rs` | Infrastructure | PENDING_SCRIPTS, reload_scripts, run_scripts, orchestrator |
 | `core/src/entities/game_rules/event.rs` | Core | GameEvent enum |
-| `core/src/entities/game_rules/session.rs` | Core | EventQueue, GameSession lifecycle |
+| `core/src/entities/game_rules/session.rs` | Core | EventQueue, GameSession lifecycle, Zone struct for world gen |
 | `core/src/entities/game_rules/character.rs` | Core | CharacterInstance.ai_script field |
 | `core/src/entities/game_rules/definition.rs` | Core | GameDefinition script name references |
 | `core/src/entities/script.rs` | Core | Script entity (id, name, source) |

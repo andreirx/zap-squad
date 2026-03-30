@@ -13,7 +13,7 @@ Support code that is not exposed as a finished feature remains incomplete.
 
 ---
 
-## Current State (2026-03-26)
+## Current State (2026-03-29)
 
 ### Complete (support + user-facing feature)
 
@@ -48,29 +48,37 @@ Support code that is not exposed as a finished feature remains incomplete.
 - **Play/Stop controls** — FBToolbar Play/Stop buttons. Game definition selector dropdown.
   Edit tools disabled during play. State driven by WASM acknowledgment events.
 - **Scoped script routing** — WASM `reload_scripts()` parses scoped format and routes
-  `rules` → `RulesScriptEngine`, `character_ai` → legacy `ScriptEngine`. `world_gen`
-  scripts stored in IDB but skipped at WASM layer (Track D).
+  `character_ai` → `AiScriptEngine`, `rules` → `RulesScriptEngine`, `world_gen` →
+  `WorldGenScriptEngine`. All three scopes compiled and executed.
 - **WebGPU rendering** — `force2D` removed. Largest atlas is 2400x1536, under 8192 limit.
 
 ### Support-complete but not feature-complete
 
-- **Three-scope script DTOs** — `CharacterAiContext`, `RulesContext`, `WorldGenContext` with
-  command/context types. `RulesContext` fully registered in Rhai. `CharacterAiContext` and
-  `WorldGenContext` not yet registered.
-- **Character AI (legacy path)** — `ScriptEngine` + `ScriptContext` + `ActorId` runs
-  per-frame AI. Works but uses old `script_id` assignment, not named scripts from IDB.
-  No Freedom Board UI to assign a script name to a placed character.
 - **GameEvent system** — 18 event types. `GameStart`, `Tick` emitted by orchestrator.
   Other events (`UnitDamaged`, `UnitKilled`, etc.) emitted by `apply_rules_command`.
 - **Combat use case** — `apply_damage`, `calculate_damage` with 6 tests.
   No targeting UI, no combat feedback.
 
+### Complete (2026-03-29)
+
+- **Three-scope script DTOs** — `CharacterAiContext`, `RulesContext`, `WorldGenContext` with
+  command/context types. All three registered in Rhai.
+- **Character AI** — Migrated to `AiScriptEngine` with legacy-compatible API (`move_to`,
+  `attack`, `find_nearest`, etc.). Named scripts from IDB assigned via CharacterPanel.
+- **Character script assignment UI** — CharacterPanel dropdown binds named scripts to
+  placed characters.
+- **World generation execution** — `WorldGenScriptEngine` runs `fn generate(ctx)` during
+  session setup. PlaceTile, SpawnUnit, DefineZone, Log commands. Failure aborts startup
+  with snapshot rollback.
+- **Character AI migration** — AiScriptEngine replaces legacy ScriptContext path in
+  Freedom Board.
+- **Pre-flight script validation** — `start_game_session()` verifies all referenced scripts
+  (rules, world_gen, team AI, per-character AI) are compiled before allowing play. Missing
+  scripts abort startup with `start_failed` event.
+
 ### Not started
 
 - Play Mode HUD (phase, resources, turns, team indicators)
-- Character script assignment UI (bind named script to placed character)
-- World generation execution (run `fn generate(ctx)` during Setup phase)
-- Character AI migration to `CharacterAiContext` (replace legacy `ScriptContext`)
 - Combat UX (targeting, ranged attacks, feedback)
 - Group commands (multi-select, commander/follower)
 - Canvas-based zone editor (form-based exists in Rules Editor)
@@ -104,62 +112,67 @@ Error handling on all IDB operations. WebGPU rendering restored.
 
 ---
 
-### Phase C: Character Script Assignment + Play HUD
+### Phase C: Character Script Assignment + Play HUD — PARTIAL (2026-03-29)
 
 **Goal:** Connect the existing character AI runtime to named scripts from IDB,
 and give the player visible feedback during play mode.
 
 **Tasks:**
-1. UI to assign a script name to a placed character (dropdown from `scriptStore.list()`)
-2. Store script_name on character in world state (serialize/deserialize)
-3. WASM reads script_name from character, looks up compiled AST by name
+1. ~~UI to assign a script name to a placed character (dropdown from `scriptStore.list()`)~~ — DONE
+2. ~~Store script_name on character in world state (serialize/deserialize)~~ — DONE
+3. ~~WASM reads script_name from character, looks up compiled AST by name~~ — DONE
 4. GameHUD component: current phase, game mode, team resources, turn indicator
 5. Surface validation/start failures in HUD, not console only
 6. Surface script compile errors in Script Panel status
 
 **Done when:**
-- A placed character runs its assigned AI script during Play mode
+- ~~A placed character runs its assigned AI script during Play mode~~ — DONE
 - The HUD shows phase, resources, and game status
 - Compile errors are visible in the Script Panel
 
 ---
 
-### Phase D: World Generation Scripting
+### Phase D: World Generation Scripting — COMPLETE (2026-03-29)
 
 **Goal:** World gen scripts populate the map during Setup phase.
 
 **Tasks:**
-1. Register `WorldGenContext` in Rhai with `cmd_place_tile`, `cmd_spawn`, `cmd_define_zone`, `cmd_log`
-2. Compile `world_gen` scope scripts in WASM (currently skipped)
-3. Run `world_gen_script` during `GamePhase::Setup`
-4. Apply `PlaceTile` → SparseWorld mutation, `SpawnUnit` → character placement
-5. Apply `DefineZone` → WorldBinding zone creation
-6. Transition to Exploration phase after world gen completes
-7. Add world gen example script to Examples button
+1. ~~Register `WorldGenContext` in Rhai with `place_tile`, `spawn_unit`, `define_zone`, `log`, `rand`, `seed`~~ — DONE
+2. ~~Compile `world_gen` scope scripts in WASM~~ — DONE
+3. ~~Run `world_gen_script` during `start_game_session()` after pre-flight validation~~ — DONE
+4. ~~Apply `PlaceTile` → name→id resolution, SparseWorld mutation, `SpawnUnit` → template-matched placement~~ — DONE
+5. ~~Apply `DefineZone` → session.zones (Zone struct)~~ — DONE
+6. ~~Transition to Exploration phase after world gen completes~~ — DONE
+7. ~~Failure aborts startup and restores pre-play snapshot~~ — DONE
 
-**Done when:**
-- A world gen script creates terrain, spawns units, and defines zones
-- The game starts from an empty board and builds itself
+**Done:** A world gen script creates terrain, spawns units, and defines zones.
+RNG uses xorshift32, reset to seed 42 before each run.
 
 ---
 
-### Phase E: Character AI Migration
+### Phase E: Character AI Migration — COMPLETE (2026-03-29)
 
 **Goal:** Replace legacy `ScriptContext`/`ScriptCommand`/`ActorId` execution path with
 `CharacterAiContext`/`AiCommand`/`CharacterInstanceId`.
 
 **Tasks:**
-1. Register `CharacterAiContext` in Rhai with all cmd_* and query methods
-2. Bridge from legacy scripted actor loop to `CharacterAiContext`
-3. Populate `GameView` snapshot for AI scripts from live session state
-4. Map `AiCommand` output through `CharacterInstanceId → ActorId` for rendering
-5. Preserve current movement/animation functionality
-6. Retire legacy `ScriptContext` execution path
+1. ~~Register `CharacterAiContext` in Rhai with all cmd_* and query methods~~ — DONE
+2. ~~Bridge from legacy scripted actor loop to `CharacterAiContext`~~ — DONE
+3. ~~Populate `GameView` snapshot for AI scripts from live session state~~ — DONE
+4. ~~Map `AiCommand` output through `CharacterInstanceId → ActorId` for rendering~~ — DONE
+5. ~~Preserve current movement/animation functionality~~ — DONE
+6. ~~Retire legacy `ScriptContext` execution path from Freedom Board~~ — DONE (retained for standalone WASM only)
 
-**Done when:**
-- Characters execute AI scripts through the new context
-- `find_nearest_enemy`, stat queries, and movement all work
-- Legacy ScriptContext path can be removed
+**Done:** Characters execute AI scripts through AiScriptEngine. Legacy ScriptContext
+path retired from Freedom Board.
+
+---
+
+### Remaining Debt (2026-03-29)
+
+- **Combat damage is placeholder:** `calculate_damage(10)` — no weapon stats or formulas
+- **Compile/runtime errors are console-only:** not surfaced in Script Panel or HUD
+- **World gen runs at play-start only:** edit-time preview generation is future work
 
 ---
 
@@ -218,10 +231,11 @@ and give the player visible feedback during play mode.
 
 ## Immediate Priority Order
 
-1. **Character script assignment + Play HUD** — connect AI to named scripts, show game state
-2. **World gen scripting** — game = world + rules from authored data
-3. **Character AI migration** — new scope replaces legacy
-4. **Play Mode polish** — pause, win/lose, mode-specific flow
-5. **Combat UX** — targeting, feedback, events
-6. **Group commands** — multi-select, squads
-7. **Headless orchestrator tests** — wasm-canvas test seam
+1. ~~**Character script assignment**~~ — DONE (AiScriptEngine, CharacterPanel)
+2. ~~**World gen scripting**~~ — DONE (WorldGenScriptEngine)
+3. ~~**Character AI migration**~~ — DONE (AiScriptEngine replaces legacy)
+4. **Play HUD** — show phase, resources, turns, game status
+5. **Play Mode polish** — pause, win/lose, mode-specific flow
+6. **Combat UX** — targeting, feedback, events
+7. **Group commands** — multi-select, squads
+8. **Headless orchestrator tests** — wasm-canvas test seam

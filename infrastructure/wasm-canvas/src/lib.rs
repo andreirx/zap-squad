@@ -63,11 +63,16 @@ use zapsquad_core::entities::freedom_board::{
     SparseWorld, TileCoord, TilePlacement, VisibleTile, CHUNK_SIZE,
 };
 use zapsquad_core::entities::{ActorId, AnimationState, CompositeActor, Direction, ScriptId};
-use zapsquad_adapters::script_bindings::{ScriptCommand, ScriptEngine, WorldQuery};
-use zapsquad_adapters::{RulesScriptEngine, RulesContext, RulesCommand, GameView, CharacterView, TeamView};
+// Legacy script_bindings retired in Step 3c. AI execution uses AiScriptEngine.
+use zapsquad_adapters::{
+    RulesScriptEngine, RulesContext, RulesCommand,
+    AiScriptEngine, CharacterAiContext, AiCommand,
+    WorldGenScriptEngine, WorldGenContext, WorldGenCommand,
+    GameView, CharacterView, TeamView,
+};
 use zapsquad_core::entities::game_rules::{
     GameDefinition, GameSession, GamePhase, CharacterInstanceId, TeamId,
-    CharacterInstance, validate_game, IssueSeverity,
+    CharacterInstance, TemplateId, validate_game, IssueSeverity,
 };
 // Alias to avoid collision with zap_engine::GameEvent
 use zapsquad_core::entities::game_rules::GameEvent as RulesGameEvent;
@@ -273,7 +278,9 @@ impl<'a> InfiniteNavGrid for SparseWorldNav<'a> {
 /// and the core's tile coordinate model.
 /// Snapshot of mutable state captured before entering play mode.
 /// Restored by stop_game_session() to ensure the board returns cleanly to edit state.
+/// Includes the tile world so world-gen tile placements are rolled back on stop.
 struct PrePlaySnapshot {
+    world: SparseWorld,
     characters: std::collections::HashMap<ActorId, CompositeActor>,
     next_actor_id: u32,
     selected_character: Option<ActorId>,
@@ -325,8 +332,12 @@ pub struct FreedomBoardGame {
     waypoint_queues: std::collections::HashMap<ActorId, std::collections::VecDeque<glam::Vec2>>,
 
     // ── Scripting state ─────────────────────────────────────────────────
-    /// Rhai script engine — compiles and executes .rhai scripts per frame.
-    scripts: ScriptEngine,
+    /// Rhai engine for character AI scripts (scoped architecture).
+    /// Compiles and executes `update(ctx)` with `CharacterAiContext`.
+    ai_engine: AiScriptEngine,
+    /// Rhai engine for world generation scripts.
+    /// Executes `generate(ctx)` once during GamePhase::Setup.
+    worldgen_engine: WorldGenScriptEngine,
 
     // ── Game session orchestrator ────────────────────────────────────────
     /// Loaded game definition. Set via `load_game_definition()` WASM export.
@@ -404,7 +415,8 @@ impl FreedomBoardGame {
             character_equipment: Vec::new(),
             movement_targets: std::collections::HashMap::new(),
             waypoint_queues: std::collections::HashMap::new(),
-            scripts: ScriptEngine::new(),
+            ai_engine: AiScriptEngine::new(),
+            worldgen_engine: WorldGenScriptEngine::new(),
 
             game_definition: None,
             game_session: None,
@@ -437,6 +449,13 @@ impl FreedomBoardGame {
     /// Look up the tile name for an asset_id. Returns None if not registered.
     fn tile_name(&self, asset_id: u16) -> Option<&str> {
         self.tile_registry.get(asset_id as usize).map(|t| t.name.as_str())
+    }
+
+    /// Resolve a tile name to its numeric asset_id. Returns None if not found.
+    fn tile_id_by_name(&self, name: &str) -> Option<u16> {
+        self.tile_registry.iter().enumerate()
+            .find(|(_, t)| t.name == name)
+            .map(|(i, _)| i as u16)
     }
 
     /// Look up full tile info for an asset_id.
@@ -797,82 +816,100 @@ impl FreedomBoardGame {
     /// Uses a fixed dt of 1/60s (the engine runs at requestAnimationFrame cadence).
     /// Execute Rhai scripts for all characters that have assigned script_ids.
     ///
-    /// For each character with a script_id, builds a ScriptContext with the actor's
-    /// position and a WorldQuery of all other actors, then calls the script's update()
-    /// function. Collected ScriptCommands are applied to the actor:
-    ///   - MoveTo → inserts into movement_targets (smooth interpolation)
-    ///   - SetDirection → directly sets actor.direction
-    ///   - SetAnimation → directly sets actor.animation_state
-    ///   - SetVelocity → directly sets actor.velocity (overrides movement_targets)
-    ///   - Attack → placeholder (logs, does not apply damage yet — see T3)
-    ///   - PlaySound → placeholder (no audio system wired yet)
+    /// Execute per-frame AI scripts for characters.
+    ///
+    /// When a game session is active (Play mode), uses `AiScriptEngine` with
+    /// `CharacterAiContext` / `AiCommand`.  Characters are iterated from the
+    /// authoritative `GameSession.characters` (domain entities), and commands
+    /// are applied via the `CharacterInstanceId → ActorId` bridge.
+    ///
+    /// When no session is active (edit mode), characters are inert — no AI runs.
+    /// This matches the VISION §5a: "Before Play is pressed, characters are
+    /// inert visual props. No AI executes."
     fn run_scripts(&mut self) {
+        let session = match &self.game_session {
+            Some(s) => s,
+            None => return, // Edit mode — characters are inert
+        };
+
+        // Don't run AI if game has ended
+        if matches!(session.phase, GamePhase::Ended { .. }) {
+            return;
+        }
+
         const DT: f32 = 1.0 / 60.0;
 
-        // Collect actor IDs that have scripts (can't borrow self mutably during iteration).
-        // Prefer script_name (named scripts from IDB) over legacy numeric script_id.
-        let scripted: Vec<(ActorId, String)> = self
+        // Build GameView once for all scripts this frame.
+        // Shared with run_orchestrator() in concept, but built separately
+        // here because run_orchestrator drains events first and may mutate
+        // the session between the two calls.
+        let game_view = self.build_game_view();
+
+        // Collect scripted characters from the session (domain entities).
+        // Each has a CharacterInstanceId, optional ai_script name, and an
+        // actor_id bridge to the renderer.
+        let scripted: Vec<(CharacterInstanceId, ActorId, String)> = session
             .characters
             .values()
-            .filter_map(|a| {
-                // script_name takes precedence — it's the IDB-stored name
-                if let Some(ref name) = a.script_name {
-                    return Some((a.id, name.clone()));
-                }
-                // Legacy fallback: numeric script_id → "script_{id}"
-                if let Some(sid) = a.script_id {
-                    return Some((a.id, format!("script_{}", sid.0)));
-                }
-                None
-            })
+            .filter(|c| c.alive && c.ai_script.is_some() && c.actor_id.is_some())
+            .map(|c| (c.id, c.actor_id.unwrap(), c.ai_script.clone().unwrap()))
             .collect();
 
         if scripted.is_empty() {
             return;
         }
 
-        // Build world query from all characters (read-only snapshot)
-        let mut query = WorldQuery::new();
-        for actor in self.characters.values() {
-            query.add_actor(actor.id, actor.position, actor.tag.clone());
-        }
+        // Run each script and collect commands keyed by (CharacterInstanceId, ActorId)
+        let mut all_commands: Vec<(CharacterInstanceId, ActorId, Vec<AiCommand>)> = Vec::new();
 
-        // Run each script and collect commands
-        let mut all_commands: Vec<(ActorId, Vec<ScriptCommand>)> = Vec::new();
+        for (instance_id, actor_id, script_name) in &scripted {
+            // Skip if the script isn't compiled
+            if !self.ai_engine.has_script(script_name) {
+                continue;
+            }
 
-        for (actor_id, script_name) in &scripted {
             let actor = match self.characters.get(actor_id) {
                 Some(a) => a,
                 None => continue,
             };
 
-            let ctx = zapsquad_adapters::script_bindings::ScriptContext::new(
-                *actor_id,
+            // Build per-character context from domain + renderer data
+            let session_char = match session.character(*instance_id) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            let ctx = CharacterAiContext::new(
+                instance_id.0,
+                session_char.team_id.0,
                 actor.position,
+                session_char.stats.clone(),
                 DT,
-                query.clone(),
+                game_view.clone(),
             );
 
-            match self.scripts.run_update_with_context(script_name, ctx) {
+            match self.ai_engine.run_update(script_name, ctx) {
                 Ok(commands) => {
                     if !commands.is_empty() {
-                        all_commands.push((*actor_id, commands));
+                        all_commands.push((*instance_id, *actor_id, commands));
                     }
                 }
-                Err(_) => {
-                    // Script execution error — silently skip.
-                    // Compilation errors are already logged during reload.
+                Err(e) => {
+                    web_sys::console::error_1(
+                        &format!("[ai] script '{}' error: {}", script_name, e).into(),
+                    );
                 }
             }
         }
 
-        // Apply commands
-        let mut kills: Vec<ActorId> = Vec::new();
-        for (actor_id, commands) in all_commands {
+        // Apply AiCommands — bridge CharacterInstanceId to ActorId for renderer mutations.
+        // attacker_id is the domain identity of the character whose script emitted the command.
+        let mut kills: Vec<(ActorId, CharacterInstanceId, CharacterInstanceId)> = Vec::new(); // (target_actor, target_instance, killer_instance)
+
+        for (attacker_instance_id, actor_id, commands) in all_commands {
             for cmd in commands {
                 match cmd {
-                    ScriptCommand::MoveTo(target) => {
-                        // Use the smooth movement system (movement_targets)
+                    AiCommand::MoveTo(target) => {
                         self.movement_targets.insert(actor_id, target);
                         if let Some(actor) = self.characters.get_mut(&actor_id) {
                             let delta = target - actor.position;
@@ -882,17 +919,31 @@ impl FreedomBoardGame {
                             actor.animation_state = AnimationState::Walk;
                         }
                     }
-                    ScriptCommand::SetDirection(dir) => {
+                    AiCommand::Face(direction) => {
                         if let Some(actor) = self.characters.get_mut(&actor_id) {
+                            let dir = match direction.to_lowercase().as_str() {
+                                "north" | "up" => Direction::North,
+                                "south" | "down" => Direction::South,
+                                "east" | "right" => Direction::East,
+                                "west" | "left" => Direction::West,
+                                _ => continue,
+                            };
                             actor.direction = dir;
                         }
                     }
-                    ScriptCommand::SetAnimation(anim) => {
+                    AiCommand::SetAnimation(state) => {
                         if let Some(actor) = self.characters.get_mut(&actor_id) {
+                            let anim = match state.to_lowercase().as_str() {
+                                "idle" => AnimationState::Idle,
+                                "walk" => AnimationState::Walk,
+                                "melee" | "melee_attack" => AnimationState::MeleeAttack,
+                                "throw" | "throw_attack" => AnimationState::ThrowAttack,
+                                _ => continue,
+                            };
                             actor.animation_state = anim;
                         }
                     }
-                    ScriptCommand::SetVelocity(vel) => {
+                    AiCommand::SetVelocity(vel) => {
                         if let Some(actor) = self.characters.get_mut(&actor_id) {
                             actor.velocity = vel;
                             if vel.length_squared() > 0.1 {
@@ -900,21 +951,46 @@ impl FreedomBoardGame {
                             }
                         }
                     }
-                    ScriptCommand::Attack(target_id) => {
+                    AiCommand::Attack(target_instance_id) => {
                         // Set attacker animation
                         if let Some(actor) = self.characters.get_mut(&actor_id) {
                             actor.animation_state = AnimationState::MeleeAttack;
                         }
-                        // Apply damage to target
-                        let base = calculate_damage(10); // TODO: get from weapon definition
-                        if let Some(target) = self.characters.get_mut(&target_id) {
-                            let result = apply_damage(target, base);
-                            if result.is_kill {
-                                kills.push(target_id);
+                        // Resolve target: CharacterInstanceId → ActorId
+                        let target_actor_id = self.game_session.as_ref()
+                            .and_then(|s| s.character(target_instance_id))
+                            .and_then(|c| c.actor_id);
+
+                        if let Some(target_aid) = target_actor_id {
+                            // TODO: read weapon stats from template/instance for real damage
+                            let base = calculate_damage(10);
+                            if let Some(target) = self.characters.get_mut(&target_aid) {
+                                let result = apply_damage(target, base);
+                                let remaining_hp = target.health as f32;
+
+                                // Sync damage into authoritative session stats.
+                                // The renderer actor is the source of truth for current HP
+                                // after apply_damage. Write it back into the session so
+                                // GameView, AI queries, and rules scripts see consistent state.
+                                if let Some(session) = &mut self.game_session {
+                                    if let Some(instance) = session.character_mut(target_instance_id) {
+                                        instance.stats.insert("hp".into(), remaining_hp);
+                                    }
+                                    session.events.push(RulesGameEvent::UnitDamaged {
+                                        character_id: target_instance_id,
+                                        attacker_id: Some(attacker_instance_id),
+                                        damage: base as f32,
+                                        remaining_hp,
+                                    });
+                                }
+
+                                if result.is_kill {
+                                    kills.push((target_aid, target_instance_id, attacker_instance_id));
+                                }
                             }
                         }
                     }
-                    ScriptCommand::PlaySound(_name) => {
+                    AiCommand::PlaySound(_name) => {
                         // TODO: Wire audio system
                     }
                 }
@@ -922,13 +998,24 @@ impl FreedomBoardGame {
             self.characters_dirty = true;
         }
 
-        // Remove killed actors
-        for dead_id in &kills {
-            self.characters.remove(dead_id);
-            self.movement_targets.remove(dead_id);
-            self.waypoint_queues.remove(dead_id);
-            if self.selected_character == Some(*dead_id) {
+        // Remove killed actors and mark domain instances as dead
+        for (dead_aid, dead_cid, killer_cid) in &kills {
+            self.characters.remove(dead_aid);
+            self.movement_targets.remove(dead_aid);
+            self.waypoint_queues.remove(dead_aid);
+            self.actor_to_instance.remove(dead_aid);
+            if self.selected_character == Some(*dead_aid) {
                 self.clear_character_selection();
+            }
+            // Mark dead in session and emit UnitKilled with killer attribution
+            if let Some(session) = &mut self.game_session {
+                if let Some(instance) = session.character_mut(*dead_cid) {
+                    instance.alive = false;
+                }
+                session.events.push(RulesGameEvent::UnitKilled {
+                    character_id: *dead_cid,
+                    killer_id: Some(*killer_cid),
+                });
             }
             self.character_generation += 1;
             self.characters_dirty = true;
@@ -1022,13 +1109,16 @@ impl FreedomBoardGame {
     /// Create a GameSession from the loaded definition and begin play.
     /// Runs authoritative validation first — refuses to start if not playable.
     fn start_game_session(&mut self) {
-        let def = match &self.game_definition {
+        // Clone the definition so the borrow on self.game_definition is released
+        // before we need &mut self for world gen command application.
+        let def = match self.game_definition.clone() {
             Some(d) => d,
             None => {
                 web_sys::console::error_1(&"[orchestrator] cannot start: no game definition loaded".into());
                 return;
             }
         };
+        let def = &def;
 
         // Authoritative validation gate — same validator as wasm-validator crate
         let validation = validate_game(def);
@@ -1057,8 +1147,10 @@ impl FreedomBoardGame {
             );
         }
 
-        // Snapshot edit-mode state before play mutations begin
+        // Snapshot edit-mode state before play mutations begin.
+        // Includes the tile world so world-gen tile placements are rolled back on stop.
         self.pre_play_snapshot = Some(PrePlaySnapshot {
+            world: self.world.clone(),
             characters: self.characters.clone(),
             next_actor_id: self.next_actor_id,
             selected_character: self.selected_character,
@@ -1068,6 +1160,160 @@ impl FreedomBoardGame {
 
         let mut session = GameSession::from_definition(def);
 
+        // ── Migrate placed board actors into the game session ─────────
+        // Each CompositeActor on the board becomes a CharacterInstance in
+        // the session, bridged via actor_to_instance.  This is what makes
+        // the session's character universe match the visible board state.
+        //
+        // Team assignment: if the actor has a tag like "team_1", parse
+        // the team ID from it.  Otherwise default to team 0.
+        // Script assignment: copy script_name from the actor.
+        let mut migrated = 0u32;
+        let mut migrated_from_template = 0u32;
+        for actor in self.characters.values() {
+            let team_id = actor.tag.strip_prefix("team_")
+                .and_then(|s| s.parse::<u32>().ok())
+                .map(TeamId)
+                .unwrap_or(TeamId(0));
+
+            let instance_id = session.next_character_id();
+
+            // Try to match the actor against a character template by body_def_id.
+            // Template match gives us: base stats, equipment, template lineage, tags.
+            // Fallback to standalone with renderer-level health when no template matches.
+            let template = def.character_templates.iter()
+                .find(|t| t.body_def_id == actor.body_def_id);
+
+            let mut instance = if let Some(tmpl) = template {
+                let mut inst = CharacterInstance::from_template(instance_id, team_id, tmpl, false);
+                // Template provides base_stats, weapon_def_id, throwable_def_id, tags.
+                // Reconcile HP from the renderer actor — the board actor may have been
+                // damaged or healed in edit mode, so its visible HP takes precedence
+                // over the template's base_stats for initial session state.
+                inst.stats.insert("hp".into(), actor.health as f32);
+                inst.stats.insert("max_hp".into(), actor.max_health as f32);
+                migrated_from_template += 1;
+                inst
+            } else {
+                // No template match — create standalone with renderer health as fallback.
+                let mut stats = std::collections::HashMap::new();
+                stats.insert("hp".into(), actor.health as f32);
+                stats.insert("max_hp".into(), actor.max_health as f32);
+                CharacterInstance::standalone(instance_id, team_id, stats)
+            };
+
+            instance.attach_actor(actor.id);
+            // Actor-level script assignment takes precedence over template default.
+            instance.ai_script = actor.script_name.clone();
+
+            self.actor_to_instance.insert(actor.id, instance_id);
+            session.add_character(instance);
+            migrated += 1;
+        }
+
+        // ── Pre-flight script validation ──────────────────────────────
+        // Verify that every referenced script name is compiled before play.
+        // Missing scripts are logged as errors. Play is aborted if any are missing.
+        let mut missing_scripts: Vec<String> = Vec::new();
+
+        // Check rules script
+        if !def.rules_script.is_empty() && !self.rules_engine.has_script(&def.rules_script) {
+            missing_scripts.push(format!("rules: '{}'", def.rules_script));
+        }
+
+        // Check world gen script
+        if let Some(ref wgs) = def.world_gen_script {
+            if !wgs.is_empty() && !self.worldgen_engine.has_script(wgs) {
+                missing_scripts.push(format!("world_gen: '{}'", wgs));
+            }
+        }
+
+        // Check CPU team controller scripts
+        for team_def in &def.teams {
+            if let zapsquad_core::entities::game_rules::TeamController::Cpu { ref script_name } = team_def.controller {
+                if !script_name.is_empty() && !self.ai_engine.has_script(script_name) {
+                    missing_scripts.push(format!("team_ai: '{}' (team '{}')", script_name, team_def.name));
+                }
+            }
+        }
+
+        // Check AI scripts on migrated characters
+        for c in session.characters.values() {
+            if let Some(ref script_name) = c.ai_script {
+                if !self.ai_engine.has_script(script_name) {
+                    let label = format!("character_ai: '{}' (instance {})", script_name, c.id.0);
+                    // Avoid duplicate messages for the same script name
+                    if !missing_scripts.iter().any(|m| m.contains(&format!("'{}'", script_name))) {
+                        missing_scripts.push(label);
+                    }
+                }
+            }
+        }
+
+        if !missing_scripts.is_empty() {
+            for msg in &missing_scripts {
+                web_sys::console::error_1(
+                    &format!("[orchestrator] missing script: {}", msg).into(),
+                );
+            }
+            web_sys::console::error_1(
+                &format!(
+                    "[orchestrator] cannot start: {} referenced script(s) not compiled. \
+                     Open the Script Panel and reload scripts before pressing Play.",
+                    missing_scripts.len(),
+                ).into(),
+            );
+            // Clean up the migration we already did
+            self.actor_to_instance.clear();
+            // Restore full snapshot (tiles + characters) since we're aborting
+            if let Some(snapshot) = self.pre_play_snapshot.take() {
+                self.world = snapshot.world;
+                self.characters = snapshot.characters;
+                self.next_actor_id = snapshot.next_actor_id;
+                self.selected_character = snapshot.selected_character;
+                self.movement_targets = snapshot.movement_targets;
+                self.waypoint_queues = snapshot.waypoint_queues;
+            }
+            self.pending_session_events.push(4); // start_failed
+            return;
+        }
+
+        // ── Execute world gen script (if any) ────────────────────────
+        // Runs once during setup, after validation passes.  Commands can
+        // place tiles, spawn units from templates, and define zones.
+        // Execution failure aborts startup and restores the pre-play snapshot.
+        let worldgen_name = def.world_gen_script.as_deref().unwrap_or("");
+        if !worldgen_name.is_empty() && self.worldgen_engine.has_script(worldgen_name) {
+            let templates = def.character_templates.clone();
+            let ctx = WorldGenContext::new();
+            match self.worldgen_engine.run_generate(worldgen_name, ctx) {
+                Ok(commands) => {
+                    let cmd_count = commands.len();
+                    self.apply_worldgen_commands(commands, &templates, &mut session);
+                    web_sys::console::log_1(
+                        &format!("[orchestrator] world gen '{}': {} commands applied", worldgen_name, cmd_count).into(),
+                    );
+                }
+                Err(e) => {
+                    web_sys::console::error_1(
+                        &format!("[orchestrator] world gen '{}' failed: {}", worldgen_name, e).into(),
+                    );
+                    // Abort startup — restore pre-play snapshot
+                    self.actor_to_instance.clear();
+                    if let Some(snapshot) = self.pre_play_snapshot.take() {
+                        self.world = snapshot.world;
+                        self.characters = snapshot.characters;
+                        self.next_actor_id = snapshot.next_actor_id;
+                        self.selected_character = snapshot.selected_character;
+                        self.movement_targets = snapshot.movement_targets;
+                        self.waypoint_queues = snapshot.waypoint_queues;
+                    }
+                    self.pending_session_events.push(4); // start_failed
+                    return;
+                }
+            }
+        }
+
         // Emit GameStart event
         session.events.push(RulesGameEvent::GameStart);
 
@@ -1076,8 +1322,9 @@ impl FreedomBoardGame {
 
         web_sys::console::log_1(
             &format!(
-                "[orchestrator] game started: '{}' mode={:?} teams={} templates={}",
-                def.name, def.mode, session.teams.len(), def.character_templates.len()
+                "[orchestrator] game started: '{}' mode={:?} teams={} templates={} migrated={} ({}+{} template/standalone)",
+                def.name, def.mode, session.teams.len(), def.character_templates.len(),
+                migrated, migrated_from_template, migrated - migrated_from_template,
             ).into(),
         );
 
@@ -1095,8 +1342,9 @@ impl FreedomBoardGame {
         self.game_session = None;
         self.actor_to_instance.clear();
 
-        // Restore edit-mode state from snapshot
+        // Restore edit-mode state from snapshot (including tile world)
         if let Some(snapshot) = self.pre_play_snapshot.take() {
+            self.world = snapshot.world;
             self.characters = snapshot.characters;
             self.next_actor_id = snapshot.next_actor_id;
             self.selected_character = snapshot.selected_character;
@@ -1104,7 +1352,7 @@ impl FreedomBoardGame {
             self.waypoint_queues = snapshot.waypoint_queues;
             self.characters_dirty = true;
             self.character_generation += 1;
-            web_sys::console::log_1(&"[orchestrator] game stopped, edit-mode state restored".into());
+            web_sys::console::log_1(&"[orchestrator] game stopped, edit-mode state restored (tiles + characters)".into());
         } else {
             web_sys::console::warn_1(&"[orchestrator] game stopped but no snapshot to restore".into());
         }
@@ -1204,18 +1452,28 @@ impl FreedomBoardGame {
                 unit_count: session.team_characters(t.id).len(),
             }).collect(),
             characters: session.characters.values().map(|c| {
-                // Cross-reference actor position
+                // Cross-reference actor position from renderer
                 let (x, y) = c.actor_id
                     .and_then(|aid| self.characters.get(&aid))
                     .map(|actor| (actor.position.x, actor.position.y))
                     .unwrap_or((0.0, 0.0));
+                // Resolve tags from the character's template definition.
+                // CharacterInstance stores template_id; tags live on CharacterTemplate.
+                let tags = c.template_id.as_ref()
+                    .and_then(|tid| {
+                        self.game_definition.as_ref()
+                            .and_then(|def| def.character_templates.iter()
+                                .find(|t| t.id == *tid))
+                    })
+                    .map(|t| t.tags.clone())
+                    .unwrap_or_default();
                 CharacterView {
                     instance_id: c.id.0,
                     team_id: c.team_id.0,
                     x, y,
                     stats: c.stats.clone(),
                     alive: c.alive,
-                    tags: vec![], // no tags on CharacterInstance (tags are on templates)
+                    tags,
                 }
             }).collect(),
         }
@@ -1313,6 +1571,72 @@ impl FreedomBoardGame {
             }
         };
         (name, data, strings)
+    }
+
+    /// Apply world gen commands during session setup.
+    /// Mutates the board (tiles), spawns characters, and defines zones.
+    fn apply_worldgen_commands(
+        &mut self,
+        commands: Vec<WorldGenCommand>,
+        templates: &[zapsquad_core::entities::game_rules::CharacterTemplate],
+        session: &mut GameSession,
+    ) {
+        for cmd in commands {
+            match cmd {
+                WorldGenCommand::PlaceTile { x, y, asset_id, layer, variant } => {
+                    if let Some(numeric_id) = self.tile_id_by_name(&asset_id) {
+                        let coord = TileCoord::new(x, y);
+                        let tile = TilePlacement::new(numeric_id, variant, layer);
+                        place_tile(&mut self.world, coord, tile);
+                    } else {
+                        web_sys::console::warn_1(
+                            &format!("[worldgen] unknown tile '{}' at ({}, {}), skipping", asset_id, x, y).into(),
+                        );
+                    }
+                }
+                WorldGenCommand::SpawnUnit { template_id, team_id, x, y } => {
+                    let tid = TemplateId(template_id.clone());
+                    let template = templates.iter().find(|t| t.id == tid);
+                    if let Some(tmpl) = template {
+                        let instance_id = session.next_character_id();
+                        let mut instance = CharacterInstance::from_template(
+                            instance_id, TeamId(team_id), tmpl, false,
+                        );
+                        let actor_id = ActorId(self.next_actor_id);
+                        self.next_actor_id += 1;
+                        let mut actor = CompositeActor::new(actor_id, Vec2::new(x, y), &tmpl.body_def_id);
+                        // Copy template equipment and HP — same as rules SpawnUnit path
+                        actor.weapon_def_id = tmpl.weapon_def_id.clone();
+                        actor.throwable_def_id = tmpl.throwable_def_id.clone();
+                        actor.tag = format!("team_{}", team_id);
+                        if let Some(&hp) = tmpl.base_stats.get("hp") {
+                            actor.health = hp as i32;
+                            actor.max_health = hp as i32;
+                        }
+                        self.characters.insert(actor_id, actor);
+
+                        instance.attach_actor(actor_id);
+                        self.actor_to_instance.insert(actor_id, instance_id);
+                        session.add_character(instance);
+
+                        self.characters_dirty = true;
+                        self.character_generation += 1;
+                    } else {
+                        web_sys::console::warn_1(
+                            &format!("[worldgen] unknown template '{}', skipping spawn", template_id).into(),
+                        );
+                    }
+                }
+                WorldGenCommand::DefineZone { name, x, y, width, height, zone_type, team_id } => {
+                    session.define_zone(name, x, y, width, height, zone_type, team_id.map(TeamId));
+                }
+                WorldGenCommand::Log(msg) => {
+                    web_sys::console::log_1(
+                        &format!("[worldgen] {}", msg).into(),
+                    );
+                }
+            }
+        }
     }
 
     /// Apply a single RulesCommand to the game session and world state.
@@ -2429,10 +2753,11 @@ impl Game for FreedomBoardGame {
         // correct engine based on its declared scope.
         PENDING_SCRIPTS.with(|p| {
             if let Some(scripts) = p.borrow_mut().take() {
-                // Clear both engines before recompiling. Each engine only
+                // Clear all engines before recompiling. Each engine only
                 // receives scripts that belong to its scope.
-                self.scripts.clear_scripts();
+                self.ai_engine.clear_scripts();
                 self.rules_engine.clear_scripts();
+                self.worldgen_engine.clear_scripts();
 
                 let mut ai_ok = 0u32;
                 let mut ai_fail = 0u32;
@@ -2444,8 +2769,10 @@ impl Game for FreedomBoardGame {
                 for (name, entry) in &scripts {
                     match entry.scope.as_str() {
                         "character_ai" => {
-                            match self.scripts.compile_script(name, &entry.source) {
-                                Ok(_) => ai_ok += 1,
+                            match self.ai_engine.compile_script(name, &entry.source) {
+                                Ok(_) => {
+                                    ai_ok += 1;
+                                }
                                 Err(e) => {
                                     web_sys::console::error_1(
                                         &format!("[freedom-board] AI script '{}' compile error: {:?}", name, e).into(),
@@ -2466,9 +2793,15 @@ impl Game for FreedomBoardGame {
                             }
                         }
                         "world_gen" => {
-                            // World gen engine not yet wired (Track E — WorldGenContext).
-                            // Script is stored in IDB but skipped at the WASM layer for now.
-                            worldgen_count += 1;
+                            match self.worldgen_engine.compile_script(name, &entry.source) {
+                                Ok(_) => worldgen_count += 1,
+                                Err(e) => {
+                                    web_sys::console::error_1(
+                                        &format!("[freedom-board] world_gen script '{}' compile error: {:?}", name, e).into(),
+                                    );
+                                    worldgen_count += 1; // still count for reporting
+                                }
+                            }
                         }
                         other => {
                             web_sys::console::warn_1(
@@ -2595,8 +2928,8 @@ impl Game for FreedomBoardGame {
 /// Scoped script entry for hot-reload. Carries source code and the scope
 /// that determines which Rhai engine compiles it:
 /// - "rules"        → RulesScriptEngine (on_event entry point)
-/// - "character_ai" → legacy ScriptEngine (update entry point)
-/// - "world_gen"    → deferred (Track E — WorldGenContext not yet wired)
+/// - "character_ai" → AiScriptEngine (update entry point)
+/// - "world_gen"    → WorldGenScriptEngine (generate entry point)
 #[derive(serde::Deserialize)]
 struct PendingScript {
     source: String,
@@ -2941,8 +3274,8 @@ pub fn import_world(json: &str) {
 ///
 /// Each script is routed to the correct engine based on its scope:
 /// - "rules"        → RulesScriptEngine
-/// - "character_ai" → legacy ScriptEngine (AI per-character)
-/// - "world_gen"    → not yet wired (logged and skipped)
+/// - "character_ai" → AiScriptEngine (AI per-character)
+/// - "world_gen"    → WorldGenScriptEngine (generate entry point)
 ///
 /// Scripts are compiled on the next game tick. Compilation errors are
 /// logged to the browser console but do not crash the game.

@@ -35,6 +35,7 @@ pub struct ChunkLOD {
 ///
 /// Stored in a `HashMap<ChunkCoord, Chunk>` by `SparseWorld`.
 /// Only chunks with at least one tile exist in memory.
+#[derive(Clone)]
 pub struct Chunk {
     /// `tiles[cell_index][layer]` — each cell has MAX_LAYERS slots.
     tiles: [[Option<TilePlacement>; MAX_LAYERS]; CHUNK_AREA],

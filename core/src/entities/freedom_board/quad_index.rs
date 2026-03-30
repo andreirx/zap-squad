@@ -191,12 +191,14 @@ pub enum LODResult {
 
 // ── QuadNode ───────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct QuadNode {
     bounds: ChunkAABB,
     content: NodeContent,
     aggregate: NodeAggregate,
 }
 
+#[derive(Clone)]
 enum NodeContent {
     Leaf {
         coord: ChunkCoord,
@@ -241,6 +243,7 @@ impl QuadNode {
 ///
 /// The tree grows dynamically to accommodate any coordinate. Empty after
 /// construction; the first `insert` establishes the initial bounds.
+#[derive(Clone)]
 pub struct QuadTreeIndex {
     root: Option<QuadNode>,
     count: usize,

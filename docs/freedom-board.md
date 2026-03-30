@@ -26,9 +26,8 @@ The active UI surface now lives in `ui/web/src/freedom-board/`. `ui/canvas/` rem
 +-------------------------------------------------------------------+
 |                     ADAPTERS (Rhai bindings)                       |
 |  adapters/src/game_script_bindings.rs                             |
-|    RulesScriptEngine, RulesContext, RulesCommand, GameView        |
-|  adapters/src/script_bindings.rs                                  |
-|    ScriptEngine (legacy AI), ScriptContext, ScriptCommand         |
+|    AiScriptEngine, RulesScriptEngine, WorldGenScriptEngine        |
+|    RulesContext, CharacterAiContext, WorldGenContext, GameView     |
 +-------------------------------------------------------------------+
 |                     INFRASTRUCTURE (Volatile)                     |
 |  infrastructure/wasm-canvas/  (Rust, WASM)                        |
@@ -46,7 +45,7 @@ The active UI surface now lives in `ui/web/src/freedom-board/`. `ui/canvas/` rem
 
 Dependency direction: `ui/web/ --> wasm-canvas --> adapters/ --> core/`. Core never imports from adapters or infrastructure.
 
-The adapters layer was introduced for Rhai scripting. `RulesScriptEngine` and `ScriptEngine` register core domain types as Rhai functions. The WASM crate imports both core and adapters.
+The adapters layer was introduced for Rhai scripting. `AiScriptEngine`, `RulesScriptEngine`, and `WorldGenScriptEngine` register core domain types as Rhai functions. The WASM crate imports both core and adapters.
 
 ---
 
@@ -258,8 +257,10 @@ struct FreedomBoardGame {
     pre_play_snapshot: Option<PrePlaySnapshot>,
     pending_session_events: Vec<u32>,
 
-    // Legacy character AI
-    scripts: ScriptEngine,
+    // Character AI
+    ai_engine: AiScriptEngine,
+    // World generation
+    worldgen_engine: WorldGenScriptEngine,
 }
 ```
 
@@ -572,7 +573,7 @@ Total: **77 tests** covering core entities and use cases.
 | **LOD rendering not wired** | Low | `query_viewport_lod()` exists in core and quadtree supports it, but WASM always uses `query_viewport()`. Wire when infinite zoom-out is needed. |
 | **Undo stack unbounded** | Medium | `Vec<Vec<EditResult>>` grows without limit. Need max depth (e.g., 1000 operations) with tail truncation. |
 | ~~No persistence~~ | ~~High~~ | IN PROGRESS (2026-03-22). IDB module done. WASM serialize/deserialize done. Worker bridge and React wiring pending. See `docs/storage-architecture.md`. |
-| ~~No Rhai scripting~~ | ~~High~~ | DONE (2026-03-26). Rules scripting fully wired: RulesScriptEngine, orchestrator, Play/Stop lifecycle, Script Panel with IDB persistence, scoped reload. Character AI via legacy path. |
+| ~~No Rhai scripting~~ | ~~High~~ | DONE (2026-03-26). Rules scripting fully wired: RulesScriptEngine, orchestrator, Play/Stop lifecycle, Script Panel with IDB persistence, scoped reload. Character AI via AiScriptEngine, World Gen via WorldGenScriptEngine. |
 | **f32 event precision** | Low | Tile coordinates and asset IDs travel as f32 in the custom event protocol. Safe up to 2^24 (~16M). Not a concern for practical use but worth documenting. |
 | **Deterministic registry ordering** | Medium | Alphabetical sort of tile IDs for asset_id assignment means adding a tile can shift all IDs. Serialized maps must store tile names, not IDs. |
 | ~~Force2D rendering~~ | ~~Low~~ | DONE (2026-03-26). `force2D` removed. Largest atlas 2400x1536, under WebGPU 8192 default. |
@@ -598,11 +599,11 @@ Total: **77 tests** covering core entities and use cases.
 | **SAB lock flag for data consistency** | Medium | SharedArrayBuffer has no read-side lock. Worker writes + renderer reads concurrently. Causes occasional tile position glitches during pan/zoom. Fix: HEADER_LOCK check in frame reader. |
 | **Chunk-level serialization** | High | Large worlds (10M+ tiles) need chunk-level save/load (stream chunks as camera moves) rather than monolithic JSON. WASM memory ceiling is ~4GB. |
 | **movementCost not in AssetPanel** | Low | Tile passable/movementCost lives in per-tile `properties.json` files under `/mods/tiles/`, not in `manifest.json`. AssetPanel shows terrainType (LAND/WATER) only. Fix: either merge properties into manifest during bake, or batch-fetch properties.json files on startup (18 requests). |
-| **Character script assignment UI** | High | No Freedom Board UI to bind a named script from IDB to a placed character. Legacy runtime uses numeric `script_id`, not named scripts. Blocks character AI from being testable through the Script Panel. |
+| ~~Character script assignment UI~~ | ~~High~~ | DONE (2026-03-29). CharacterPanel dropdown assigns named scripts to placed characters. |
 | **Compile error feedback to UI** | Medium | Script compilation errors logged to browser console only. WASM does not emit compile errors as game events or return them from reload_scripts. Script Panel has no compile status display. |
 | **wasm-canvas has zero tests** | High | The orchestrator, session lifecycle, command application, event emission, and snapshot/restore have no automated tests. All verification is manual. Headless test seam needed. |
 | **Play HUD does not exist** | Medium | No visible indication of current phase, game mode, team resources, turn number, or session status during play mode. Validation failures only surface in console. |
-| **World gen scripts not compiled** | Low | WASM explicitly skips `world_gen` scope during `reload_scripts`. Scripts stored in IDB but not executable. Track D. |
+| ~~World gen scripts not compiled~~ | ~~Low~~ | DONE (2026-03-29). WorldGenScriptEngine compiles and executes `world_gen` scripts at play start. |
 
 ### Assumptions
 
@@ -614,7 +615,7 @@ Total: **77 tests** covering core entities and use cases.
 
 ### Divergences from Original Plan
 
-1. ~~**No adapters layer**~~: RESOLVED (2026-03-26). The adapters layer was introduced for Rhai scripting (`adapters/src/game_script_bindings.rs`, `adapters/src/script_bindings.rs`). WASM imports both core and adapters.
+1. ~~**No adapters layer**~~: RESOLVED (2026-03-26). The adapters layer was introduced for Rhai scripting (`adapters/src/game_script_bindings.rs`). `script_bindings.rs` is retained only for the standalone WASM renderer, not used by Freedom Board. WASM imports both core and adapters.
 2. **Camera owned by React**: Originally considered WASM-owned camera. React-owned was chosen because the infinite canvas pan/zoom is a UI concern, and React already handles pointer events natively.
 3. **Multi-layer tiles**: ADR-007 (2026-03-21). `MAX_LAYERS=8`. Chunk stores `[[Option<TP>; 8]; 1024]` (64KB). Layer auto-derived from tile type in React via `tileTypeToLayer()`. Ground=0, Water=1, Bridge=2, Path=3, Objects=4, Reserved=5-7.
 4. **Feathered tile edges replace transitions**: ADR-006. Terrain blending uses pre-baked alpha feathering instead of 8-directional transition sprites. See `docs/tile-rendering-system.md` and `docs/architecture_decisions.md`.

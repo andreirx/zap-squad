@@ -13,8 +13,8 @@ scope is not available in another.
 | Scope | Entry Point | When It Runs | Context Type |
 |-------|-------------|--------------|--------------|
 | Rules | `fn on_event(ctx)` | Per game event (GameStart, Tick, etc.) | `RulesCtx` |
-| Character AI | `fn update(ctx)` | Every frame per scripted character | `Context` (legacy) |
-| World Gen | `fn generate(ctx)` | Once during Setup phase | `WorldGenCtx` (future) |
+| Character AI | `fn update(ctx)` | Every frame per scripted character | `Context` |
+| World Gen | `fn generate(ctx)` | Once during Setup phase | `WorldGenCtx` |
 
 ---
 
@@ -135,11 +135,11 @@ fn on_event(ctx) {
 
 ---
 
-## Character AI Scripts (Legacy)
+## Character AI Scripts
 
 Character AI scripts control individual character behavior each frame.
-These use the legacy `ScriptContext` / `ScriptCommand` path. Migration to
-`CharacterAiContext` is planned (Track D).
+These use `AiScriptEngine` with legacy-compatible function names (`move_to`,
+`attack`, `find_nearest`, etc.) and the `CharacterAiContext` / `AiCommand` path.
 
 ### Entry Point
 
@@ -173,11 +173,29 @@ fn update(ctx) {
 
 | Function | Parameters | Returns | Description |
 |----------|-----------|---------|-------------|
-| `find_nearest(ctx, tag)` | `String` | `i64` | Actor ID of nearest actor with tag, or -1. |
-| `get_position(ctx, actor_id)` | `i64` | `Vec2` | Position of an actor. |
+| `find_nearest(ctx, selector)` | `String` | `i64` | ID of nearest matching character, or -1. See **Selector semantics** below. |
+| `find_nearest_enemy(ctx)` | — | `i64` | Shorthand for `find_nearest(ctx, "enemy")`. |
+| `get_position(ctx, id)` | `i64` | `Vec2` | Position of a character (`.x`, `.y`). |
 | `self_pos(ctx)` | — | `Vec2` | This character's position. |
-| `self_id(ctx)` | — | `i64` | This character's actor ID. |
+| `self_id(ctx)` | — | `i64` | This character's ID. |
+| `self_team(ctx)` | — | `i64` | This character's team ID. |
+| `self_stat(ctx, key)` | `String` | `f64` | Value of a stat on this character, or 0. |
 | `dt(ctx)` | — | `f64` | Delta time (seconds per frame). |
+
+#### Selector semantics for `find_nearest`
+
+The `selector` parameter is either a **reserved relation keyword** or a **custom tag**:
+
+| Selector | Type | Meaning |
+|----------|------|---------|
+| `"enemy"` | Computed relation | Characters on a different team than the caller. |
+| `"ally"` | Computed relation | Characters on the same team (excluding self). |
+| Any other string | Tag match | Searches `CharacterView.tags` for a literal match. |
+
+**Reserved keywords take precedence.** Do not use `"enemy"` or `"ally"` as custom
+tag strings — they will always be interpreted as computed relations, not tag lookups.
+
+Dead characters and self are always excluded from results.
 
 ### Utility Functions
 
@@ -241,10 +259,11 @@ fn update(ctx) {
 
 ---
 
-## World Generation Scripts (Future)
+## World Generation Scripts
 
-World gen scripts run once during `GamePhase::Setup` to populate the map.
-Not yet wired to the orchestrator (Track E).
+World gen scripts run once during `GamePhase::Setup` to populate the map
+via `WorldGenScriptEngine`. Execution occurs in `start_game_session()` after
+pre-flight validation.
 
 ### Entry Point
 
@@ -335,8 +354,8 @@ the `reload_scripts(json)` export. The wire format is scoped:
 
 Each script is routed to the correct Rhai Engine based on its `scope`:
 - `"rules"` → `RulesScriptEngine` (isolated engine for rules scope)
-- `"character_ai"` → legacy `ScriptEngine` (per-character AI)
-- `"world_gen"` → not yet compiled (deferred to Track D)
+- `"character_ai"` → `AiScriptEngine` (per-character AI)
+- `"world_gen"` → `WorldGenScriptEngine` (setup-time world creation)
 
 Scripts are compiled to Rhai AST on load. Compilation errors are logged to the
 browser console. Scripts that fail to compile are silently skipped during execution.
@@ -357,9 +376,9 @@ Script names are referenced by:
 | Rules commands (all 8) | Working — applied by orchestrator |
 | Rules queries (all 6) | Working — read from GameView snapshot |
 | Event DTO (numeric + string channels) | Working — no data loss at boundary |
-| Character AI execution (update) | Working — legacy path via ScriptContext |
-| World gen execution (generate) | Not yet wired — Track D |
+| Character AI execution (update) | Working — AiScriptEngine with legacy-compatible API |
+| World gen execution (generate) | Working — WorldGenScriptEngine, runs at play start |
 | Script hot-reload | Working — scoped reload_scripts() WASM export |
 | Script persistence in IDB | Working — IDB v4 `scripts` store, Script Panel UI |
-| Scoped routing at WASM boundary | Working — rules → RulesScriptEngine, AI → ScriptEngine |
+| Scoped routing at WASM boundary | Working — rules → RulesScriptEngine, AI → AiScriptEngine, world_gen → WorldGenScriptEngine |
 | Compile error feedback to UI | Not yet — console only |

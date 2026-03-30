@@ -54,13 +54,38 @@ The scripting model has three isolated scopes:
 - **World gen scripts** (`fn generate(ctx)`) — procedural map setup
 
 The first user-facing scripting milestone delivered was **rules scripting** — the orchestrator
-runs rules scripts during Play mode, executing commands that mutate game state. Character AI
-scripting exists through a legacy path but lacks a UI for assigning named scripts to placed
-characters. World gen scripting remains deferred.
+runs rules scripts during Play mode, executing commands that mutate game state. All three
+scripting scopes are now live. Character AI uses `AiScriptEngine` with legacy-compatible
+function names. World gen runs during session setup via `WorldGenScriptEngine`.
 
 The original plan assumed character behavior would ship first. In practice, rules scripting
 was the natural first scope because it validates the entire orchestrator spine: event emission,
 script execution, command application, and session lifecycle.
+
+### 5a. Edit and Play are UI modes, not engine states
+
+There is no binary split between editing and playing. The product is a continuous session:
+
+- **Play** starts a `GameSession`. Characters become live domain entities with AI,
+  stats, teams, and combat. Rules scripts execute per-event. AI scripts execute per-frame.
+- **Pause** is an explicit user action. It freezes the game tick but does not destroy
+  the session. The user can inspect state, edit scripts, or switch panels while paused.
+- **Edit tools** (draw, erase, fill, character placement) are always available regardless
+  of whether the game is running. Switching to an edit tool does NOT pause or stop the game.
+  The user can draw tiles while characters are moving.
+- **Stop** ends the session and returns characters to inert props on the board.
+
+The implication for scripting:
+- Before Play is pressed, characters are inert visual props. No AI executes.
+- After Play, characters are live. AI runs every frame while unpaused.
+- World gen scripts run once during session setup (the moment Play is pressed).
+- Switching between edit panels, script editor, and asset browser does not
+  interrupt the running game. Play continues in the background.
+- A dedicated Pause button exists. It may optionally auto-trigger when switching
+  to certain edit modes, but that is a UX preference, not an architectural rule.
+
+This means the engine must support simultaneous editing and gameplay. The board
+is both the authoring surface and the runtime surface at all times.
 
 ### 6. Asset model simplification
 
@@ -143,13 +168,15 @@ The remaining work is no longer about proving that the engine can render. It is 
 
 1. ~~Script authoring/persistence~~ — DONE: Script Panel, IDB v4 `scripts` store, scoped reload
 2. ~~Rules scripting~~ — DONE: orchestrator, Play/Stop lifecycle, rules command application
-3. Character script assignment to placed characters (by name, not numeric id)
-4. Play HUD and compile/runtime error visibility
-5. World generation execution
-6. Character AI migration to `CharacterAiContext`
-7. Attack UI and ranged-attack flow
-8. Multi-select and group commands
-9. Commander/follower behavior
+3. ~~Character script assignment~~ — DONE: CharacterPanel UI, assign_character_script WASM export
+4. ~~Runtime asset merge~~ — DONE: seed + IDB overlay, live refresh on save+bake
+5. ~~Character AI migration~~ — DONE: AiScriptEngine with legacy-compatible API
+6. ~~Pre-flight script validation~~ — DONE: validates rules, world_gen, team AI, per-character AI
+7. Play HUD and compile/runtime error visibility
+8. ~~World generation execution~~ — DONE: WorldGenScriptEngine, tile placement, spawn, zones, snapshot rollback
+9. Combat depth (weapon stats, damage formulas, UnitDamaged/UnitKilled events)
+10. Multi-select and group commands
+11. Commander/follower behavior
 
 ### Platform track
 

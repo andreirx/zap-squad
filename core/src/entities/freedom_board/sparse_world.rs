@@ -32,6 +32,7 @@ pub struct VisibleTile {
 }
 
 /// The infinite sparse tile grid.
+#[derive(Clone)]
 pub struct SparseWorld {
     chunks: HashMap<ChunkCoord, Chunk>,
     index: QuadTreeIndex,

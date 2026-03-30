@@ -36,8 +36,24 @@ pub struct GameSession {
     /// Next character instance ID for spawning.
     next_character_id: u32,
 
+    /// Named zones defined by world gen or level design.
+    /// Used for spawn points, encounter areas, objectives, etc.
+    pub zones: Vec<Zone>,
+
     /// Pending events for script consumption.
     pub events: EventQueue,
+}
+
+/// A named spatial zone on the game map.
+#[derive(Debug, Clone)]
+pub struct Zone {
+    pub name: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub zone_type: String,
+    pub team_id: Option<TeamId>,
 }
 
 impl GameSession {
@@ -53,6 +69,7 @@ impl GameSession {
             relations: HashMap::new(),
             characters: HashMap::new(),
             next_character_id: 1,
+            zones: Vec::new(),
             events: EventQueue::new(),
         }
     }
@@ -140,6 +157,18 @@ impl GameSession {
     /// Check if a team has been eliminated (no living characters).
     pub fn is_team_eliminated(&self, team: TeamId) -> bool {
         !self.characters.values().any(|c| c.team_id == team && c.alive)
+    }
+
+    /// Define a named spatial zone (spawn point, encounter area, etc.).
+    pub fn define_zone(
+        &mut self,
+        name: String,
+        x: i32, y: i32,
+        width: i32, height: i32,
+        zone_type: String,
+        team_id: Option<TeamId>,
+    ) {
+        self.zones.push(Zone { name, x, y, width, height, zone_type, team_id });
     }
 
     /// Get alive character count per team.
