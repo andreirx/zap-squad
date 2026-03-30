@@ -35,6 +35,7 @@ mod session;
 mod event;
 mod definition;
 mod validation;
+mod package;
 
 pub use types::*;
 pub use team::*;
@@ -44,3 +45,4 @@ pub use session::*;
 pub use event::*;
 pub use definition::*;
 pub use validation::*;
+pub use package::*;

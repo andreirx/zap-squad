@@ -2,7 +2,7 @@
 
 ## Mission
 
-Create a programmable 2D world-building and game-making system for kids, where the same world can be edited, populated, animated, and eventually played through character behavior scripts.
+Create a programmable 2D world-building and game-making system for kids, where the same world can be edited, populated, animated, explored as a sandbox, and then turned into a real game by activating authored rules.
 
 The product is not a split "editor app" and "game app" anymore. The product is a single unified web application centered on Freedom Board, with supporting editors for source assets.
 
@@ -77,8 +77,9 @@ There is no binary split between editing and playing. The product is a continuou
 
 The implication for scripting:
 - Before Play is pressed, characters are inert visual props. No AI executes.
+- In sandbox mode, selected AI scripts may be previewed without activating a formal game.
 - After Play, characters are live. AI runs every frame while unpaused.
-- World gen scripts run once during session setup (the moment Play is pressed).
+- World gen scripts belong to sandbox/setup only. They are not part of live `GAME ON` execution.
 - Switching between edit panels, script editor, and asset browser does not
   interrupt the running game. Play continues in the background.
 - A dedicated Pause button exists. It may optionally auto-trigger when switching
@@ -86,6 +87,94 @@ The implication for scripting:
 
 This means the engine must support simultaneous editing and gameplay. The board
 is both the authoring surface and the runtime surface at all times.
+
+### 5b. Sandbox first, game second
+
+Freedom Board should feel like a playground before it feels like a game engine.
+
+- The default state is a **sandbox**: the user draws terrain, places characters and objects,
+  moves things around, and toys with the scene without requiring a formal win/loss structure.
+- The UI should clearly separate **authoring controls** (draw, erase, fill, place, assign assets)
+  from **play-around controls** (play, pause, inspect, trigger interactions, observe runtime state).
+- A "game" is created when the user brings in a **rules package** that says what must exist in the
+  sandbox and what becomes enforced once the game is activated.
+
+The intended mental model is playground rules:
+
+- kids first arrange the field, props, players, and boundaries
+- then they say what game they are playing
+- then the rules become binding and the HUD appears: `GAME ON!`
+
+This means a rules package is not only executable logic. It also needs product-facing metadata:
+
+- **Prerequisites**: what must exist before the game can start
+- **Verification function**: inspect the authored world and answer whether the setup is valid
+- **Activation semantics**: what changes when the game begins (HUD, scoring, timers, enforced zones, allowed actions)
+- **Runtime rules**: event-driven logic once the game is active
+- **Failure explanation**: if verification fails, the product must say what is missing
+
+Execution boundaries:
+
+- **Character AI scripts** are valid in both sandbox preview and `GAME ON`
+- **Rules scripts** are valid only in `GAME ON`
+- **World gen scripts** are valid only in sandbox/setup and are not a live gameplay primitive
+
+This is intentional:
+
+- AI preview lets the user experiment with behavior before committing to a formal game
+- rules activation is what turns the sandbox into an enforced game contract
+- world gen remains a world-authoring operation, not a runtime gameplay effect
+
+Examples:
+
+- **Soccer** requires enough characters on two teams, a ball object, a play field, and goal zones
+- **Laser tag / paintball** requires teams, weapons or tagging rules, arena boundaries, and scoring logic
+- **Diablo-like** requires enemies, loot rules, combat rules, and traversal space
+- **XCOM-like** requires squad units, hostile units, cover/layout semantics, and turn/phase logic
+- **Abstract social or economic simulations** are valid if their hidden state, entities, and rule checks can be modeled explicitly
+
+The engine therefore must support both:
+
+- **spatial prerequisites**: tiles, zones, objects, team placement, boundaries
+- **systemic prerequisites**: hidden variables, relation graphs, counters, role assignments, state machines
+
+The product should not assume that "game logic" means only movement and combat. A rule package may define
+anything from playground sports to social simulation, provided it can verify its inputs and enforce its rules
+through explicit state and commands.
+
+### 5c. Persistence boundary: authored world vs live match state
+
+Freedom Board has two categories of mutation:
+
+- **Authored mutations** — changes made while the game is not active
+- **Live match mutations** — changes caused during `GAME ON`
+
+These have different persistence rules.
+
+**While GAME OFF:**
+
+- drawing terrain, placing characters, placing objects, running world gen, and other authoring actions
+  modify the authored board state
+- these changes are part of the user's intended world and are always persisted
+
+**While GAME ON:**
+
+- the active session may still modify terrain or objects in the future
+  (for example: build a bridge, destroy cover, remove an object, open a gate)
+- these are runtime gameplay effects, not authoring edits
+- they are never written back into the persisted authored world
+- when the session stops, the board reverts to the persisted initial state
+
+This means:
+
+- world generation belongs to authored state creation only
+- runtime terrain mutation belongs to active game rules/effects only
+- stopping play restores the stored authored world, not the mutated match state
+
+The persistence contract must therefore be explicit:
+
+- **GAME OFF edits** are durable by default
+- **GAME ON world changes** are ephemeral unless a future feature explicitly introduces a save-the-match-state workflow
 
 ### 6. Asset model simplification
 
@@ -98,9 +187,11 @@ Weapons and objects are converging toward a simpler "object asset" model for vis
 For the kid:
 - draw or import tiles and characters
 - place them into a world
+- play with the scene as a sandbox before committing to a formal game
 - assign simple behavior scripts
+- choose or author a rules package and see whether the world satisfies its prerequisites
 - issue commands to one or many characters
-- observe movement, combat, and interactions immediately
+- observe movement, combat, scoring, and interactions immediately once the game is activated
 
 For the educator or advanced creator:
 - inspect behavior in a deterministic system
@@ -128,6 +219,8 @@ All tools should converge on one browser-side persistence model:
 - explicit load/save to disk
 - seed assets from CDN/S3
 - user assets, levels, worlds, and settings stored locally
+
+Within that model, persisted board state means authored state. Active match state is a transient runtime layer and must not silently overwrite authored storage.
 
 ### Shared runtime semantics
 
@@ -172,11 +265,14 @@ The remaining work is no longer about proving that the engine can render. It is 
 4. ~~Runtime asset merge~~ — DONE: seed + IDB overlay, live refresh on save+bake
 5. ~~Character AI migration~~ — DONE: AiScriptEngine with legacy-compatible API
 6. ~~Pre-flight script validation~~ — DONE: validates rules, world_gen, team AI, per-character AI
-7. Play HUD and compile/runtime error visibility
+7. Play HUD, game activation feedback, and compile/runtime error visibility
 8. ~~World generation execution~~ — DONE: WorldGenScriptEngine, tile placement, spawn, zones, snapshot rollback
 9. Combat depth (weapon stats, damage formulas, UnitDamaged/UnitKilled events)
 10. Multi-select and group commands
 11. Commander/follower behavior
+12. Sandbox/game control split and prerequisite visualization for rules packages
+13. Sandbox AI preview on selected actors without full game activation
+14. Runtime terrain/object effects during GAME ON, with explicit non-persistent session rollback
 
 ### Platform track
 
@@ -200,6 +296,8 @@ Examples:
 - Rhai engine without a script UI is not done
 - attack commands without attack interaction and feedback are not done
 - follow-state math without group controls is not done
+- a rules package without prerequisite verification and clear activation/failure feedback is not done
+- runtime terrain mutation without a clear persistence boundary is not done
 
 ---
 
