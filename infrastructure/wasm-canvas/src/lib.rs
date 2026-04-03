@@ -69,6 +69,7 @@ use zapsquad_adapters::{
     AiScriptEngine, CharacterAiContext, AiCommand,
     WorldGenScriptEngine, WorldGenContext, WorldGenCommand,
     GameView, CharacterView, TeamView,
+    VisualEffect, project_effects,
 };
 use zapsquad_core::entities::game_rules::{
     GameDefinition, GameSession, GamePhase, CharacterInstanceId, TeamId,
@@ -91,6 +92,14 @@ use zapsquad_core::use_cases::freedom_board::{
 const TILE_CONTENT_PX: f32 = 128.0;
 const SPRITE_PX: f32 = 160.0;
 const SPRITE_SCALE: f32 = SPRITE_PX / TILE_CONTENT_PX; // 1.25
+
+/// Number of frames a beam arc persists before being cleared.
+///
+/// The engine's `add_arc()` pushes arcs permanently. ZapSquad manages their
+/// lifetime via `effects_clear_countdown`. Set to 18 frames (~300ms at 60fps)
+/// to match the spark particle lifetime (0.3s). By the time clear() runs,
+/// particles have naturally expired, so the sweep only removes stale arcs.
+const BEAM_LIFETIME_FRAMES: u32 = 18;
 
 /// Custom event kinds: React -> WASM
 mod events {
@@ -356,6 +365,16 @@ pub struct FreedomBoardGame {
     /// Pending session state events to emit to React. Drained in update() where ctx is available.
     /// Values: 1=def_loaded, 2=playing, 3=stopped, 4=start_failed.
     pending_session_events: Vec<u32>,
+    /// Pending visual effects projected from domain events during the orchestrator tick.
+    /// Translated to engine calls in `update()` where `EngineContext` is available.
+    pending_visual_effects: Vec<VisualEffect>,
+    /// Countdown (in frames) until `ctx.effects.clear()` is called to retire arcs.
+    ///
+    /// The engine's `add_arc()` pushes arcs permanently — `tick()` twitches them
+    /// but never retires them. ZapSquad manages arc lifetime here: when beams are
+    /// spawned, this counter is set to `BEAM_LIFETIME_FRAMES`. Each frame it
+    /// decrements. At zero, `clear()` sweeps all arcs (and any dead particles).
+    effects_clear_countdown: u32,
 
     // ── Rendering state ─────────────────────────────────────────────────
     /// Engine entity IDs currently spawned for visible tiles.
@@ -424,6 +443,8 @@ impl FreedomBoardGame {
             actor_to_instance: std::collections::HashMap::new(),
             pre_play_snapshot: None,
             pending_session_events: Vec::new(),
+            pending_visual_effects: Vec::new(),
+            effects_clear_countdown: 0,
 
             tile_entities: Vec::new(),
             last_rendered_generation: u64::MAX, // force initial render
@@ -956,12 +977,20 @@ impl FreedomBoardGame {
                         if let Some(actor) = self.characters.get_mut(&actor_id) {
                             actor.animation_state = AnimationState::MeleeAttack;
                         }
+                        // Capture attacker position before mutable borrows.
+                        let attacker_pos = self.characters.get(&actor_id)
+                            .map(|a| (a.position.x, a.position.y));
+
                         // Resolve target: CharacterInstanceId → ActorId
                         let target_actor_id = self.game_session.as_ref()
                             .and_then(|s| s.character(target_instance_id))
                             .and_then(|c| c.actor_id);
 
                         if let Some(target_aid) = target_actor_id {
+                            // Capture target position before mutable borrow.
+                            let target_pos = self.characters.get(&target_aid)
+                                .map(|a| (a.position.x, a.position.y));
+
                             // TODO: read weapon stats from template/instance for real damage
                             let base = calculate_damage(10);
                             if let Some(target) = self.characters.get_mut(&target_aid) {
@@ -982,6 +1011,18 @@ impl FreedomBoardGame {
                                         damage: base as f32,
                                         remaining_hp,
                                     });
+                                    // Emit spatial attack event for effect projection.
+                                    // Positions captured above before the mutable borrow.
+                                    if let (Some(a_pos), Some(t_pos)) = (attacker_pos, target_pos) {
+                                        session.events.push(RulesGameEvent::AttackResolved {
+                                            attacker_id: attacker_instance_id,
+                                            target_id: target_instance_id,
+                                            damage: base as f32,
+                                            hit: true,
+                                            attacker_pos: a_pos,
+                                            target_pos: t_pos,
+                                        });
+                                    }
                                 }
 
                                 if result.is_kill {
@@ -1387,10 +1428,17 @@ impl FreedomBoardGame {
             }
         }
 
-        // Drain events and execute rules script
+        // Drain events: used for both rules scripts and effect projection.
         let events = session.events.drain();
         if events.is_empty() {
             return;
+        }
+
+        // Project domain events into visual effects (adapter seam).
+        // Stored on self and translated to engine calls in update() where
+        // EngineContext is available.
+        for event in &events {
+            self.pending_visual_effects.extend(project_effects(event));
         }
 
         // Get the rules script name from the definition
@@ -1513,6 +1561,19 @@ impl FreedomBoardGame {
             RulesGameEvent::ResolutionStart => "ResolutionStart".to_string(),
             RulesGameEvent::ResolutionEnd => "ResolutionEnd".to_string(),
             RulesGameEvent::EncounterResolved => "EncounterResolved".to_string(),
+            RulesGameEvent::AttackResolved {
+                attacker_id, target_id, damage, hit, attacker_pos, target_pos,
+            } => {
+                data.insert("attacker_id".into(), attacker_id.0 as f64);
+                data.insert("target_id".into(), target_id.0 as f64);
+                data.insert("damage".into(), *damage as f64);
+                data.insert("hit".into(), if *hit { 1.0 } else { 0.0 });
+                data.insert("attacker_x".into(), attacker_pos.0 as f64);
+                data.insert("attacker_y".into(), attacker_pos.1 as f64);
+                data.insert("target_x".into(), target_pos.0 as f64);
+                data.insert("target_y".into(), target_pos.1 as f64);
+                "AttackResolved".to_string()
+            }
             RulesGameEvent::UnitSpawned { character_id, team } => {
                 data.insert("character_id".into(), character_id.0 as f64);
                 data.insert("team_id".into(), team.0 as f64);
@@ -2078,6 +2139,65 @@ impl FreedomBoardGame {
     /// Entity with a sprite looked up from the engine's asset registry using
     /// the character's body_def_id, animation state, direction, and frame:
     ///   sprite key = "{body_def_id}/{anim}_{direction}/{frame}"
+    // ── Effect translation (infrastructure → engine) ────────────────
+
+    /// Convert world-space coordinates to screen-space pixels.
+    ///
+    /// World units are tile-scale floats (e.g., actor.position).
+    /// Screen pixels are what the engine renders.
+    fn world_to_screen(&self, wx: f32, wy: f32) -> [f32; 2] {
+        [
+            (wx - self.camera_x) * self.zoom,
+            (wy - self.camera_y) * self.zoom,
+        ]
+    }
+
+    /// Translate a single `VisualEffect` (adapter vocabulary) to engine API calls.
+    ///
+    /// This is the sole point where adapter-level visual intents become engine
+    /// primitives. All engine coupling for effects is isolated here.
+    fn translate_visual_effect(&mut self, effect: &VisualEffect, ctx: &mut EngineContext) {
+        match effect {
+            VisualEffect::Beam { from, to } => {
+                let screen_from = self.world_to_screen(from.0, from.1);
+                let screen_to = self.world_to_screen(to.0, to.1);
+                // Arc parameters:
+                //   width: scaled by zoom so beam thickness is visually consistent
+                //   color: Cyan for energy weapon aesthetic
+                //   power_of_two: 3 = 8 segments (enough detail for short-range beams)
+                let beam_width = self.zoom * 0.06;
+                ctx.effects.add_arc(
+                    screen_from,
+                    screen_to,
+                    beam_width,
+                    SegmentColor::Cyan,
+                    3, // 2^3 = 8 midpoint-displacement segments
+                );
+                // Engine arcs have no lifetime — schedule cleanup.
+                // Reset countdown on each new beam so overlapping attacks
+                // don't cause premature clearing.
+                self.effects_clear_countdown = BEAM_LIFETIME_FRAMES;
+            }
+            VisualEffect::SparkBurst { position, intensity } => {
+                let screen_pos = self.world_to_screen(position.0, position.1);
+                // Particle count: 4 at minimum intensity, 16 at full intensity.
+                let count = (4.0 + intensity * 12.0) as usize;
+                // Speed and size scale with zoom for visual consistency.
+                let speed = self.zoom * 1.5;
+                let width = self.zoom * 0.04;
+                ctx.effects.spawn_particles(
+                    screen_pos,
+                    count,
+                    speed,
+                    width,
+                    0.3, // 300ms lifetime — quick flash
+                );
+            }
+        }
+    }
+
+    // ── Character rendering ───────────────────────────────────────────
+
     ///
     /// Characters render at scale = zoom (128px sprites fill one tile).
     /// No feathering — character atlases are 128x128, not 160x160.
@@ -2657,13 +2777,27 @@ impl Default for FreedomBoardGame {
 
 impl Game for FreedomBoardGame {
     fn config(&self) -> GameConfig {
+        // Capacity notes (see docs/effects-and-visibility-plan.md):
+        //
+        // max_entities / max_instances: Freedom Board despawns and respawns all
+        //   visible tile + character entities every frame. A full viewport at
+        //   moderate zoom can show 10K-30K tiles across 5 render passes.
+        //   50K provides headroom for dense worlds with characters on top.
+        //
+        // max_layer_batches: One batch per (RenderLayer, BlendMode, AtlasId)
+        //   triple. Freedom Board has 26+ seed atlases plus baked character
+        //   overlay atlases. With 6 layers, 2 blend modes, and 30+ atlases,
+        //   theoretical max exceeds 300. Practical viewport max: 80-120.
+        //   256 provides robust headroom at 5KB SAB cost. Revisit if atlas
+        //   count exceeds ~40 with heavy additive blend usage.
+        //   Engine default is 96 (sized for generic examples, not Freedom Board).
         GameConfig {
             world_width: 1920.0,
             world_height: 1080.0,
             fixed_dt: 1.0 / 60.0,
             max_entities: 50_000,
             max_instances: 50_000,
-            max_layer_batches: 64,
+            max_layer_batches: 256,
             ..Default::default()
         }
     }
@@ -2678,6 +2812,7 @@ impl Game for FreedomBoardGame {
                 );
             }
         });
+        #[cfg(target_arch = "wasm32")]
         web_sys::console::log_1(&"[freedom-board] initialized".into());
     }
 
@@ -2868,6 +3003,25 @@ impl Game for FreedomBoardGame {
 
         // 1a. Run game session orchestrator (emit events, execute rules script, apply commands)
         self.run_orchestrator(1.0 / 60.0);
+
+        // 1a'. Manage effect lifecycle: retire stale arcs.
+        // Engine arcs have no built-in lifetime — ZapSquad manages expiry here.
+        if self.effects_clear_countdown > 0 {
+            self.effects_clear_countdown -= 1;
+            if self.effects_clear_countdown == 0 {
+                ctx.effects.clear();
+            }
+        }
+
+        // 1a''. Translate pending visual effects to engine calls.
+        // Effects were projected from domain events inside run_orchestrator.
+        // Translation happens here because EngineContext is only available in update().
+        if !self.pending_visual_effects.is_empty() {
+            let effects: Vec<VisualEffect> = self.pending_visual_effects.drain(..).collect();
+            for effect in &effects {
+                self.translate_visual_effect(effect, ctx);
+            }
+        }
 
         // 1b. Run Rhai scripts for characters with assigned script_ids (legacy AI path)
         self.run_scripts();
@@ -3352,3 +3506,459 @@ pub fn take_selected_character_info() -> String {
 // Export the game using zap-web macro.
 // This generates all wasm-bindgen exports: game_init, game_tick, game_custom_event, etc.
 zap_web::export_game!(FreedomBoardGame, "freedom_board", vectors);
+
+// ============================================================================
+// Integration Tests
+// ============================================================================
+//
+// These tests exercise FreedomBoardGame with a real EngineContext on the host
+// toolchain (not WASM). No browser, no GPU, no web_sys calls — just in-memory
+// engine state. The tests verify effect lifecycle, arc cleanup, and session
+// transitions at the integration boundary where the recent arc-leak bug lived.
+//
+// Run with: cargo test -p freedom-board-wasm --lib
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zap_engine::{Game, InputQueue};
+
+    /// Create a minimal FreedomBoardGame + EngineContext pair.
+    ///
+    /// No game session, no characters, no tile registry. Debug drawing
+    /// disabled to avoid unnecessary vector geometry in test output.
+    fn setup() -> (FreedomBoardGame, EngineContext) {
+        let mut game = FreedomBoardGame::new();
+        game.debug_show_grid = false;
+        game.debug_show_crosshair = false;
+        game.debug_show_quadtree = false;
+        let config = game.config();
+        let mut ctx = EngineContext::with_config(&config);
+        game.init(&mut ctx);
+        (game, ctx)
+    }
+
+    /// Advance one frame.
+    fn tick(game: &mut FreedomBoardGame, ctx: &mut EngineContext) {
+        let input = InputQueue::new();
+        game.update(ctx, &input);
+    }
+
+    // ── Beam lifecycle ────────────────────────────────────────────────
+
+    #[test]
+    fn beam_effect_creates_one_arc() {
+        let (mut game, mut ctx) = setup();
+        game.pending_visual_effects.push(VisualEffect::Beam {
+            from: (1.0, 2.0),
+            to: (5.0, 6.0),
+        });
+        tick(&mut game, &mut ctx);
+        assert_eq!(ctx.effects.arcs.len(), 1);
+    }
+
+    #[test]
+    fn beam_sets_cleanup_countdown() {
+        let (mut game, mut ctx) = setup();
+        game.pending_visual_effects.push(VisualEffect::Beam {
+            from: (0.0, 0.0),
+            to: (1.0, 1.0),
+        });
+        tick(&mut game, &mut ctx);
+        assert_eq!(game.effects_clear_countdown, BEAM_LIFETIME_FRAMES);
+    }
+
+    #[test]
+    fn arcs_persist_until_countdown_expires() {
+        let (mut game, mut ctx) = setup();
+        game.pending_visual_effects.push(VisualEffect::Beam {
+            from: (0.0, 0.0),
+            to: (1.0, 1.0),
+        });
+        tick(&mut game, &mut ctx);
+
+        // Tick (BEAM_LIFETIME_FRAMES - 1) more times.
+        // Countdown should be at 1, arc still alive.
+        for _ in 0..(BEAM_LIFETIME_FRAMES - 1) {
+            tick(&mut game, &mut ctx);
+        }
+        assert_eq!(game.effects_clear_countdown, 1);
+        assert_eq!(ctx.effects.arcs.len(), 1, "arc should survive until countdown expires");
+    }
+
+    #[test]
+    fn arcs_cleared_when_countdown_reaches_zero() {
+        let (mut game, mut ctx) = setup();
+        game.pending_visual_effects.push(VisualEffect::Beam {
+            from: (0.0, 0.0),
+            to: (1.0, 1.0),
+        });
+        tick(&mut game, &mut ctx);
+
+        // Tick exactly BEAM_LIFETIME_FRAMES more times to expire.
+        for _ in 0..BEAM_LIFETIME_FRAMES {
+            tick(&mut game, &mut ctx);
+        }
+        assert_eq!(game.effects_clear_countdown, 0);
+        assert_eq!(ctx.effects.arcs.len(), 0, "arcs should be cleared after countdown");
+    }
+
+    #[test]
+    fn new_beam_resets_countdown() {
+        let (mut game, mut ctx) = setup();
+        game.pending_visual_effects.push(VisualEffect::Beam {
+            from: (0.0, 0.0),
+            to: (1.0, 1.0),
+        });
+        tick(&mut game, &mut ctx);
+
+        // Advance 5 frames.
+        for _ in 0..5 {
+            tick(&mut game, &mut ctx);
+        }
+        assert_eq!(game.effects_clear_countdown, BEAM_LIFETIME_FRAMES - 5);
+
+        // Spawn another beam — countdown should reset to full.
+        game.pending_visual_effects.push(VisualEffect::Beam {
+            from: (2.0, 2.0),
+            to: (3.0, 3.0),
+        });
+        tick(&mut game, &mut ctx);
+        assert_eq!(game.effects_clear_countdown, BEAM_LIFETIME_FRAMES);
+        assert_eq!(ctx.effects.arcs.len(), 2, "both arcs should be present");
+    }
+
+    #[test]
+    fn multiple_beams_all_cleared_on_countdown_expiry() {
+        let (mut game, mut ctx) = setup();
+        // Spawn 3 beams in one frame.
+        for i in 0..3 {
+            game.pending_visual_effects.push(VisualEffect::Beam {
+                from: (0.0, 0.0),
+                to: (i as f32, i as f32),
+            });
+        }
+        tick(&mut game, &mut ctx);
+        assert_eq!(ctx.effects.arcs.len(), 3);
+
+        // Expire.
+        for _ in 0..BEAM_LIFETIME_FRAMES {
+            tick(&mut game, &mut ctx);
+        }
+        assert_eq!(ctx.effects.arcs.len(), 0, "all arcs should be cleared");
+    }
+
+    // ── Spark lifecycle ───────────────────────────────────────────────
+
+    #[test]
+    fn spark_burst_creates_particles() {
+        let (mut game, mut ctx) = setup();
+        game.pending_visual_effects.push(VisualEffect::SparkBurst {
+            position: (3.0, 4.0),
+            intensity: 0.5,
+        });
+        tick(&mut game, &mut ctx);
+        assert!(
+            !ctx.effects.particles.is_empty(),
+            "SparkBurst should create particles"
+        );
+    }
+
+    #[test]
+    fn spark_intensity_affects_particle_count() {
+        let (mut game_lo, mut ctx_lo) = setup();
+        game_lo.pending_visual_effects.push(VisualEffect::SparkBurst {
+            position: (0.0, 0.0),
+            intensity: 0.0,
+        });
+        tick(&mut game_lo, &mut ctx_lo);
+        let count_lo = ctx_lo.effects.particles.len();
+
+        let (mut game_hi, mut ctx_hi) = setup();
+        game_hi.pending_visual_effects.push(VisualEffect::SparkBurst {
+            position: (0.0, 0.0),
+            intensity: 1.0,
+        });
+        tick(&mut game_hi, &mut ctx_hi);
+        let count_hi = ctx_hi.effects.particles.len();
+
+        assert!(
+            count_hi > count_lo,
+            "full intensity ({}) should spawn more particles than zero intensity ({})",
+            count_hi,
+            count_lo
+        );
+    }
+
+    // ── Idle state ────────────────────────────────────────────────────
+
+    #[test]
+    fn no_effects_when_nothing_pending() {
+        let (mut game, mut ctx) = setup();
+        tick(&mut game, &mut ctx);
+        assert_eq!(ctx.effects.arcs.len(), 0);
+        assert!(ctx.effects.particles.is_empty());
+        assert_eq!(game.effects_clear_countdown, 0);
+    }
+
+    #[test]
+    fn countdown_stays_zero_with_no_beams() {
+        let (mut game, mut ctx) = setup();
+        for _ in 0..10 {
+            tick(&mut game, &mut ctx);
+        }
+        assert_eq!(game.effects_clear_countdown, 0, "countdown should not underflow");
+    }
+
+    // ── Combined beam + spark ─────────────────────────────────────────
+
+    #[test]
+    fn beam_and_spark_coexist() {
+        let (mut game, mut ctx) = setup();
+        game.pending_visual_effects.push(VisualEffect::Beam {
+            from: (0.0, 0.0),
+            to: (5.0, 5.0),
+        });
+        game.pending_visual_effects.push(VisualEffect::SparkBurst {
+            position: (5.0, 5.0),
+            intensity: 0.8,
+        });
+        tick(&mut game, &mut ctx);
+        assert_eq!(ctx.effects.arcs.len(), 1);
+        assert!(!ctx.effects.particles.is_empty());
+    }
+
+    #[test]
+    fn clear_on_countdown_removes_arcs_and_particles() {
+        let (mut game, mut ctx) = setup();
+        game.pending_visual_effects.push(VisualEffect::Beam {
+            from: (0.0, 0.0),
+            to: (5.0, 5.0),
+        });
+        game.pending_visual_effects.push(VisualEffect::SparkBurst {
+            position: (5.0, 5.0),
+            intensity: 1.0,
+        });
+        tick(&mut game, &mut ctx);
+
+        // Verify both arcs and particles exist after first tick.
+        assert_eq!(ctx.effects.arcs.len(), 1);
+        let initial_particles = ctx.effects.particles.len();
+        assert!(initial_particles > 0, "SparkBurst should have spawned particles");
+
+        // Expire countdown. clear() is coarse: it removes BOTH arcs and
+        // any particles still alive. Spark lifetime (0.3s) matches the
+        // countdown (BEAM_LIFETIME_FRAMES = 18 frames at 60fps = 0.3s),
+        // but particles are not ticked by Game::update (only GameRunner::tick
+        // calls effects.tick), so they won't have expired naturally in this
+        // test. The clear() must remove them.
+        for _ in 0..BEAM_LIFETIME_FRAMES {
+            tick(&mut game, &mut ctx);
+        }
+        assert_eq!(ctx.effects.arcs.len(), 0, "arcs should be cleared");
+        assert_eq!(ctx.effects.particles.len(), 0, "particles should be cleared by coarse clear()");
+    }
+
+    // ── Pending effects drain ─────────────────────────────────────────
+
+    #[test]
+    fn pending_effects_drained_after_translation() {
+        let (mut game, mut ctx) = setup();
+        game.pending_visual_effects.push(VisualEffect::Beam {
+            from: (0.0, 0.0),
+            to: (1.0, 1.0),
+        });
+        assert_eq!(game.pending_visual_effects.len(), 1);
+        tick(&mut game, &mut ctx);
+        assert_eq!(
+            game.pending_visual_effects.len(),
+            0,
+            "pending effects should be drained after translation"
+        );
+    }
+
+    // ── Orchestrator event-to-effect handoff ──────────────────────────
+    //
+    // These tests exercise the real path: domain events pushed to
+    // session.events → drained by run_orchestrator → projected via
+    // project_effects → stored in pending_visual_effects.
+
+    use zapsquad_core::entities::game_rules::{
+        GameSession, GamePhase, CharacterInstanceId,
+        GameEvent as RulesGameEvent,
+    };
+
+    /// Create a FreedomBoardGame with an active game session in Exploration.
+    /// No rules script — the orchestrator will project effects from events
+    /// then return early at the script check, which is the path we want to test.
+    fn setup_with_session() -> (FreedomBoardGame, EngineContext) {
+        let (mut game, ctx) = setup();
+        let mut session = GameSession::new(
+            zapsquad_core::entities::game_rules::GameMode::RealTime,
+        );
+        // Advance past Setup phase so run_orchestrator doesn't bail.
+        session.phase = GamePhase::Exploration;
+        game.game_session = Some(session);
+        (game, ctx)
+    }
+
+    #[test]
+    fn orchestrator_projects_attack_resolved_to_beam_and_sparks() {
+        let (mut game, _ctx) = setup_with_session();
+
+        // Push AttackResolved directly to session events (simulates what
+        // the attack handler does after apply_damage).
+        game.game_session.as_mut().unwrap().events.push(
+            RulesGameEvent::AttackResolved {
+                attacker_id: CharacterInstanceId(1),
+                target_id: CharacterInstanceId(2),
+                damage: 10.0,
+                hit: true,
+                attacker_pos: (3.0, 4.0),
+                target_pos: (7.0, 8.0),
+            },
+        );
+
+        // Run orchestrator — drains events, projects effects.
+        game.run_orchestrator(1.0 / 60.0);
+
+        // Verify the projection produced both Beam and SparkBurst.
+        assert_eq!(
+            game.pending_visual_effects.len(), 2,
+            "AttackResolved with hit=true should project Beam + SparkBurst"
+        );
+        assert!(
+            matches!(game.pending_visual_effects[0], VisualEffect::Beam { .. }),
+            "first effect should be Beam"
+        );
+        assert!(
+            matches!(game.pending_visual_effects[1], VisualEffect::SparkBurst { .. }),
+            "second effect should be SparkBurst"
+        );
+    }
+
+    #[test]
+    fn orchestrator_projects_miss_to_beam_only() {
+        let (mut game, _ctx) = setup_with_session();
+
+        game.game_session.as_mut().unwrap().events.push(
+            RulesGameEvent::AttackResolved {
+                attacker_id: CharacterInstanceId(1),
+                target_id: CharacterInstanceId(2),
+                damage: 0.0,
+                hit: false,
+                attacker_pos: (0.0, 0.0),
+                target_pos: (5.0, 5.0),
+            },
+        );
+
+        game.run_orchestrator(1.0 / 60.0);
+
+        assert_eq!(
+            game.pending_visual_effects.len(), 1,
+            "AttackResolved with hit=false should project Beam only"
+        );
+        assert!(matches!(game.pending_visual_effects[0], VisualEffect::Beam { .. }));
+    }
+
+    #[test]
+    fn orchestrator_projects_beam_positions_from_event() {
+        let (mut game, _ctx) = setup_with_session();
+
+        game.game_session.as_mut().unwrap().events.push(
+            RulesGameEvent::AttackResolved {
+                attacker_id: CharacterInstanceId(10),
+                target_id: CharacterInstanceId(20),
+                damage: 5.0,
+                hit: false,
+                attacker_pos: (1.5, 2.5),
+                target_pos: (9.5, 10.5),
+            },
+        );
+
+        game.run_orchestrator(1.0 / 60.0);
+
+        match &game.pending_visual_effects[0] {
+            VisualEffect::Beam { from, to } => {
+                assert_eq!(*from, (1.5, 2.5));
+                assert_eq!(*to, (9.5, 10.5));
+            }
+            other => panic!("expected Beam, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn orchestrator_ignores_non_attack_events() {
+        let (mut game, _ctx) = setup_with_session();
+
+        // Push Tick event — should produce no visual effects.
+        game.game_session.as_mut().unwrap().events.push(
+            RulesGameEvent::Tick { dt: 0.016 },
+        );
+
+        game.run_orchestrator(1.0 / 60.0);
+
+        assert!(
+            game.pending_visual_effects.is_empty(),
+            "Tick event should not produce visual effects"
+        );
+    }
+
+    #[test]
+    fn orchestrator_end_to_end_attack_to_engine_effects() {
+        let (mut game, mut ctx) = setup_with_session();
+
+        // Push AttackResolved to session events.
+        game.game_session.as_mut().unwrap().events.push(
+            RulesGameEvent::AttackResolved {
+                attacker_id: CharacterInstanceId(1),
+                target_id: CharacterInstanceId(2),
+                damage: 25.0,
+                hit: true,
+                attacker_pos: (2.0, 3.0),
+                target_pos: (6.0, 7.0),
+            },
+        );
+
+        // Full update tick: orchestrator projects effects, update translates to engine.
+        tick(&mut game, &mut ctx);
+
+        // Verify engine state: one arc from beam, particles from spark burst.
+        assert_eq!(ctx.effects.arcs.len(), 1, "should have one arc from Beam");
+        assert!(!ctx.effects.particles.is_empty(), "should have particles from SparkBurst");
+        assert_eq!(game.effects_clear_countdown, BEAM_LIFETIME_FRAMES);
+        // pending_visual_effects should be drained.
+        assert!(game.pending_visual_effects.is_empty());
+    }
+
+    // ── Session transition ────────────────────────────────────────────
+
+    #[test]
+    fn removing_session_prevents_stale_effect_projection() {
+        let (mut game, mut ctx) = setup_with_session();
+
+        // Spawn a beam through the orchestrator.
+        game.game_session.as_mut().unwrap().events.push(
+            RulesGameEvent::AttackResolved {
+                attacker_id: CharacterInstanceId(1),
+                target_id: CharacterInstanceId(2),
+                damage: 10.0,
+                hit: true,
+                attacker_pos: (0.0, 0.0),
+                target_pos: (1.0, 1.0),
+            },
+        );
+        tick(&mut game, &mut ctx);
+        assert_eq!(ctx.effects.arcs.len(), 1);
+
+        // "Stop game" — remove session. Countdown continues ticking.
+        game.game_session = None;
+
+        // Tick to expiry — countdown should still clear effects.
+        for _ in 0..BEAM_LIFETIME_FRAMES {
+            tick(&mut game, &mut ctx);
+        }
+        assert_eq!(ctx.effects.arcs.len(), 0, "effects should still clear after session removed");
+        assert_eq!(game.effects_clear_countdown, 0);
+    }
+}

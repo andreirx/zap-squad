@@ -51,6 +51,25 @@ pub enum GameEvent {
     /// Encounter fully resolved. All enemies dead or fled. Return to Exploration.
     EncounterResolved,
 
+    // ── Combat events ────────────────────────────────────────────────
+
+    /// An attack was resolved between two characters.
+    ///
+    /// Emitted by infrastructure after `apply_damage`. Carries world-space
+    /// positions at the time of the attack so downstream consumers (rules
+    /// scripts, effect projection) have spatial context without needing to
+    /// look up actor state after the fact.
+    AttackResolved {
+        attacker_id: CharacterInstanceId,
+        target_id: CharacterInstanceId,
+        damage: f32,
+        hit: bool,
+        /// Attacker world position at time of attack (world units, not pixels).
+        attacker_pos: (f32, f32),
+        /// Target world position at time of attack (world units, not pixels).
+        target_pos: (f32, f32),
+    },
+
     // ── Unit lifecycle events ────────────────────────────────────────
 
     /// A character was spawned.

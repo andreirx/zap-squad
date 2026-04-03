@@ -4,6 +4,7 @@
 test:
 	cargo test -p zapsquad-core
 	cargo test -p zapsquad-adapters
+	cargo test -p freedom-board-wasm --lib
 	cargo test -p wasm-feather
 	cargo test -p wasm-validator
 	cargo test -p wasm-baker

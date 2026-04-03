@@ -193,26 +193,66 @@ path retired from Freedom Board.
 
 ---
 
-### Phase G: Combat Feature Layer
+### Phase G: Effects Pipeline + Combat Feature Layer
 
-**Goal:** Combat becomes a real interactive feature.
+**Goal:** Combat becomes a real interactive feature with visual feedback.
 
-**Tasks:**
+See `docs/effects-and-visibility-plan.md` for the full effects architecture.
+
+**Prerequisite:** Stream 1 (engine contract stabilization) must be complete.
+Engine is frozen at protocol v5 (zap-engine commit 3986dbe, 2026-04-02).
+
+**Tasks (combat):**
 1. Attack targeting UI (click to select target)
 2. Ranged attacks through object assets
 3. Range validation and failure feedback
-4. Hit/damage/death feedback (visual + event emission)
-5. Idle state return after attack animation
-6. Events emitted into GameSession.events (UnitDamaged, UnitKilled)
+4. Idle state return after attack animation
+
+**Tasks (effects pipeline — Stream 2 Phase 1):**
+5. ~~Extend GameEvent with AttackResolved (semantic attack event with positions)~~ — DONE
+6. ~~Build effect_projection.rs in adapters (GameEvent -> VisualEffect, 7 tests)~~ — DONE
+7. ~~Build effect translator in infrastructure (VisualEffect -> engine calls)~~ — DONE
+8. ~~Wire attack -> AttackResolved -> Beam + SparkBurst (first concrete case)~~ — DONE
+9. ~~Test effect projection off-target (7 tests passing)~~ — DONE
+
+**Tasks (combat feedback using effects pipeline):**
+10. Hit/damage/death feedback via projected effects
+11. Events emitted into GameSession.events (UnitDamaged, UnitKilled)
 
 **Done when:**
 - A player can command a character to attack a valid target
 - Damage, death, and animation all work correctly
+- Visual feedback (beams, sparks, flashes) renders through the effects pipeline
 - Events fire for rules scripts to react to
+- Effect projection is unit-tested off-target
 
 ---
 
-### Phase H: Group Commands
+### Phase H: Fog of War (Stream 3)
+
+**Goal:** Team-scoped visibility with exploration memory.
+
+See `docs/effects-and-visibility-plan.md` for the full architecture.
+
+**Can run in parallel with Phase G after 3A is complete.**
+
+**Tasks:**
+1. TeamVisibility entity in core (Hidden / Explored / Visible per cell per team)
+2. Vision update use case (radius-only, pure function, off-target testable)
+3. Visibility mapper in adapters (CellState -> byte)
+4. Wire into infrastructure (GameConfig cols/rows, ctx.visibility, entity filter)
+5. Product tuning (dimming values, vision ranges per unit type)
+
+**Done when:**
+- Fog renders during play mode, clears on stop
+- Characters reveal terrain within their vision range
+- Previously-seen areas are dimmed, never-seen areas are black
+- Enemy characters on hidden cells are not rendered
+- Vision update logic has off-target unit tests
+
+---
+
+### Phase I: Group Commands
 
 **Goal:** Multi-character control.
 
@@ -234,8 +274,10 @@ path retired from Freedom Board.
 1. ~~**Character script assignment**~~ — DONE (AiScriptEngine, CharacterPanel)
 2. ~~**World gen scripting**~~ — DONE (WorldGenScriptEngine)
 3. ~~**Character AI migration**~~ — DONE (AiScriptEngine replaces legacy)
-4. **Play HUD** — show phase, resources, turns, game status
-5. **Play Mode polish** — pause, win/lose, mode-specific flow
-6. **Combat UX** — targeting, feedback, events
-7. **Group commands** — multi-select, squads
-8. **Headless orchestrator tests** — wasm-canvas test seam
+4. ~~**Engine contract stabilization**~~ — DONE (protocol v5, batch budget 256)
+5. **Play HUD** — show phase, resources, turns, game status
+6. **Play Mode polish** — pause, win/lose, mode-specific flow
+7. **Effects pipeline + Combat UX** — Stream 2 Phase 1, targeting, feedback, events
+8. **Fog of war** — Stream 3, can run parallel with #7
+9. **Group commands** — multi-select, squads
+10. **Headless orchestrator tests** — wasm-canvas test seam

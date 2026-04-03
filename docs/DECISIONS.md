@@ -239,3 +239,131 @@ The product direction is toward a simplified visual asset model where ranged/thr
 - Data schemas and docs must stop describing land paths as same-type-only
 - Bridge rendering logic must be validated against mixed road types
 - Combat feature work can rely on object assets for ranged/throwable presentation without preserving a separate user-facing weapon editor concept as a primary surface
+
+---
+
+# ADR: Effects Architecture — Semantic Events and Visual Projection
+
+## Status: Accepted (2026-04-02)
+
+## Context
+
+zap-engine gained per-sprite blend modes, alpha particles, electric arcs, and a
+visibility mask (protocol v5, commit 3986dbe). ZapSquad needs to adopt these
+capabilities for combat feedback (laser shots, explosions, smoke), environmental
+effects (dust, hazards), and fog of war.
+
+The question is where visual effect decisions live in the architecture.
+
+## Decision
+
+### 1. Core emits semantic domain events, never visual vocabulary
+
+`core/entities/game_rules/event.rs` contains `GameEvent` variants like
+`AttackResolved`, `UnitKilled`, and (future) `ExplosionOccurred`. These carry
+gameplay data (positions, damage, actor IDs). Core never names beams, smoke,
+sparks, or any rendering concept. The name `AttackResolved` was chosen over
+`ShotResolved` because it covers both melee and ranged attacks.
+
+Rationale: visuals iterate faster than gameplay semantics. The same domain event
+may map to different visuals for different game packages. Keeping visual language
+out of core preserves maximum stability.
+
+### 2. Adapter owns art direction via effect projection
+
+`adapters/effect_projection.rs` maps `GameEvent` to `Vec<VisualEffect>`.
+`VisualEffect` is adapter vocabulary: `Beam`, `SparkBurst`, `SmokePuff`,
+`DustCloud`, `DeathFlash`, `MuzzleFlash`. This is the sole seam where domain
+semantics become visual decisions.
+
+This function is pure, testable off-target, and swappable per game package.
+
+### 3. Infrastructure performs mechanical engine translation
+
+`wasm-canvas` reads `VisualEffect` variants and calls the appropriate
+`ctx.effects` or `ctx.scene` methods. No art decisions here — only API mapping.
+
+### 4. Effect projection is general, not combat-specific
+
+Effects can originate from any `GameEvent` source: combat, rules scripts,
+hazards, world-gen flourishes, UI actions. The projection seam handles all of
+them through the same function.
+
+### 5. Smoke is phased
+
+Phase 1: alpha particles (procedural geometry, physics-driven). Sufficient for
+dust, debris, cheap smoke volume. Phase 2: sprite-based animated smoke if the
+product requires richer explosions. The adapter doesn't change between phases —
+only the infrastructure translation for `SmokePuff`.
+
+## Consequences
+
+- Core remains free of rendering vocabulary
+- Visual tuning happens in one file (`effect_projection.rs`), not scattered
+  across use cases
+- Infrastructure has no art opinions, only engine coupling
+- Adding a new visual effect type requires: adapter enum variant + infrastructure
+  translation. No core changes.
+- Script authors cannot customize visual effects in Phase 1 (intentional — art
+  direction should stabilize before scripting exposure)
+
+See `docs/effects-and-visibility-plan.md` for the full implementation plan.
+
+---
+
+# ADR: Fog of War — Play-Mode, Three-State, Not-Rendered
+
+## Status: Accepted (2026-04-02)
+
+## Context
+
+zap-engine now provides a per-cell byte grid visibility mask with fullscreen
+compositing. ZapSquad needs fog of war for gameplay (hidden enemies, exploration
+memory, tactical information hiding).
+
+Multiple implementation strategies exist with different cost/capability profiles.
+
+## Decision
+
+### 1. Play-mode only
+
+Visibility state is owned by `GameSession`. Created when play starts, destroyed
+when play stops. Edit mode always shows the full world. This keeps authored and
+live session state cleanly separated per VISION.md.
+
+### 2. Three-state byte per cell
+
+`CellState`: `Hidden` (0), `Explored` (128), `Visible` (255). Maps directly to
+the engine's single-byte mask. `Explored` produces ~50% dimming — tunable in the
+adapter without touching core.
+
+### 3. Hidden enemies are not rendered
+
+Infrastructure skips `ctx.scene.spawn()` for enemy characters on cells where
+the viewing team's visibility is `Hidden`. This prevents information leakage even
+through debug tools. The engine mask handles terrain/decoration dimming; entity
+filtering handles actors.
+
+### 4. Radius-only vision (Phase 1)
+
+No line-of-sight occlusion. Walls and obstacles do not block vision. LOS is
+deferred to avoid premature complexity and potential engine-side acceleration
+structure requirements.
+
+### 5. Per-team storage in core
+
+`TeamVisibility` is a grid per team. The viewing team's grid is what gets
+rendered. Spectator mode (showing multiple teams) is deferred — it would
+require engine support for multiple simultaneous masks.
+
+## Consequences
+
+- Core visibility logic is pure and testable off-target
+- Fog rendering is a thin infrastructure concern (byte grid + entity filter)
+- No engine changes needed for Phase 1
+- Vision update cost is O(observers x radius^2) per tick — acceptable for
+  small-to-medium unit counts. Optimization deferred.
+- LOS, multi-team spectator view, and GPU-accelerated vision are future work
+  that may require breaking the engine freeze
+
+See `docs/effects-and-visibility-plan.md` for the full implementation plan.

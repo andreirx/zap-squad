@@ -11,6 +11,7 @@
 pub mod asset_gateway;
 pub mod asset_manifest;
 pub mod composite_renderer;
+pub mod effect_projection;
 pub mod engine_gateway;
 pub mod input_adapter;
 pub mod game_script_bindings;
@@ -21,6 +22,7 @@ pub mod game_script_bindings;
 /// Delete this module when the old WASM crate is retired.
 pub mod script_bindings;
 
+pub use effect_projection::{VisualEffect, project_effects};
 pub use asset_gateway::{AssetGateway, EntitySpawnInfo, TileDefinition, TileInstance};
 pub use asset_manifest::{AssetManifest, BodyDefinition, WeaponDefinition, WeaponType};
 pub use composite_renderer::CompositeRenderer;
