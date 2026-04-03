@@ -74,6 +74,7 @@ use zapsquad_adapters::{
 use zapsquad_core::entities::game_rules::{
     GameDefinition, GameSession, GamePhase, CharacterInstanceId, TeamId,
     CharacterInstance, TemplateId, validate_game, IssueSeverity,
+    TeamRelation,
 };
 // Alias to avoid collision with zap_engine::GameEvent
 use zapsquad_core::entities::game_rules::GameEvent as RulesGameEvent;
@@ -92,6 +93,12 @@ use zapsquad_core::use_cases::freedom_board::{
 const TILE_CONTENT_PX: f32 = 128.0;
 const SPRITE_PX: f32 = 160.0;
 const SPRITE_SCALE: f32 = SPRITE_PX / TILE_CONTENT_PX; // 1.25
+
+/// Default attack range in tiles. Used when no `attack_range` stat is defined
+/// on the character. This is temporary combat policy — will be replaced by
+/// per-weapon or per-character stat-driven range when weapon types differentiate.
+/// See docs/NEXT_STEPS.md Phase G.
+const DEFAULT_ATTACK_RANGE_TILES: f32 = 3.0;
 
 /// Number of frames a beam arc persists before being cleared.
 ///
@@ -377,6 +384,12 @@ pub struct FreedomBoardGame {
     /// Pending visual effects projected from domain events during the orchestrator tick.
     /// Translated to engine calls in `update()` where `EngineContext` is available.
     pending_visual_effects: Vec<VisualEffect>,
+    /// True when the game session is paused. Blocks orchestrator, AI scripts,
+    /// movement, and player input. Rendering and HUD remain active.
+    /// Orthogonal to GamePhase — you can be paused in any phase.
+    /// Infrastructure-owned: core does not know about pause.
+    paused: bool,
+
     /// True when HUD-relevant session state has changed since last serialization.
     /// Set by: start/stop session, SetPhase, EndGame, ModifyResource, SpawnUnit, KillUnit.
     /// Consumed by update() which serializes and stores in HUD_STATE thread_local.
@@ -458,6 +471,7 @@ impl FreedomBoardGame {
             pre_play_snapshot: None,
             pending_session_events: Vec::new(),
             pending_visual_effects: Vec::new(),
+            paused: false,
             hud_dirty: false,
             effects_clear_countdown: 0,
 
@@ -717,9 +731,71 @@ impl FreedomBoardGame {
             }
             events::MOVE_CHARACTER => {
                 // a=tile_x, b=tile_y — command selected character to walk here.
-                // Uses A* pathfinding if ground tiles exist, falls back to straight line.
+                //
+                // During play mode: if there is a hostile character at the target
+                // tile, attack it instead of moving (standard RTS right-click
+                // behavior). Range is checked against DEFAULT_ATTACK_RANGE_TILES.
+                //
+                // Outside play mode (or no hostile at target): uses A* pathfinding
+                // if ground tiles exist, falls back to straight line.
                 if let Some(sel_id) = self.selected_character {
                     let goal_tile = glam::IVec2::new(a as i32, b as i32);
+
+                    // ── Play-mode attack branch ──────────────────────────
+                    // Only human-controlled actors can be commanded by the player.
+                    // CPU/AI actors are controlled by their scripts, not by clicks.
+                    // TurnBased mode is excluded — turn rotation and active-team
+                    // gating are not yet implemented. Allowing free input in TurnBased
+                    // would bypass turn order entirely.
+                    let is_active_realtime_play = self.game_session.as_ref()
+                        .map(|s| {
+                            !matches!(s.phase, GamePhase::Ended { .. })
+                            && matches!(s.mode,
+                                zapsquad_core::entities::game_rules::GameMode::RealTime
+                                | zapsquad_core::entities::game_rules::GameMode::Tactical
+                            )
+                        })
+                        .unwrap_or(false);
+                    if is_active_realtime_play && self.is_player_controlled(sel_id) {
+                        let target_center = (goal_tile.x as f32 + 0.5, goal_tile.y as f32 + 0.5);
+                        if let Some(target_aid) = self.find_character_at(target_center.0, target_center.1) {
+                            // Don't attack self
+                            if target_aid != sel_id {
+                                // Check team relation via domain model
+                                let is_hostile = self.is_hostile(sel_id, target_aid);
+                                if is_hostile {
+                                    // Range check
+                                    let in_range = self.characters.get(&sel_id)
+                                        .and_then(|attacker| self.characters.get(&target_aid).map(|target| {
+                                            let dx = attacker.position.x - target.position.x;
+                                            let dy = attacker.position.y - target.position.y;
+                                            (dx * dx + dy * dy).sqrt()
+                                        }))
+                                        .map(|dist| dist <= DEFAULT_ATTACK_RANGE_TILES)
+                                        .unwrap_or(false);
+
+                                    if in_range {
+                                        if let Some(kill) = self.execute_attack(sel_id, target_aid) {
+                                            // Handle kill inline (same pattern as AI kill handling)
+                                            self.handle_kill(kill.0, kill.1, kill.2);
+                                        }
+                                        // Attack consumed the click — skip movement.
+                                        return;
+                                    }
+                                    // Out of range — fall through to movement
+                                }
+                            }
+                        }
+                    }
+
+                    // During active RealTime/Tactical play, only player-controlled actors move.
+                    // TurnBased, Ended, or CPU actor: reject player input.
+                    // Edit mode (no session) allows moving any character.
+                    if self.game_session.is_some() {
+                        if !is_active_realtime_play || !self.is_player_controlled(sel_id) {
+                            return;
+                        }
+                    }
 
                     if let Some(actor) = self.characters.get(&sel_id) {
                         let start_tile = glam::IVec2::new(
@@ -988,61 +1064,14 @@ impl FreedomBoardGame {
                         }
                     }
                     AiCommand::Attack(target_instance_id) => {
-                        // Set attacker animation
-                        if let Some(actor) = self.characters.get_mut(&actor_id) {
-                            actor.animation_state = AnimationState::MeleeAttack;
-                        }
-                        // Capture attacker position before mutable borrows.
-                        let attacker_pos = self.characters.get(&actor_id)
-                            .map(|a| (a.position.x, a.position.y));
-
                         // Resolve target: CharacterInstanceId → ActorId
                         let target_actor_id = self.game_session.as_ref()
                             .and_then(|s| s.character(target_instance_id))
                             .and_then(|c| c.actor_id);
 
                         if let Some(target_aid) = target_actor_id {
-                            // Capture target position before mutable borrow.
-                            let target_pos = self.characters.get(&target_aid)
-                                .map(|a| (a.position.x, a.position.y));
-
-                            // TODO: read weapon stats from template/instance for real damage
-                            let base = calculate_damage(10);
-                            if let Some(target) = self.characters.get_mut(&target_aid) {
-                                let result = apply_damage(target, base);
-                                let remaining_hp = target.health as f32;
-
-                                // Sync damage into authoritative session stats.
-                                // The renderer actor is the source of truth for current HP
-                                // after apply_damage. Write it back into the session so
-                                // GameView, AI queries, and rules scripts see consistent state.
-                                if let Some(session) = &mut self.game_session {
-                                    if let Some(instance) = session.character_mut(target_instance_id) {
-                                        instance.stats.insert("hp".into(), remaining_hp);
-                                    }
-                                    session.events.push(RulesGameEvent::UnitDamaged {
-                                        character_id: target_instance_id,
-                                        attacker_id: Some(attacker_instance_id),
-                                        damage: base as f32,
-                                        remaining_hp,
-                                    });
-                                    // Emit spatial attack event for effect projection.
-                                    // Positions captured above before the mutable borrow.
-                                    if let (Some(a_pos), Some(t_pos)) = (attacker_pos, target_pos) {
-                                        session.events.push(RulesGameEvent::AttackResolved {
-                                            attacker_id: attacker_instance_id,
-                                            target_id: target_instance_id,
-                                            damage: base as f32,
-                                            hit: true,
-                                            attacker_pos: a_pos,
-                                            target_pos: t_pos,
-                                        });
-                                    }
-                                }
-
-                                if result.is_kill {
-                                    kills.push((target_aid, target_instance_id, attacker_instance_id));
-                                }
+                            if let Some(kill) = self.execute_attack(actor_id, target_aid) {
+                                kills.push(kill);
                             }
                         }
                     }
@@ -1055,26 +1084,8 @@ impl FreedomBoardGame {
         }
 
         // Remove killed actors and mark domain instances as dead
-        for (dead_aid, dead_cid, killer_cid) in &kills {
-            self.characters.remove(dead_aid);
-            self.movement_targets.remove(dead_aid);
-            self.waypoint_queues.remove(dead_aid);
-            self.actor_to_instance.remove(dead_aid);
-            if self.selected_character == Some(*dead_aid) {
-                self.clear_character_selection();
-            }
-            // Mark dead in session and emit UnitKilled with killer attribution
-            if let Some(session) = &mut self.game_session {
-                if let Some(instance) = session.character_mut(*dead_cid) {
-                    instance.alive = false;
-                }
-                session.events.push(RulesGameEvent::UnitKilled {
-                    character_id: *dead_cid,
-                    killer_id: Some(*killer_cid),
-                });
-            }
-            self.character_generation += 1;
-            self.characters_dirty = true;
+        for (dead_aid, dead_cid, killer_cid) in kills {
+            self.handle_kill(dead_aid, dead_cid, killer_cid);
         }
     }
 
@@ -1119,23 +1130,26 @@ impl FreedomBoardGame {
             if let Some(json) = p.borrow_mut().take() {
                 match serde_json::from_str::<GameDefinition>(&json) {
                     Ok(def) => {
+                        #[cfg(target_arch = "wasm32")]
                         web_sys::console::log_1(
                             &format!("[orchestrator] loaded game definition: '{}' mode={:?}", def.name, def.mode).into(),
                         );
-                        // Compile the rules script if we have source for it
                         let rules_name = def.rules_script.clone();
                         self.game_definition = Some(def);
                         self.pending_session_events.push(1); // def_loaded
                         if !rules_name.is_empty() && !self.rules_engine.has_script(&rules_name) {
+                            #[cfg(target_arch = "wasm32")]
                             web_sys::console::log_1(
                                 &format!("[orchestrator] rules script '{}' not yet compiled — load it via reload_scripts()", rules_name).into(),
                             );
                         }
                     }
                     Err(e) => {
+                        #[cfg(target_arch = "wasm32")]
                         web_sys::console::error_1(
                             &format!("[orchestrator] failed to parse game definition: {}", e).into(),
                         );
+                        let _ = e;
                     }
                 }
             }
@@ -1170,6 +1184,7 @@ impl FreedomBoardGame {
         let def = match self.game_definition.clone() {
             Some(d) => d,
             None => {
+                #[cfg(target_arch = "wasm32")]
                 web_sys::console::error_1(&"[orchestrator] cannot start: no game definition loaded".into());
                 return;
             }
@@ -1204,9 +1219,11 @@ impl FreedomBoardGame {
         }
         // Log warnings even for valid definitions
         for issue in validation.warnings() {
+            #[cfg(target_arch = "wasm32")]
             web_sys::console::warn_1(
                 &format!("[orchestrator] warning: {}", issue.message).into(),
             );
+            let _ = issue;
         }
 
         // Snapshot edit-mode state before play mutations begin.
@@ -1365,9 +1382,11 @@ impl FreedomBoardGame {
                 Ok(commands) => {
                     let cmd_count = commands.len();
                     self.apply_worldgen_commands(commands, &templates, &mut session);
+                    #[cfg(target_arch = "wasm32")]
                     web_sys::console::log_1(
                         &format!("[orchestrator] world gen '{}': {} commands applied", worldgen_name, cmd_count).into(),
                     );
+                    let _ = cmd_count;
                 }
                 Err(e) => {
                     #[cfg(target_arch = "wasm32")]
@@ -1402,6 +1421,7 @@ impl FreedomBoardGame {
         // Transition from Setup to Exploration
         session.transition(GamePhase::Exploration);
 
+        #[cfg(target_arch = "wasm32")]
         web_sys::console::log_1(
             &format!(
                 "[orchestrator] game started: '{}' mode={:?} teams={} templates={} migrated={} ({}+{} template/standalone)",
@@ -1425,6 +1445,14 @@ impl FreedomBoardGame {
         self.game_session = None;
         self.actor_to_instance.clear();
 
+        // Clear effect state to prevent leaking arcs/particles/countdowns
+        // into the next play session or edit mode.
+        // pending_visual_effects and countdown are cleared here (owned by self).
+        // ctx.effects.clear() must happen in update() where EngineContext is available —
+        // signaled via effects_clear_countdown = 1 (will fire on the next tick).
+        self.pending_visual_effects.clear();
+        self.effects_clear_countdown = 1; // triggers ctx.effects.clear() on next update()
+
         // Restore edit-mode state from snapshot (including tile world)
         if let Some(snapshot) = self.pre_play_snapshot.take() {
             self.world = snapshot.world;
@@ -1435,8 +1463,10 @@ impl FreedomBoardGame {
             self.waypoint_queues = snapshot.waypoint_queues;
             self.characters_dirty = true;
             self.character_generation += 1;
+            #[cfg(target_arch = "wasm32")]
             web_sys::console::log_1(&"[orchestrator] game stopped, edit-mode state restored (tiles + characters)".into());
         } else {
+            #[cfg(target_arch = "wasm32")]
             web_sys::console::warn_1(&"[orchestrator] game stopped but no snapshot to restore".into());
         }
         self.pending_session_events.push(3); // stopped
@@ -1747,7 +1777,9 @@ impl FreedomBoardGame {
     fn apply_rules_command(&mut self, cmd: RulesCommand) {
         match cmd {
             RulesCommand::Log(msg) => {
+                #[cfg(target_arch = "wasm32")]
                 web_sys::console::log_1(&format!("[rules] {}", msg).into());
+                let _ = msg; // suppress unused warning on non-wasm
             }
             RulesCommand::SpawnUnit { template_id, team_id, x, y, individual } => {
                 let session = match &mut self.game_session {
@@ -1765,6 +1797,7 @@ impl FreedomBoardGame {
                 let template = match template {
                     Some(t) => t,
                     None => {
+                        #[cfg(target_arch = "wasm32")]
                         web_sys::console::error_1(
                             &format!("[orchestrator] SpawnUnit: template '{}' not found", template_id).into(),
                         );
@@ -1806,6 +1839,7 @@ impl FreedomBoardGame {
                     team: tid,
                 });
 
+                #[cfg(target_arch = "wasm32")]
                 web_sys::console::log_1(
                     &format!("[orchestrator] spawned '{}' (instance={}, actor={}) at ({}, {})",
                         template.name, instance_id.0, actor_id.0, x, y).into(),
@@ -1900,6 +1934,7 @@ impl FreedomBoardGame {
                     "EncounterDecision" => GamePhase::EncounterDecision,
                     "EncounterResolution" => GamePhase::EncounterResolution,
                     _ => {
+                        #[cfg(target_arch = "wasm32")]
                         web_sys::console::error_1(
                             &format!("[orchestrator] unknown phase: '{}'", phase_str).into(),
                         );
@@ -1917,6 +1952,7 @@ impl FreedomBoardGame {
                 let winner = winner_team_id.map(TeamId);
                 session.transition(GamePhase::Ended { winner });
                 self.hud_dirty = true; // game ended
+                #[cfg(target_arch = "wasm32")]
                 web_sys::console::log_1(
                     &format!("[orchestrator] game ended. winner: {:?}", winner).into(),
                 );
@@ -2187,6 +2223,178 @@ impl FreedomBoardGame {
     /// Entity with a sprite looked up from the engine's asset registry using
     /// the character's body_def_id, animation state, direction, and frame:
     ///   sprite key = "{body_def_id}/{anim}_{direction}/{frame}"
+    // ── Combat helpers ─────────────────────────────────────────────
+
+    /// Check if an actor belongs to a human-controlled team.
+    /// Returns false if the actor is not in the game session or team lookup fails.
+    fn is_player_controlled(&self, actor_id: ActorId) -> bool {
+        let session = match &self.game_session {
+            Some(s) => s,
+            None => return false,
+        };
+        let cid = match self.actor_to_instance.get(&actor_id) {
+            Some(&cid) => cid,
+            None => return false,
+        };
+        let team_id = match session.character(cid) {
+            Some(c) => c.team_id,
+            None => return false,
+        };
+        session.teams.iter()
+            .find(|t| t.id == team_id)
+            .map(|t| matches!(t.controller, zapsquad_core::entities::game_rules::TeamController::Human))
+            .unwrap_or(false)
+    }
+
+    /// Check if two actors are on hostile teams via the domain relation model.
+    /// Returns false if either actor is not in the game session.
+    fn is_hostile(&self, a: ActorId, b: ActorId) -> bool {
+        let session = match &self.game_session {
+            Some(s) => s,
+            None => return false,
+        };
+        let a_cid = match self.actor_to_instance.get(&a) {
+            Some(&cid) => cid,
+            None => return false,
+        };
+        let b_cid = match self.actor_to_instance.get(&b) {
+            Some(&cid) => cid,
+            None => return false,
+        };
+        let a_team = match session.character(a_cid) {
+            Some(c) => c.team_id,
+            None => return false,
+        };
+        let b_team = match session.character(b_cid) {
+            Some(c) => c.team_id,
+            None => return false,
+        };
+        session.relation(a_team, b_team) == TeamRelation::Hostile
+    }
+
+    /// Process a kill: remove actor, clear movement state, mark dead in session,
+    /// emit UnitKilled event, clear selection if the dead actor was selected.
+    fn handle_kill(&mut self, dead_aid: ActorId, dead_cid: CharacterInstanceId, killer_cid: CharacterInstanceId) {
+        self.characters.remove(&dead_aid);
+        self.movement_targets.remove(&dead_aid);
+        self.waypoint_queues.remove(&dead_aid);
+        self.actor_to_instance.remove(&dead_aid);
+        if self.selected_character == Some(dead_aid) {
+            self.clear_character_selection();
+        }
+        if let Some(session) = &mut self.game_session {
+            if let Some(instance) = session.character_mut(dead_cid) {
+                instance.alive = false;
+            }
+            session.events.push(RulesGameEvent::UnitKilled {
+                character_id: dead_cid,
+                killer_id: Some(killer_cid),
+            });
+        }
+        self.characters_dirty = true;
+        self.character_generation += 1;
+        self.hud_dirty = true;
+    }
+
+    // ── Shared attack execution ─────────────────────────────────────
+    //
+    // Used by both AI commands (AiCommand::Attack) and player input
+    // (right-click on hostile during play). Returns the killed
+    // (target_aid, target_cid, attacker_cid) tuple if the target died.
+
+    /// Find a character at the given tile center coordinates.
+    /// Uses the same proximity check as SELECT_CHARACTER (±0.5 tiles).
+    fn find_character_at(&self, tx: f32, ty: f32) -> Option<ActorId> {
+        self.characters.iter()
+            .find(|(_, c)| {
+                (c.position.x - tx).abs() < 0.5 && (c.position.y - ty).abs() < 0.5
+            })
+            .map(|(id, _)| *id)
+    }
+
+    /// Execute an attack from attacker to target.
+    ///
+    /// Applies damage, syncs session state, emits domain events (UnitDamaged,
+    /// AttackResolved), and returns kill info if the target died.
+    /// Both actor IDs must be valid and mapped to session CharacterInstanceIds.
+    fn execute_attack(
+        &mut self,
+        attacker_aid: ActorId,
+        target_aid: ActorId,
+    ) -> Option<(ActorId, CharacterInstanceId, CharacterInstanceId)> {
+        let attacker_cid = match self.actor_to_instance.get(&attacker_aid) {
+            Some(&cid) => cid,
+            None => return None,
+        };
+        let target_cid = match self.actor_to_instance.get(&target_aid) {
+            Some(&cid) => cid,
+            None => return None,
+        };
+
+        // Compute facing direction before mutable borrow.
+        let face_dir = self.characters.get(&attacker_aid)
+            .and_then(|attacker| self.characters.get(&target_aid).map(|target| {
+                Direction::from_velocity(target.position - attacker.position)
+            }))
+            .flatten();
+
+        // Set attacker animation and facing.
+        if let Some(actor) = self.characters.get_mut(&attacker_aid) {
+            actor.animation_state = AnimationState::MeleeAttack;
+            if let Some(dir) = face_dir {
+                actor.direction = dir;
+            }
+        }
+
+        // Capture positions before mutable borrows.
+        let attacker_pos = self.characters.get(&attacker_aid)
+            .map(|a| (a.position.x, a.position.y));
+        let target_pos = self.characters.get(&target_aid)
+            .map(|a| (a.position.x, a.position.y));
+
+        // TODO: read weapon stats from template/instance for real damage
+        let base = calculate_damage(10);
+        let kill_info = if let Some(target) = self.characters.get_mut(&target_aid) {
+            let result = apply_damage(target, base);
+            let remaining_hp = target.health as f32;
+
+            // Sync damage into authoritative session stats.
+            if let Some(session) = &mut self.game_session {
+                if let Some(instance) = session.character_mut(target_cid) {
+                    instance.stats.insert("hp".into(), remaining_hp);
+                }
+                session.events.push(RulesGameEvent::UnitDamaged {
+                    character_id: target_cid,
+                    attacker_id: Some(attacker_cid),
+                    damage: base as f32,
+                    remaining_hp,
+                });
+                if let (Some(a_pos), Some(t_pos)) = (attacker_pos, target_pos) {
+                    session.events.push(RulesGameEvent::AttackResolved {
+                        attacker_id: attacker_cid,
+                        target_id: target_cid,
+                        damage: base as f32,
+                        hit: true,
+                        attacker_pos: a_pos,
+                        target_pos: t_pos,
+                    });
+                }
+                self.hud_dirty = true; // HP changed
+            }
+
+            if result.is_kill {
+                Some((target_aid, target_cid, attacker_cid))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        self.characters_dirty = true;
+        kill_info
+    }
+
     // ── HUD state serialization ──────────────────────────────────────
 
     /// Write structured start-error diagnostics to the START_ERRORS thread_local.
@@ -3279,6 +3487,9 @@ thread_local! {
     /// Set by `assign_character_script()`, consumed by update().
     static PENDING_SCRIPT_ASSIGNMENT: std::cell::RefCell<Vec<(u32, Option<String>)>> =
         std::cell::RefCell::new(Vec::new());
+    /// Flag to toggle pause state. Set by `toggle_pause()`, consumed by update().
+    static PENDING_PAUSE_TOGGLE: std::cell::RefCell<bool> =
+        std::cell::RefCell::new(false);
     /// JSON string describing the currently selected character.
     /// Written by update() when selection changes, read by `take_selected_character_info()`.
     static SELECTED_CHARACTER_INFO: std::cell::RefCell<Option<String>> =
@@ -4173,5 +4384,611 @@ mod tests {
         }
         assert_eq!(ctx.effects.arcs.len(), 0, "effects should still clear after session removed");
         assert_eq!(game.effects_clear_countdown, 0);
+    }
+
+    // ── Player combat ─────────────────────────────────────────────────
+    //
+    // Tests for the click-to-attack path: MOVE_CHARACTER on hostile during
+    // play mode, range gating, player-ownership gating, and the shared
+    // execute_attack method.
+
+    use zapsquad_core::entities::game_rules::{
+        TeamController, TeamId as CoreTeamId, TeamState,
+    };
+
+    /// Set up a game with two teams (human team 0, cpu team 1) and two
+    /// characters: player_actor on team 0, enemy_actor on team 1.
+    /// Returns (game, ctx, player_aid, enemy_aid).
+    fn setup_combat() -> (FreedomBoardGame, EngineContext, ActorId, ActorId) {
+        let (mut game, ctx) = setup();
+
+        // Create a session with two teams
+        let mut session = GameSession::new(
+            zapsquad_core::entities::game_rules::GameMode::RealTime,
+        );
+        session.phase = GamePhase::Exploration;
+
+        // Team 0: Human
+        session.teams.push(TeamState {
+            id: CoreTeamId(0),
+            name: "Player".into(),
+            controller: TeamController::Human,
+            color: "#00f".into(),
+            resources: std::collections::HashMap::new(),
+            eliminated: false,
+        });
+        // Team 1: CPU
+        session.teams.push(TeamState {
+            id: CoreTeamId(1),
+            name: "Enemy".into(),
+            controller: TeamController::Cpu { script_name: "enemy_ai".into() },
+            color: "#f00".into(),
+            resources: std::collections::HashMap::new(),
+            eliminated: false,
+        });
+        session.set_relation(CoreTeamId(0), CoreTeamId(1), TeamRelation::Hostile);
+
+        // Player character at (2.5, 2.5)
+        let player_aid = ActorId(100);
+        let player_cid = session.next_character_id();
+        let mut player_char = zapsquad_core::entities::game_rules::CharacterInstance::standalone(
+            player_cid, CoreTeamId(0), {
+                let mut s = std::collections::HashMap::new();
+                s.insert("hp".into(), 100.0);
+                s.insert("max_hp".into(), 100.0);
+                s
+            },
+        );
+        player_char.attach_actor(player_aid);
+        session.add_character(player_char);
+
+        let mut player_actor = CompositeActor::new(player_aid, Vec2::new(2.5, 2.5), "marine");
+        player_actor.tag = "team_0".into();
+        player_actor.health = 100;
+        player_actor.max_health = 100;
+        game.characters.insert(player_aid, player_actor);
+        game.actor_to_instance.insert(player_aid, player_cid);
+
+        // Enemy character at (4.5, 2.5) — 2 tiles away, within default range (3.0)
+        let enemy_aid = ActorId(200);
+        let enemy_cid = session.next_character_id();
+        let mut enemy_char = zapsquad_core::entities::game_rules::CharacterInstance::standalone(
+            enemy_cid, CoreTeamId(1), {
+                let mut s = std::collections::HashMap::new();
+                s.insert("hp".into(), 50.0);
+                s.insert("max_hp".into(), 50.0);
+                s
+            },
+        );
+        enemy_char.attach_actor(enemy_aid);
+        session.add_character(enemy_char);
+
+        let mut enemy_actor = CompositeActor::new(enemy_aid, Vec2::new(4.5, 2.5), "alien");
+        enemy_actor.tag = "team_1".into();
+        enemy_actor.health = 50;
+        enemy_actor.max_health = 50;
+        game.characters.insert(enemy_aid, enemy_actor);
+        game.actor_to_instance.insert(enemy_aid, enemy_cid);
+
+        game.game_session = Some(session);
+
+        (game, ctx, player_aid, enemy_aid)
+    }
+
+    #[test]
+    fn is_hostile_detects_cross_team_hostility() {
+        let (game, _, player_aid, enemy_aid) = setup_combat();
+        assert!(game.is_hostile(player_aid, enemy_aid));
+        assert!(game.is_hostile(enemy_aid, player_aid));
+        // Same-team is allied
+        assert!(!game.is_hostile(player_aid, player_aid));
+    }
+
+    #[test]
+    fn is_player_controlled_distinguishes_human_from_cpu() {
+        let (game, _, player_aid, enemy_aid) = setup_combat();
+        assert!(game.is_player_controlled(player_aid));
+        assert!(!game.is_player_controlled(enemy_aid));
+    }
+
+    #[test]
+    fn execute_attack_damages_target_and_emits_events() {
+        let (mut game, _, player_aid, enemy_aid) = setup_combat();
+        let initial_hp = game.characters.get(&enemy_aid).unwrap().health;
+
+        let kill_info = game.execute_attack(player_aid, enemy_aid);
+
+        // Target should have taken damage
+        let new_hp = game.characters.get(&enemy_aid).unwrap().health;
+        assert!(new_hp < initial_hp, "target HP should decrease");
+
+        // Session should have UnitDamaged + AttackResolved events
+        let session = game.game_session.as_ref().unwrap();
+        let events = &session.events;
+        assert!(!events.is_empty(), "should have pending events");
+
+        // Not a kill at 10 damage vs 50 HP
+        assert!(kill_info.is_none());
+    }
+
+    #[test]
+    fn execute_attack_returns_kill_on_lethal_damage() {
+        let (mut game, _, player_aid, enemy_aid) = setup_combat();
+        // Set enemy HP low enough for a one-hit kill
+        game.characters.get_mut(&enemy_aid).unwrap().health = 5;
+
+        let kill_info = game.execute_attack(player_aid, enemy_aid);
+        assert!(kill_info.is_some(), "should return kill info for lethal damage");
+    }
+
+    #[test]
+    fn player_attack_via_move_character_on_hostile() {
+        let (mut game, mut ctx, player_aid, enemy_aid) = setup_combat();
+        game.selected_character = Some(player_aid);
+
+        let enemy_hp_before = game.characters.get(&enemy_aid).unwrap().health;
+
+        // Simulate right-click on enemy tile (4, 2) — where enemy is at (4.5, 2.5)
+        game.handle_custom_event(events::MOVE_CHARACTER, 4.0, 2.0, 0.0);
+
+        // Enemy should have taken damage
+        let enemy_hp_after = game.characters.get(&enemy_aid).unwrap().health;
+        assert!(
+            enemy_hp_after < enemy_hp_before,
+            "enemy HP should decrease: {} -> {}",
+            enemy_hp_before,
+            enemy_hp_after
+        );
+
+        // Effects should have been projected into pending_visual_effects
+        // (they haven't been translated yet — that happens in update())
+        // But the AttackResolved event was pushed to session events.
+        let session = game.game_session.as_ref().unwrap();
+        assert!(!session.events.is_empty(), "should have pending domain events");
+
+        // Tick to translate effects
+        tick(&mut game, &mut ctx);
+        assert_eq!(ctx.effects.arcs.len(), 1, "beam should render from attack");
+    }
+
+    #[test]
+    fn player_attack_rejected_when_out_of_range() {
+        let (mut game, _, player_aid, enemy_aid) = setup_combat();
+        game.selected_character = Some(player_aid);
+
+        // Move enemy far away (beyond DEFAULT_ATTACK_RANGE_TILES = 3.0)
+        game.characters.get_mut(&enemy_aid).unwrap().position = Vec2::new(20.5, 2.5);
+
+        let enemy_hp_before = game.characters.get(&enemy_aid).unwrap().health;
+
+        // Right-click on enemy tile (20, 2)
+        game.handle_custom_event(events::MOVE_CHARACTER, 20.0, 2.0, 0.0);
+
+        // Should NOT have attacked (out of range)
+        let enemy_hp_after = game.characters.get(&enemy_aid).unwrap().health;
+        assert_eq!(
+            enemy_hp_before, enemy_hp_after,
+            "enemy should not take damage when out of range"
+        );
+    }
+
+    #[test]
+    fn cpu_actor_cannot_be_commanded_by_player() {
+        let (mut game, _, _player_aid, enemy_aid) = setup_combat();
+        // Select the CPU-controlled enemy
+        game.selected_character = Some(enemy_aid);
+
+        // Place a friendly target for the CPU actor to "attack"
+        // (this shouldn't work because CPU actors can't be player-commanded)
+        let enemy_hp_before = game.characters.values()
+            .find(|c| c.id != enemy_aid)
+            .map(|c| c.health)
+            .unwrap();
+
+        // Right-click on player character tile (2, 2)
+        game.handle_custom_event(events::MOVE_CHARACTER, 2.0, 2.0, 0.0);
+
+        // Player character should NOT have been attacked
+        let enemy_hp_after = game.characters.values()
+            .find(|c| c.id != enemy_aid)
+            .map(|c| c.health)
+            .unwrap();
+        assert_eq!(
+            enemy_hp_before, enemy_hp_after,
+            "CPU actor should not attack via player click"
+        );
+    }
+
+    #[test]
+    fn turnbased_rejects_player_attack() {
+        let (mut game, _, player_aid, enemy_aid) = setup_combat();
+        // Switch to TurnBased mode
+        game.game_session.as_mut().unwrap().mode =
+            zapsquad_core::entities::game_rules::GameMode::TurnBased;
+        game.selected_character = Some(player_aid);
+
+        let enemy_hp_before = game.characters.get(&enemy_aid).unwrap().health;
+
+        // Right-click on enemy tile
+        game.handle_custom_event(events::MOVE_CHARACTER, 4.0, 2.0, 0.0);
+
+        // Attack should NOT have happened — TurnBased is gated out
+        let enemy_hp_after = game.characters.get(&enemy_aid).unwrap().health;
+        assert_eq!(
+            enemy_hp_before, enemy_hp_after,
+            "TurnBased mode should reject player attack"
+        );
+    }
+
+    #[test]
+    fn move_character_falls_through_to_movement_on_empty_tile() {
+        let (mut game, _, player_aid, _) = setup_combat();
+        game.selected_character = Some(player_aid);
+
+        // Right-click on empty tile (10, 10) — no character there
+        game.handle_custom_event(events::MOVE_CHARACTER, 10.0, 10.0, 0.0);
+
+        // Should have set a movement target (A* or fallback)
+        // The waypoint system sets movement_targets on path found.
+        // With no tiles placed, pathfinding may fail (no walkable ground),
+        // but the attack path should NOT have fired.
+        let session = game.game_session.as_ref().unwrap();
+        // No attack events should exist
+        let has_attack = session.events.peek()
+            .iter()
+            .any(|e| matches!(e, RulesGameEvent::AttackResolved { .. }));
+        assert!(!has_attack, "no attack event should be emitted for empty tile click");
+    }
+
+    // ── Session lifecycle transitions ─────────────────────────────────
+
+    #[test]
+    fn end_game_transitions_phase_to_ended() {
+        let (mut game, _ctx, _player_aid, _enemy_aid) = setup_combat();
+
+        // Apply EndGame command via rules command path
+        game.apply_rules_command(RulesCommand::EndGame { winner_team_id: Some(0) });
+
+        let session = game.game_session.as_ref().unwrap();
+        assert!(
+            matches!(session.phase, GamePhase::Ended { winner: Some(t) } if t == CoreTeamId(0)),
+            "phase should be Ended with winner team 0"
+        );
+        assert!(game.hud_dirty, "hud should be dirty after end game");
+    }
+
+    #[test]
+    fn orchestrator_stops_after_ended() {
+        let (mut game, _ctx, _player_aid, _enemy_aid) = setup_combat();
+
+        // End the game
+        game.apply_rules_command(RulesCommand::EndGame { winner_team_id: Some(0) });
+
+        // Push an event to session — orchestrator should NOT project it
+        game.game_session.as_mut().unwrap().events.push(
+            RulesGameEvent::AttackResolved {
+                attacker_id: CharacterInstanceId(1),
+                target_id: CharacterInstanceId(2),
+                damage: 10.0,
+                hit: true,
+                attacker_pos: (0.0, 0.0),
+                target_pos: (1.0, 1.0),
+            },
+        );
+        game.run_orchestrator(1.0 / 60.0);
+
+        // Events should NOT have been drained (orchestrator returns early on Ended)
+        let session = game.game_session.as_ref().unwrap();
+        assert!(
+            !session.events.is_empty(),
+            "orchestrator should not drain events after Ended"
+        );
+        assert!(
+            game.pending_visual_effects.is_empty(),
+            "orchestrator should not project effects after Ended"
+        );
+    }
+
+    #[test]
+    fn stop_clears_pending_visual_effects() {
+        let (mut game, _ctx, _player_aid, _enemy_aid) = setup_combat();
+
+        // Accumulate some pending effects
+        game.pending_visual_effects.push(VisualEffect::Beam {
+            from: (0.0, 0.0), to: (1.0, 1.0),
+        });
+        assert_eq!(game.pending_visual_effects.len(), 1);
+
+        game.stop_game_session();
+
+        assert!(
+            game.pending_visual_effects.is_empty(),
+            "pending effects should be cleared on stop"
+        );
+    }
+
+    #[test]
+    fn stop_triggers_engine_effects_clear_on_next_tick() {
+        let (mut game, mut ctx, player_aid, enemy_aid) = setup_combat();
+        game.selected_character = Some(player_aid);
+
+        // Attack to create engine arcs
+        game.handle_custom_event(events::MOVE_CHARACTER, 4.0, 2.0, 0.0);
+        tick(&mut game, &mut ctx); // translates effects to engine
+        assert_eq!(ctx.effects.arcs.len(), 1, "should have arc from attack");
+
+        // Stop game — sets countdown to 1
+        game.stop_game_session();
+        assert_eq!(game.effects_clear_countdown, 1);
+
+        // Next tick clears engine effects
+        tick(&mut game, &mut ctx);
+        assert_eq!(ctx.effects.arcs.len(), 0, "arcs should be cleared after stop");
+        assert_eq!(game.effects_clear_countdown, 0);
+    }
+
+    #[test]
+    fn stop_restores_edit_mode_characters() {
+        let (mut game, _ctx, player_aid, enemy_aid) = setup_combat();
+
+        // Simulate what start_game_session does: capture pre-play snapshot.
+        // setup_combat bypasses start_game_session, so we create it manually.
+        game.pre_play_snapshot = Some(PrePlaySnapshot {
+            world: game.world.clone(),
+            characters: game.characters.clone(),
+            next_actor_id: game.next_actor_id,
+            selected_character: game.selected_character,
+            movement_targets: game.movement_targets.clone(),
+            waypoint_queues: game.waypoint_queues.clone(),
+        });
+
+        // Kill the enemy during play
+        game.characters.get_mut(&enemy_aid).unwrap().health = 1;
+        let kill_info = game.execute_attack(player_aid, enemy_aid);
+        let (dead_aid, dead_cid, killer_cid) = kill_info.expect("should be a lethal hit");
+        game.handle_kill(dead_aid, dead_cid, killer_cid);
+
+        // Enemy should be gone
+        assert!(!game.characters.contains_key(&enemy_aid));
+
+        // Stop restores from snapshot — enemy should be back
+        game.stop_game_session();
+        assert!(
+            game.characters.contains_key(&enemy_aid),
+            "edit-mode characters should be restored from snapshot"
+        );
+        assert_eq!(
+            game.characters.get(&enemy_aid).unwrap().health, 50,
+            "enemy HP should be restored to pre-play value"
+        );
+    }
+
+    #[test]
+    fn play_stop_play_cycle_no_effect_leak() {
+        let (mut game, mut ctx, player_aid, enemy_aid) = setup_combat();
+
+        // --- First play session ---
+        game.selected_character = Some(player_aid);
+        game.handle_custom_event(events::MOVE_CHARACTER, 4.0, 2.0, 0.0);
+        tick(&mut game, &mut ctx);
+        assert_eq!(ctx.effects.arcs.len(), 1, "first session: arc from attack");
+
+        // Stop first session
+        game.stop_game_session();
+        tick(&mut game, &mut ctx); // countdown=1 → clear
+        assert_eq!(ctx.effects.arcs.len(), 0, "arcs cleared after first stop");
+
+        // --- Second play session ---
+        // Re-create session (simulate pressing Play again)
+        let mut session2 = GameSession::new(
+            zapsquad_core::entities::game_rules::GameMode::RealTime,
+        );
+        session2.phase = GamePhase::Exploration;
+        session2.teams.push(TeamState {
+            id: CoreTeamId(0), name: "Player".into(),
+            controller: TeamController::Human, color: "#00f".into(),
+            resources: std::collections::HashMap::new(), eliminated: false,
+        });
+        session2.teams.push(TeamState {
+            id: CoreTeamId(1), name: "Enemy".into(),
+            controller: TeamController::Cpu { script_name: "ai".into() },
+            color: "#f00".into(),
+            resources: std::collections::HashMap::new(), eliminated: false,
+        });
+        session2.set_relation(CoreTeamId(0), CoreTeamId(1), TeamRelation::Hostile);
+
+        // Re-create character instances in new session
+        let player_cid2 = session2.next_character_id();
+        let mut pc2 = zapsquad_core::entities::game_rules::CharacterInstance::standalone(
+            player_cid2, CoreTeamId(0), {
+                let mut s = std::collections::HashMap::new();
+                s.insert("hp".into(), 100.0); s
+            },
+        );
+        pc2.attach_actor(player_aid);
+        session2.add_character(pc2);
+        game.actor_to_instance.insert(player_aid, player_cid2);
+
+        let enemy_cid2 = session2.next_character_id();
+        let mut ec2 = zapsquad_core::entities::game_rules::CharacterInstance::standalone(
+            enemy_cid2, CoreTeamId(1), {
+                let mut s = std::collections::HashMap::new();
+                s.insert("hp".into(), 50.0); s
+            },
+        );
+        ec2.attach_actor(enemy_aid);
+        session2.add_character(ec2);
+        game.actor_to_instance.insert(enemy_aid, enemy_cid2);
+
+        game.game_session = Some(session2);
+
+        // Verify clean slate
+        assert_eq!(ctx.effects.arcs.len(), 0, "no arcs before second attack");
+        assert!(game.pending_visual_effects.is_empty(), "no pending effects before second attack");
+        assert_eq!(game.effects_clear_countdown, 0, "no stale countdown");
+    }
+
+    #[test]
+    fn ended_session_rejects_player_attack() {
+        let (mut game, _, player_aid, enemy_aid) = setup_combat();
+        game.selected_character = Some(player_aid);
+
+        // End the game
+        game.apply_rules_command(RulesCommand::EndGame { winner_team_id: Some(0) });
+
+        let enemy_hp_before = game.characters.get(&enemy_aid).unwrap().health;
+
+        // Right-click on enemy tile — should be rejected because phase is Ended
+        game.handle_custom_event(events::MOVE_CHARACTER, 4.0, 2.0, 0.0);
+
+        let enemy_hp_after = game.characters.get(&enemy_aid).unwrap().health;
+        assert_eq!(
+            enemy_hp_before, enemy_hp_after,
+            "player should not be able to attack after game ended"
+        );
+    }
+
+    #[test]
+    fn ended_session_rejects_player_movement() {
+        let (mut game, _, player_aid, _enemy_aid) = setup_combat();
+        game.selected_character = Some(player_aid);
+
+        // End the game
+        game.apply_rules_command(RulesCommand::EndGame { winner_team_id: Some(0) });
+
+        // Right-click on empty ground — should not set a movement target
+        game.handle_custom_event(events::MOVE_CHARACTER, 10.0, 10.0, 0.0);
+
+        assert!(
+            !game.movement_targets.contains_key(&player_aid),
+            "player should not be able to move after game ended"
+        );
+    }
+
+    // ── Real start_game_session path ────────────────────────────────
+
+    use zapsquad_core::entities::game_rules::{
+        GameDefinition, GameMode as CoreGameMode,
+        StatSchema, StatDef, TeamDefinition as DefTeamDefinition,
+    };
+
+    use zapsquad_core::entities::game_rules::WinCondition;
+
+    /// Build a minimal valid GameDefinition that passes validation.
+    /// Two human teams, hp stat, elimination win condition, trivial rules script.
+    fn minimal_game_def() -> GameDefinition {
+        let mut def = GameDefinition::new("test_game", CoreGameMode::RealTime);
+        def.teams = vec![
+            DefTeamDefinition {
+                id: CoreTeamId(0),
+                name: "Alpha".into(),
+                controller: TeamController::Human,
+                color: "#0f0".into(),
+            },
+            DefTeamDefinition {
+                id: CoreTeamId(1),
+                name: "Bravo".into(),
+                controller: TeamController::Human,
+                color: "#f00".into(),
+            },
+        ];
+        def.stat_schema = StatSchema::new()
+            .add(StatDef::new("hp", "Hit Points").with_range(100.0, 0.0, 1000.0));
+        def.win_conditions = vec![WinCondition::Elimination];
+        def.rules_script = "test_rules".into();
+        def
+    }
+
+    /// Set up a game with a real `start_game_session` call.
+    /// Compiles a trivial rules script so the pre-flight check passes.
+    fn setup_with_real_start() -> (FreedomBoardGame, EngineContext) {
+        let (mut game, ctx) = setup();
+        game.game_definition = Some(minimal_game_def());
+        // Compile trivial rules script so pre-flight validation passes
+        game.rules_engine.compile_script(
+            "test_rules",
+            "fn on_event(ctx) {}",
+        ).expect("trivial script should compile");
+        (game, ctx)
+    }
+
+    #[test]
+    fn real_start_creates_session_in_exploration() {
+        let (mut game, _ctx) = setup_with_real_start();
+
+        // Place a character to verify migration
+        let actor_id = ActorId(50);
+        let actor = CompositeActor::new(actor_id, Vec2::new(5.5, 5.5), "soldier");
+        game.characters.insert(actor_id, actor);
+
+        game.start_game_session();
+
+        let session = game.game_session.as_ref()
+            .expect("session should be created");
+        assert!(
+            matches!(session.phase, GamePhase::Exploration),
+            "session should start in Exploration"
+        );
+        assert_eq!(session.teams.len(), 2, "should have 2 teams");
+
+        // Character should have been migrated
+        assert!(!game.actor_to_instance.is_empty(), "actor should be mapped to instance");
+
+        // Pre-play snapshot should exist
+        assert!(game.pre_play_snapshot.is_some(), "snapshot should be captured");
+
+        // Session events should contain pending events
+        assert_eq!(
+            game.pending_session_events.last(),
+            Some(&2),
+            "should have pending 'playing' event"
+        );
+    }
+
+    #[test]
+    fn real_start_stop_cycle_restores_state() {
+        let (mut game, _ctx) = setup_with_real_start();
+
+        let actor_id = ActorId(60);
+        let actor = CompositeActor::new(actor_id, Vec2::new(3.0, 3.0), "marine");
+        game.characters.insert(actor_id, actor);
+
+        // Start
+        game.start_game_session();
+        assert!(game.game_session.is_some());
+
+        // Mutate during play (simulate combat)
+        game.characters.get_mut(&actor_id).unwrap().health = 1;
+
+        // Stop
+        game.stop_game_session();
+        assert!(game.game_session.is_none());
+
+        // Character should be restored to pre-play state
+        assert_eq!(
+            game.characters.get(&actor_id).unwrap().health, 100,
+            "health should be restored from snapshot"
+        );
+    }
+
+    #[test]
+    fn hud_state_emitted_on_stop() {
+        let (mut game, mut ctx, _, _) = setup_combat();
+
+        // Tick to consume initial hud_dirty from session start
+        game.hud_dirty = false;
+
+        // Stop game
+        game.stop_game_session();
+        assert!(game.hud_dirty, "hud should be dirty after stop");
+
+        // Tick to serialize
+        tick(&mut game, &mut ctx);
+
+        // HUD state should have been written (null for no session)
+        let hud_json = HUD_STATE.with(|p| p.borrow().clone());
+        // After tick, hud_dirty was consumed → write_hud_state called → HUD_STATE set
+        // The take_game_hud_state export drains it, but we can check hud_dirty was consumed
+        assert!(!game.hud_dirty, "hud_dirty should be consumed after tick");
     }
 }

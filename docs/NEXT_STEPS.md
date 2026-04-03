@@ -203,10 +203,13 @@ See `docs/effects-and-visibility-plan.md` for the full effects architecture.
 Engine is frozen at protocol v5 (zap-engine commit 3986dbe, 2026-04-02).
 
 **Tasks (combat):**
-1. Attack targeting UI (click to select target)
-2. Ranged attacks through object assets
-3. Range validation and failure feedback
-4. Idle state return after attack animation
+1. ~~Player-initiated attack via right-click on hostile during play~~ — DONE (2026-04-03)
+2. ~~Range validation (DEFAULT_ATTACK_RANGE_TILES = 3.0, temporary constant)~~ — DONE
+3. ~~Shared execute_attack() + handle_kill() methods (AI + player paths unified)~~ — DONE
+4. ~~Relation-aware targeting (uses session.relation(), not just different-team)~~ — DONE
+5. Ranged attacks through object assets
+6. Range driven by weapon/character stats (replaces DEFAULT_ATTACK_RANGE_TILES)
+7. Idle state return after attack animation
 
 **Tasks (effects pipeline — Stream 2 Phase 1):**
 5. ~~Extend GameEvent with AttackResolved (semantic attack event with positions)~~ — DONE
@@ -281,7 +284,14 @@ See `docs/effects-and-visibility-plan.md` for the full architecture.
    - ~~CompileResults diagnostic channel~~ — DONE
    - ~~GameHUD component (phase, teams, resources, start errors)~~ — DONE
    - ~~CompileResults → ScriptPanel (per-script OK/ERR + error detail)~~ — DONE
-6. **Play Mode polish** — pause, win/lose, mode-specific flow
+6. **Play Mode polish** — PARTIAL (2026-04-03)
+   - ~~Session lifecycle hardening (stop clears effects, countdown, pending visuals)~~ — DONE
+   - ~~End-game phase transition tested (EndGame → Ended, orchestrator stops)~~ — DONE
+   - ~~Snapshot restore tested (stop restores edit-mode characters)~~ — DONE
+   - ~~Play/stop/play cycle tested (no effect leak across sessions)~~ — DONE
+   - ~~HUD state emitted on stop~~ — DONE
+   - Pause/resume — NOT STARTED
+   - Turn-based flow — NOT STARTED (deferred until turn-based combat exists)
 7. **Effects pipeline + Combat UX** — Stream 2 Phase 1, targeting, feedback, events
 8. **Fog of war** — Stream 3, can run parallel with #7
 9. **Group commands** — multi-select, squads

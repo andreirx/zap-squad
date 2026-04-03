@@ -157,6 +157,12 @@ impl EventQueue {
     pub fn len(&self) -> usize {
         self.events.len()
     }
+
+    /// Read-only access to pending events. Useful for assertions in tests
+    /// that need to inspect events without draining them.
+    pub fn peek(&self) -> &[GameEvent] {
+        &self.events
+    }
 }
 
 #[cfg(test)]
