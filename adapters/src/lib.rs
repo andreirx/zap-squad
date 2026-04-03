@@ -13,6 +13,7 @@ pub mod asset_manifest;
 pub mod composite_renderer;
 pub mod effect_projection;
 pub mod engine_gateway;
+pub mod visibility_mapper;
 pub mod input_adapter;
 pub mod game_script_bindings;
 
@@ -23,6 +24,7 @@ pub mod game_script_bindings;
 pub mod script_bindings;
 
 pub use effect_projection::{VisualEffect, project_effects};
+pub use visibility_mapper::{cell_to_byte, fog_alpha, EXPLORED_BRIGHTNESS};
 pub use asset_gateway::{AssetGateway, EntitySpawnInfo, TileDefinition, TileInstance};
 pub use asset_manifest::{AssetManifest, BodyDefinition, WeaponDefinition, WeaponType};
 pub use composite_renderer::CompositeRenderer;

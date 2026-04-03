@@ -295,6 +295,17 @@ See `docs/effects-and-visibility-plan.md` for the full architecture.
      Rendering + HUD stay active. Pause button in GameHUD. 8 integration tests.
    - Turn-based flow — NOT STARTED (deferred until turn-based combat exists)
 7. **Effects pipeline + Combat UX** — Stream 2 Phase 1, targeting, feedback, events
-8. **Fog of war** — Stream 3, can run parallel with #7
+8. **Fog of war** — PARTIAL (2026-04-03)
+   - ~~Core: TeamVisibility entity (Hidden/Explored/Visible, per-team, radius update)~~ — DONE
+   - ~~Core: update_visibility use case (radius-only, 9 tests)~~ — DONE
+   - ~~Adapter: visibility_mapper (cell_to_byte, map_to_mask_bytes, 3 tests)~~ — DONE
+   - ~~Infrastructure: fog grids created/destroyed on start/stop~~ — DONE
+   - ~~Infrastructure: engine mask written each frame from viewing team grid~~ — DONE
+   - ~~Infrastructure: hidden enemies excluded from rendering, selection, targeting~~ — DONE
+   - ~~Infrastructure: 8 fog integration tests~~ — DONE
+   - ~~Fog-aware effect gating (beams/sparks suppressed at hidden cells)~~ — DONE
+   - ~~Visual fog overlay (vector rectangles, interim implementation)~~ — DONE
+   - Fog tile sprites with feathered edge transitions — NOT STARTED (replaces vector fog)
+   - Product tuning (vision ranges per unit, dimming level, edge behavior) — NOT STARTED
 9. **Group commands** — multi-select, squads
 10. **Headless orchestrator tests** — wasm-canvas test seam

@@ -78,7 +78,7 @@ use zapsquad_core::entities::game_rules::{
 };
 // Alias to avoid collision with zap_engine::GameEvent
 use zapsquad_core::entities::game_rules::GameEvent as RulesGameEvent;
-use zapsquad_core::use_cases::{apply_damage, calculate_damage, find_path_in_radius, InfiniteNavGrid};
+use zapsquad_core::use_cases::{apply_damage, calculate_damage, find_path_in_radius, InfiniteNavGrid, update_visibility, Observer};
 use zapsquad_core::use_cases::freedom_board::{
     connectivity_bitmask_with, draw_line, erase_rect, erase_tile, fill_rect, flood_fill, place_tile,
     query_viewport, stamp_tiles, EditResult,
@@ -390,6 +390,13 @@ pub struct FreedomBoardGame {
     /// Infrastructure-owned: core does not know about pause.
     paused: bool,
 
+    /// Per-team sparse visibility. Created on session start, destroyed on stop.
+    /// Only the viewing team's visibility drives fog overlay and entity gating.
+    /// Play-mode only — None in edit mode.
+    team_visibility: Option<std::collections::HashMap<TeamId, zapsquad_core::entities::game_rules::TeamVisibility>>,
+    /// Which team the player is viewing fog for. Set to the first human team on start.
+    viewing_team: Option<TeamId>,
+
     /// True when HUD-relevant session state has changed since last serialization.
     /// Set by: start/stop session, SetPhase, EndGame, ModifyResource, SpawnUnit, KillUnit.
     /// Consumed by update() which serializes and stores in HUD_STATE thread_local.
@@ -472,6 +479,8 @@ impl FreedomBoardGame {
             pending_session_events: Vec::new(),
             pending_visual_effects: Vec::new(),
             paused: false,
+            team_visibility: None,
+            viewing_team: None,
             hud_dirty: false,
             effects_clear_countdown: 0,
 
@@ -708,17 +717,12 @@ impl FreedomBoardGame {
                 }
             }
             events::SELECT_CHARACTER => {
-                // a=tile_x, b=tile_y — select character at this tile
+                // a=tile_x, b=tile_y — select character at this tile.
+                // During play with fog, hidden enemies cannot be selected.
                 let tx = a as f32 + 0.5;
                 let ty = b as f32 + 0.5;
                 let prev = self.selected_character;
-                self.selected_character = self
-                    .characters
-                    .iter()
-                    .find(|(_, c)| {
-                        (c.position.x - tx).abs() < 0.5 && (c.position.y - ty).abs() < 0.5
-                    })
-                    .map(|(id, _)| *id);
+                self.selected_character = self.find_character_at(tx, ty);
                 self.characters_dirty = true;
 
                 if self.selected_character != prev {
@@ -897,21 +901,25 @@ impl FreedomBoardGame {
 
     /// Map storage layer index (0-7) to zap-engine RenderLayer.
     ///
-    /// | Storage | RenderLayer  | Semantic          |
-    /// |---------|-------------|-------------------|
-    /// | 0       | Background  | Ground terrain     |
-    /// | 1       | Terrain     | Water/rivers       |
-    /// | 2       | Objects     | Bridges            |
-    /// | 3       | Foreground  | Paths              |
-    /// | 4       | VFX         | Objects/decoration |
-    /// | 5-7     | UI          | Characters / HUD   |
+    /// | Storage | RenderLayer  | Semantic                |
+    /// |---------|-------------|-------------------------|
+    /// | 0       | Background  | Ground terrain           |
+    /// | 1       | Terrain     | Water/rivers             |
+    /// | 2       | Objects     | Bridges                  |
+    /// | 3       | Foreground  | Paths + objects/decor    |
+    /// | 4       | Foreground  | (also world substrate)   |
+    /// | 5-7     | UI          | Characters / HUD         |
+    ///
+    /// Storage layers 3-4 both map to Foreground — all world substrate.
+    /// VFX(4) is reserved for future fog overlay entities (not yet implemented).
+    /// Characters (UI) render above fog layer and are gated by visibility policy.
+    /// Combat effects use the engine effects pipeline, not tile layers.
     fn storage_to_render_layer(layer: u8) -> RenderLayer {
         match layer {
             0 => RenderLayer::Background,
             1 => RenderLayer::Terrain,
             2 => RenderLayer::Objects,
-            3 => RenderLayer::Foreground,
-            4 => RenderLayer::VFX,
+            3 | 4 => RenderLayer::Foreground,
             _ => RenderLayer::UI,
         }
     }
@@ -1434,6 +1442,24 @@ impl FreedomBoardGame {
         self.game_session = Some(session);
         self.pending_session_events.push(2); // playing
         self.hud_dirty = true;
+
+        // Initialize sparse fog of war visibility for each team.
+        // No bounded rectangle — chunks are created on demand as observers reveal cells.
+        let mut vis_map = std::collections::HashMap::new();
+        if let Some(ref sess) = self.game_session {
+            for team in &sess.teams {
+                vis_map.insert(
+                    team.id,
+                    zapsquad_core::entities::game_rules::TeamVisibility::new(team.id),
+                );
+            }
+        }
+        self.team_visibility = Some(vis_map);
+        // Viewing team: first human-controlled team
+        self.viewing_team = self.game_session.as_ref()
+            .and_then(|s| s.teams.iter()
+                .find(|t| matches!(t.controller, zapsquad_core::entities::game_rules::TeamController::Human))
+                .map(|t| t.id));
     }
 
     /// Stop the active game session and restore pre-play edit-mode state.
@@ -1448,6 +1474,8 @@ impl FreedomBoardGame {
 
         // Clear session-related state.
         self.paused = false;
+        self.team_visibility = None;
+        self.viewing_team = None;
         self.pending_visual_effects.clear();
         self.effects_clear_countdown = 1; // triggers ctx.effects.clear() on next update()
 
@@ -2221,6 +2249,143 @@ impl FreedomBoardGame {
     /// Entity with a sprite looked up from the engine's asset registry using
     /// the character's body_def_id, animation state, direction, and frame:
     ///   sprite key = "{body_def_id}/{anim}_{direction}/{frame}"
+    // ── Fog of war helpers ─────────────────────────────────────────
+
+    /// Check if an actor should be visible/interactable to the viewing team.
+    ///
+    /// Returns true if:
+    /// - No active session (edit mode — everything visible)
+    /// - No visibility grids (fog disabled)
+    /// - The actor is on the viewing team (always see your own units)
+    /// - The actor's tile is Visible to the viewing team
+    ///
+    /// Returns false if the actor is on a non-viewing team and their tile
+    /// is Hidden or Explored (enemies in fog are not rendered or interactable).
+    fn is_actor_visible_to_viewer(&self, actor_id: ActorId) -> bool {
+        // No session or no fog → everything visible
+        let (session, vis_map, viewing_team) = match (
+            &self.game_session,
+            &self.team_visibility,
+            self.viewing_team,
+        ) {
+            (Some(s), Some(v), Some(vt)) => (s, v, vt),
+            _ => return true,
+        };
+
+        // Own team is always visible
+        if let Some(&cid) = self.actor_to_instance.get(&actor_id) {
+            if let Some(c) = session.character(cid) {
+                if c.team_id == viewing_team {
+                    return true;
+                }
+            }
+        }
+
+        // Check the actor's tile against the viewing team's visibility grid
+        if let Some(actor) = self.characters.get(&actor_id) {
+            let tile_x = actor.position.x.floor() as i32;
+            let tile_y = actor.position.y.floor() as i32;
+            if let Some(team_vis) = vis_map.get(&viewing_team) {
+                return team_vis.is_visible(tile_x, tile_y);
+            }
+        }
+
+        true // fallback: visible if we can't determine
+    }
+
+    /// Default vision range in tiles when no `vision_range` stat is defined.
+    /// Temporary policy — will be replaced by per-character stat.
+    const DEFAULT_VISION_RANGE: u32 = 5;
+
+    /// Update visibility grids for all teams based on current character positions.
+    /// Called once per tick during play (after movement, before rendering).
+    fn update_fog_of_war(&mut self) {
+        let session = match &self.game_session {
+            Some(s) => s,
+            None => return,
+        };
+        let vis_map = match &mut self.team_visibility {
+            Some(v) => v,
+            None => return,
+        };
+
+        // Collect observers per team from live characters
+        let mut team_observers: std::collections::HashMap<TeamId, Vec<Observer>> =
+            std::collections::HashMap::new();
+
+        for (actor_id, actor) in &self.characters {
+            if let Some(&cid) = self.actor_to_instance.get(actor_id) {
+                if let Some(c) = session.character(cid) {
+                    if !c.alive {
+                        continue;
+                    }
+                    let range = c.stats.get("vision_range")
+                        .map(|&v| v as u32)
+                        .unwrap_or(Self::DEFAULT_VISION_RANGE);
+                    team_observers.entry(c.team_id).or_default().push(Observer {
+                        tile_x: actor.position.x.floor() as i32,
+                        tile_y: actor.position.y.floor() as i32,
+                        range,
+                    });
+                }
+            }
+        }
+
+        // Update each team's visibility grid
+        for (team_id, team_vis) in vis_map.iter_mut() {
+            let observers = team_observers.get(team_id)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            update_visibility(team_vis, observers);
+        }
+    }
+
+    /// Draw fog overlay rectangles for the viewing team's hidden/explored cells.
+    ///
+    /// TEMPORARY implementation using vector rectangles. Will be replaced by
+    /// fog tile sprites with feathered edge transitions (matching the board's
+    /// visual language) when fog atlas art is available.
+    ///
+    /// Limitations of vector fog:
+    /// - Vectors render after ALL sprites in the engine pipeline, so this
+    ///   cannot interleave between world substrate and character layers.
+    ///   Currently acceptable because characters are gated out of hidden cells.
+    /// - Additive effects (beams, sparks) render AFTER vectors in the engine
+    ///   pipeline and can punch through fog. Effect gating (below) mitigates
+    ///   this, but the rendering order is not perfectly sealed.
+    /// - No edge transitions — hard tile-sized boundaries.
+    fn draw_fog_overlay(&self, ctx: &mut EngineContext) {
+        let (vis_map, viewing_team) = match (&self.team_visibility, self.viewing_team) {
+            (Some(v), Some(vt)) => (v, vt),
+            _ => return,
+        };
+        let team_vis = match vis_map.get(&viewing_team) {
+            Some(v) => v,
+            None => return,
+        };
+
+        let (vp_min, vp_max) = self.visible_bounds();
+        let tile_size = self.zoom;
+
+        for ty in vp_min.y..=vp_max.y {
+            for tx in vp_min.x..=vp_max.x {
+                let cell = team_vis.get_world(tx, ty);
+                let alpha = match cell {
+                    zapsquad_core::entities::game_rules::CellState::Hidden => 0.92,
+                    zapsquad_core::entities::game_rules::CellState::Explored => 0.45,
+                    zapsquad_core::entities::game_rules::CellState::Visible => continue,
+                };
+                let screen = self.tile_to_screen(tx as f32, ty as f32);
+                ctx.vectors.fill_rect(
+                    screen,
+                    tile_size,
+                    tile_size,
+                    VectorColor::new(0.0, 0.0, 0.0, alpha),
+                );
+            }
+        }
+    }
+
     // ── Combat helpers ─────────────────────────────────────────────
 
     /// Check if an actor belongs to a human-controlled team.
@@ -2302,10 +2467,15 @@ impl FreedomBoardGame {
 
     /// Find a character at the given tile center coordinates.
     /// Uses the same proximity check as SELECT_CHARACTER (±0.5 tiles).
+    ///
+    /// During play mode with fog enabled, hidden enemy actors are excluded.
+    /// Own-team and visible actors are always findable.
     fn find_character_at(&self, tx: f32, ty: f32) -> Option<ActorId> {
         self.characters.iter()
-            .find(|(_, c)| {
-                (c.position.x - tx).abs() < 0.5 && (c.position.y - ty).abs() < 0.5
+            .find(|(id, c)| {
+                (c.position.x - tx).abs() < 0.5
+                    && (c.position.y - ty).abs() < 0.5
+                    && self.is_actor_visible_to_viewer(**id)
             })
             .map(|(id, _)| *id)
     }
@@ -2469,13 +2639,37 @@ impl FreedomBoardGame {
         ]
     }
 
+    /// Check if a world-space position is visible to the viewing team.
+    /// Returns true if no fog is active (edit mode) or if the tile is Visible.
+    fn is_world_pos_visible(&self, wx: f32, wy: f32) -> bool {
+        let (vis_map, viewing_team) = match (&self.team_visibility, self.viewing_team) {
+            (Some(v), Some(vt)) => (v, vt),
+            _ => return true, // no fog → visible
+        };
+        match vis_map.get(&viewing_team) {
+            Some(team_vis) => team_vis.is_visible(wx.floor() as i32, wy.floor() as i32),
+            None => true,
+        }
+    }
+
     /// Translate a single `VisualEffect` (adapter vocabulary) to engine API calls.
     ///
     /// This is the sole point where adapter-level visual intents become engine
     /// primitives. All engine coupling for effects is isolated here.
+    ///
+    /// Fog-aware: effects at hidden/explored positions are suppressed to prevent
+    /// beams and sparks from punching through the fog overlay.
     fn translate_visual_effect(&mut self, effect: &VisualEffect, ctx: &mut EngineContext) {
         match effect {
             VisualEffect::Beam { from, to } => {
+                // Suppress beam if BOTH endpoints are hidden. If either end is
+                // visible (e.g., attacker is visible but target is in fog),
+                // the beam still renders — the player sees the shot fired.
+                if !self.is_world_pos_visible(from.0, from.1)
+                    && !self.is_world_pos_visible(to.0, to.1)
+                {
+                    return;
+                }
                 let screen_from = self.world_to_screen(from.0, from.1);
                 let screen_to = self.world_to_screen(to.0, to.1);
                 // Arc parameters:
@@ -2496,6 +2690,10 @@ impl FreedomBoardGame {
                 self.effects_clear_countdown = BEAM_LIFETIME_FRAMES;
             }
             VisualEffect::SparkBurst { position, intensity } => {
+                // Suppress sparks at hidden positions.
+                if !self.is_world_pos_visible(position.0, position.1) {
+                    return;
+                }
                 let screen_pos = self.world_to_screen(position.0, position.1);
                 // Particle count: 4 at minimum intensity, 16 at full intensity.
                 let count = (4.0 + intensity * 12.0) as usize;
@@ -2530,6 +2728,11 @@ impl FreedomBoardGame {
         let scale = Vec2::splat(self.zoom); // 128px sprites, no feathering
 
         for (id, actor) in &self.characters {
+            // Fog of war — skip hidden enemies (not rendered)
+            if !self.is_actor_visible_to_viewer(*id) {
+                continue;
+            }
+
             // Frustum cull — skip characters outside viewport
             let tx = actor.position.x.floor() as i32;
             let ty = actor.position.y.floor() as i32;
@@ -3115,6 +3318,9 @@ impl Game for FreedomBoardGame {
             max_entities: 50_000,
             max_instances: 50_000,
             max_layer_batches: 256,
+            // Fog of war: no engine mask. Fog is rendered as sparse overlay
+            // entities on the VFX layer, not as a fullscreen texture mask.
+            // visibility_cols/rows stay at 0 (engine mask disabled).
             ..Default::default()
         }
     }
@@ -3382,7 +3588,19 @@ impl Game for FreedomBoardGame {
             self.update_animation_frames();
         }
 
-        // 1e. Manage effect lifecycle: retire stale arcs.
+        // 1e. Update fog of war after movement (positions are current).
+        // Runs even when paused so the mask reflects the last unpaused state
+        // if the viewer moves the camera. Actually — skip when paused, because
+        // movement doesn't advance and positions don't change.
+        if !self.paused {
+            self.update_fog_of_war();
+        }
+
+        // 1f. Fog overlay: drawn via vectors in step 3b (draw_fog_overlay).
+        // Vector rectangles render after all sprite layers, but this is correct
+        // because fog and characters are spatially exclusive (visibility gating).
+
+        // 1g. Manage effect lifecycle: retire stale arcs.
         // Runs even when paused so beam arcs expire naturally instead of
         // being frozen mid-display.
         if self.effects_clear_countdown > 0 {
@@ -3419,6 +3637,11 @@ impl Game for FreedomBoardGame {
         }
         if self.debug_show_quadtree {
             self.draw_quadtree_debug(ctx);
+        }
+
+        // 3b. Fog overlay (vector rectangles over hidden/explored cells)
+        if self.game_session.is_some() {
+            self.draw_fog_overlay(ctx);
         }
 
         // 4. Characters are drawn as vectors (cleared each frame), so always redraw
@@ -5161,5 +5384,206 @@ mod tests {
         game.start_game_session();
         assert!(game.game_session.is_some());
         assert!(!game.paused, "new session should not inherit paused state");
+    }
+
+    // ── Fog of war integration ────────────────────────────────────────
+    //
+    // Tests verify that fog gating is applied consistently across all
+    // interaction paths: rendering, selection, targeting, and click lookup.
+
+    /// Set up combat with fog enabled. Player (team 0 human) at (2.5, 2.5),
+    /// enemy (team 1 CPU) at (20.5, 20.5) — far enough to be outside default
+    /// vision range (5 tiles). The enemy should be hidden.
+    fn setup_combat_with_fog() -> (FreedomBoardGame, EngineContext, ActorId, ActorId) {
+        let (mut game, ctx, player_aid, enemy_aid) = setup_combat();
+
+        // Move enemy far away — outside default vision range (5 tiles)
+        game.characters.get_mut(&enemy_aid).unwrap().position = Vec2::new(20.5, 20.5);
+
+        // Create sparse fog grids for both teams (no bounded rectangle needed)
+        let mut vis_map = std::collections::HashMap::new();
+        vis_map.insert(
+            CoreTeamId(0),
+            zapsquad_core::entities::game_rules::TeamVisibility::new(CoreTeamId(0)),
+        );
+        vis_map.insert(
+            CoreTeamId(1),
+            zapsquad_core::entities::game_rules::TeamVisibility::new(CoreTeamId(1)),
+        );
+        game.team_visibility = Some(vis_map);
+        game.viewing_team = Some(CoreTeamId(0));
+
+        // Run initial fog update so player's area is revealed
+        game.update_fog_of_war();
+
+        (game, ctx, player_aid, enemy_aid)
+    }
+
+    #[test]
+    fn fog_hides_distant_enemy_from_viewer() {
+        let (game, _, _player_aid, enemy_aid) = setup_combat_with_fog();
+
+        // Enemy at (20.5, 20.5) is outside player's vision range (5 tiles from player at 2.5,2.5)
+        assert!(
+            !game.is_actor_visible_to_viewer(enemy_aid),
+            "distant enemy should be hidden in fog"
+        );
+    }
+
+    #[test]
+    fn fog_shows_own_team_always() {
+        let (game, _, player_aid, _) = setup_combat_with_fog();
+
+        // Player's own character is always visible regardless of fog
+        assert!(
+            game.is_actor_visible_to_viewer(player_aid),
+            "own team should always be visible"
+        );
+    }
+
+    #[test]
+    fn fog_shows_enemy_within_vision_range() {
+        let (mut game, _, player_aid, enemy_aid) = setup_combat_with_fog();
+
+        // Move enemy close to player (within 5-tile range)
+        game.characters.get_mut(&enemy_aid).unwrap().position = Vec2::new(4.5, 2.5);
+        game.update_fog_of_war();
+
+        assert!(
+            game.is_actor_visible_to_viewer(enemy_aid),
+            "nearby enemy should be visible"
+        );
+    }
+
+    #[test]
+    fn fog_blocks_selection_of_hidden_enemy() {
+        let (mut game, _, _, enemy_aid) = setup_combat_with_fog();
+
+        // Try to select hidden enemy at (20.5, 20.5)
+        let found = game.find_character_at(20.5, 20.5);
+        assert!(
+            found.is_none(),
+            "should not find hidden enemy via click lookup"
+        );
+
+        // Also verify via SELECT_CHARACTER event
+        game.handle_custom_event(events::SELECT_CHARACTER, 20.0, 20.0, 0.0);
+        assert_ne!(
+            game.selected_character, Some(enemy_aid),
+            "should not select hidden enemy"
+        );
+    }
+
+    #[test]
+    fn fog_blocks_attack_on_hidden_enemy() {
+        let (mut game, _, player_aid, enemy_aid) = setup_combat_with_fog();
+        game.selected_character = Some(player_aid);
+
+        let hp_before = game.characters.get(&enemy_aid).unwrap().health;
+
+        // Right-click on hidden enemy tile
+        game.handle_custom_event(events::MOVE_CHARACTER, 20.0, 20.0, 0.0);
+
+        let hp_after = game.characters.get(&enemy_aid).unwrap().health;
+        assert_eq!(
+            hp_before, hp_after,
+            "should not attack hidden enemy through fog"
+        );
+    }
+
+    #[test]
+    fn fog_grids_created_on_session_start() {
+        let (mut game, _ctx) = setup_with_real_start();
+        let aid = ActorId(80);
+        game.characters.insert(aid, CompositeActor::new(aid, Vec2::new(5.0, 5.0), "marine"));
+
+        game.start_game_session();
+
+        assert!(game.team_visibility.is_some(), "fog grids should be created");
+        assert!(game.viewing_team.is_some(), "viewing team should be set");
+        let vis_map = game.team_visibility.as_ref().unwrap();
+        assert_eq!(vis_map.len(), 2, "should have one grid per team");
+    }
+
+    #[test]
+    fn fog_grids_destroyed_on_session_stop() {
+        let (mut game, _ctx) = setup_with_real_start();
+        let aid = ActorId(81);
+        game.characters.insert(aid, CompositeActor::new(aid, Vec2::new(5.0, 5.0), "marine"));
+
+        game.start_game_session();
+        assert!(game.team_visibility.is_some());
+
+        game.stop_game_session();
+        assert!(game.team_visibility.is_none(), "fog grids should be destroyed on stop");
+        assert!(game.viewing_team.is_none(), "viewing team should be cleared on stop");
+    }
+
+    #[test]
+    fn fog_state_cleared_on_stop() {
+        let (mut game, mut ctx) = setup_with_real_start();
+        let aid = ActorId(82);
+        game.characters.insert(aid, CompositeActor::new(aid, Vec2::new(5.0, 5.0), "marine"));
+
+        game.start_game_session();
+        tick(&mut game, &mut ctx);
+
+        // Fog grids should exist during play
+        assert!(game.team_visibility.is_some());
+
+        // Stop session
+        game.stop_game_session();
+        tick(&mut game, &mut ctx);
+
+        // Fog state should be fully cleared
+        assert!(game.team_visibility.is_none(), "fog grids should be destroyed on stop");
+        assert!(game.viewing_team.is_none(), "viewing team should be cleared on stop");
+    }
+
+    #[test]
+    fn fog_suppresses_effects_at_hidden_positions() {
+        let (mut game, mut ctx, _player_aid, _enemy_aid) = setup_combat_with_fog();
+
+        // Push a beam effect between two hidden positions (both at 20,20 area)
+        game.pending_visual_effects.push(VisualEffect::Beam {
+            from: (20.0, 20.0),
+            to: (21.0, 21.0),
+        });
+        game.pending_visual_effects.push(VisualEffect::SparkBurst {
+            position: (21.0, 21.0),
+            intensity: 1.0,
+        });
+        tick(&mut game, &mut ctx);
+
+        // Both endpoints are in fog — effects should be suppressed
+        assert_eq!(ctx.effects.arcs.len(), 0, "beam should be suppressed in fog");
+        assert!(ctx.effects.particles.is_empty(), "sparks should be suppressed in fog");
+    }
+
+    #[test]
+    fn fog_allows_effects_at_visible_positions() {
+        let (mut game, mut ctx, _player_aid, _enemy_aid) = setup_combat_with_fog();
+
+        // Push effects at the player's position (visible)
+        game.pending_visual_effects.push(VisualEffect::Beam {
+            from: (2.0, 2.0),
+            to: (3.0, 3.0),
+        });
+        game.pending_visual_effects.push(VisualEffect::SparkBurst {
+            position: (3.0, 3.0),
+            intensity: 0.5,
+        });
+        tick(&mut game, &mut ctx);
+
+        assert_eq!(ctx.effects.arcs.len(), 1, "beam at visible position should render");
+        assert!(!ctx.effects.particles.is_empty(), "sparks at visible position should render");
+    }
+
+    #[test]
+    fn no_fog_in_edit_mode() {
+        let (game, _, player_aid, enemy_aid) = setup_combat();
+        // No fog grids set → everything visible
+        assert!(game.is_actor_visible_to_viewer(player_aid));
+        assert!(game.is_actor_visible_to_viewer(enemy_aid));
     }
 }

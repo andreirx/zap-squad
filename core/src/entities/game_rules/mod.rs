@@ -36,6 +36,7 @@ mod event;
 mod definition;
 mod validation;
 mod package;
+mod visibility;
 
 pub use types::*;
 pub use team::*;
@@ -46,3 +47,4 @@ pub use event::*;
 pub use definition::*;
 pub use validation::*;
 pub use package::*;
+pub use visibility::*;
