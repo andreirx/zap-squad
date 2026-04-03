@@ -12,11 +12,21 @@ interface ScriptEntry {
   updatedAt: number;
 }
 
+/** Per-script compile result from WASM (take_compile_results channel). */
+interface CompileResult {
+  name: string;
+  scope: string;
+  ok: boolean;
+  message: string | null;
+}
+
 interface ScriptPanelProps {
   /** Send scripts to WASM via reload_scripts worker message. */
   onReloadScripts: (scriptsJson: string) => void;
   /** Panel is read-only during play mode. */
   disabled?: boolean;
+  /** Per-script compile results from the last WASM reload. Null before first reload. */
+  compileResults?: CompileResult[] | null;
 }
 
 // ── Scope metadata ────────────────────────────────────────────────────
@@ -197,7 +207,7 @@ fn update(ctx) {
 
 // ── Component ─────────────────────────────────────────────────────────
 
-export function ScriptPanel({ onReloadScripts, disabled = false }: ScriptPanelProps) {
+export function ScriptPanel({ onReloadScripts, disabled = false, compileResults }: ScriptPanelProps) {
   // Script list from IDB
   const [scripts, setScripts] = useState<ScriptEntry[]>([]);
   const [selectedName, setSelectedName] = useState<string | null>(null);
@@ -476,6 +486,17 @@ export function ScriptPanel({ onReloadScripts, disabled = false }: ScriptPanelPr
 
   const selected = scripts.find(s => s.name === selectedName);
 
+  // Build compile-result lookup: script name → CompileResult.
+  // Null when no results available (before first reload).
+  const compileMap = compileResults
+    ? new Map(compileResults.map(r => [r.name, r]))
+    : null;
+
+  // Compile error for the currently selected script (if any).
+  const selectedCompileResult = selectedName && compileMap
+    ? compileMap.get(selectedName) ?? null
+    : null;
+
   return (
     <div
       style={{
@@ -627,6 +648,25 @@ export function ScriptPanel({ onReloadScripts, disabled = false }: ScriptPanelPr
                     {selectedName === entry.name && dirty && (
                       <span style={{ color: '#e94560', fontSize: 9 }}>*</span>
                     )}
+                    {/* Compile status indicator.
+                        Suppressed for the selected script when dirty —
+                        the result describes the last-compiled source, not
+                        the current editor contents. */}
+                    {compileMap && (() => {
+                      const result = compileMap.get(entry.name);
+                      if (!result) return null; // not in last reload (e.g. created after)
+                      const isStale = selectedName === entry.name && dirty;
+                      if (isStale) return null;
+                      return (
+                        <span style={{
+                          fontSize: 9,
+                          color: result.ok ? '#4ecca3' : '#e94560',
+                          marginLeft: 2,
+                        }} title={result.ok ? 'Compiled OK' : (result.message ?? 'Compile error')}>
+                          {result.ok ? 'OK' : 'ERR'}
+                        </span>
+                      );
+                    })()}
                   </div>
                   {!disabled && selectedName === entry.name && (
                     <div style={{ display: 'flex', gap: 2 }}>
@@ -680,6 +720,25 @@ export function ScriptPanel({ onReloadScripts, disabled = false }: ScriptPanelPr
           }}>
             {selected.name}
           </span>
+        </div>
+      )}
+
+      {/* ── Compile error detail (for selected script) ─────────── */}
+      {/* Suppressed when dirty — the error describes the last-compiled source,
+          not the current editor contents. */}
+      {!dirty && selectedCompileResult && !selectedCompileResult.ok && selectedCompileResult.message && (
+        <div style={{
+          padding: '4px 10px',
+          borderBottom: '1px solid #1a2a4a',
+          background: '#2a0a0a',
+          color: '#ff8a80',
+          fontSize: 10,
+          fontFamily: 'monospace',
+          whiteSpace: 'pre-wrap',
+          maxHeight: 80,
+          overflowY: 'auto',
+        }}>
+          {selectedCompileResult.message}
         </div>
       )}
 

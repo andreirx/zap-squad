@@ -275,7 +275,12 @@ See `docs/effects-and-visibility-plan.md` for the full architecture.
 2. ~~**World gen scripting**~~ — DONE (WorldGenScriptEngine)
 3. ~~**Character AI migration**~~ — DONE (AiScriptEngine replaces legacy)
 4. ~~**Engine contract stabilization**~~ — DONE (protocol v5, batch budget 256)
-5. **Play HUD** — show phase, resources, turns, game status
+5. ~~**Play HUD**~~ — DONE (2026-04-03)
+   - ~~GameHudState boundary DTO (WASM → worker → React)~~ — DONE
+   - ~~StartErrors diagnostic channel~~ — DONE
+   - ~~CompileResults diagnostic channel~~ — DONE
+   - ~~GameHUD component (phase, teams, resources, start errors)~~ — DONE
+   - ~~CompileResults → ScriptPanel (per-script OK/ERR + error detail)~~ — DONE
 6. **Play Mode polish** — pause, win/lose, mode-specific flow
 7. **Effects pipeline + Combat UX** — Stream 2 Phase 1, targeting, feedback, events
 8. **Fog of war** — Stream 3, can run parallel with #7

@@ -288,6 +288,15 @@ impl<'a> InfiniteNavGrid for SparseWorldNav<'a> {
 /// Snapshot of mutable state captured before entering play mode.
 /// Restored by stop_game_session() to ensure the board returns cleanly to edit state.
 /// Includes the tile world so world-gen tile placements are rolled back on stop.
+/// Structured diagnostic for start-failure error surfacing.
+/// Serialized to JSON and sent to React via take_start_errors().
+struct StartDiagnostic {
+    kind: &'static str,      // "validation", "missing_script", "worldgen"
+    message: String,
+    scope: Option<String>,    // "rules", "character_ai", "world_gen", "team_ai"
+    script_name: Option<String>,
+}
+
 struct PrePlaySnapshot {
     world: SparseWorld,
     characters: std::collections::HashMap<ActorId, CompositeActor>,
@@ -368,6 +377,11 @@ pub struct FreedomBoardGame {
     /// Pending visual effects projected from domain events during the orchestrator tick.
     /// Translated to engine calls in `update()` where `EngineContext` is available.
     pending_visual_effects: Vec<VisualEffect>,
+    /// True when HUD-relevant session state has changed since last serialization.
+    /// Set by: start/stop session, SetPhase, EndGame, ModifyResource, SpawnUnit, KillUnit.
+    /// Consumed by update() which serializes and stores in HUD_STATE thread_local.
+    hud_dirty: bool,
+
     /// Countdown (in frames) until `ctx.effects.clear()` is called to retire arcs.
     ///
     /// The engine's `add_arc()` pushes arcs permanently — `tick()` twitches them
@@ -444,6 +458,7 @@ impl FreedomBoardGame {
             pre_play_snapshot: None,
             pending_session_events: Vec::new(),
             pending_visual_effects: Vec::new(),
+            hud_dirty: false,
             effects_clear_countdown: 0,
 
             tile_entities: Vec::new(),
@@ -1164,20 +1179,26 @@ impl FreedomBoardGame {
         // Authoritative validation gate — same validator as wasm-validator crate
         let validation = validate_game(def);
         if !validation.is_playable() {
+            let mut diagnostics: Vec<StartDiagnostic> = Vec::new();
             for issue in validation.errors() {
+                #[cfg(target_arch = "wasm32")]
                 web_sys::console::error_1(
                     &format!("[orchestrator] validation error: {}", issue.message).into(),
                 );
+                diagnostics.push(StartDiagnostic {
+                    kind: "validation",
+                    message: issue.message.clone(),
+                    scope: None,
+                    script_name: None,
+                });
             }
             for issue in validation.warnings() {
+                #[cfg(target_arch = "wasm32")]
                 web_sys::console::warn_1(
                     &format!("[orchestrator] validation warning: {}", issue.message).into(),
                 );
             }
-            web_sys::console::error_1(
-                &format!("[orchestrator] cannot start: {} errors, {} warnings",
-                    validation.errors().len(), validation.warnings().len()).into(),
-            );
+            Self::write_start_errors(&diagnostics);
             self.pending_session_events.push(4); // start_failed
             return;
         }
@@ -1292,18 +1313,31 @@ impl FreedomBoardGame {
         }
 
         if !missing_scripts.is_empty() {
-            for msg in &missing_scripts {
+            let diagnostics: Vec<StartDiagnostic> = missing_scripts.iter().map(|msg| {
+                // Parse "scope: 'script_name' ..." format for structured diagnostics.
+                let (scope, script_name) = if let Some(colon_pos) = msg.find(':') {
+                    let scope = msg[..colon_pos].trim().to_string();
+                    let rest = &msg[colon_pos + 1..];
+                    let name = rest.trim().trim_matches('\'')
+                        .split('\'').next().unwrap_or("").to_string();
+                    (Some(scope), Some(name))
+                } else {
+                    (None, None)
+                };
+                StartDiagnostic {
+                    kind: "missing_script",
+                    message: format!("Missing script: {}", msg),
+                    scope,
+                    script_name,
+                }
+            }).collect();
+            for d in &diagnostics {
+                #[cfg(target_arch = "wasm32")]
                 web_sys::console::error_1(
-                    &format!("[orchestrator] missing script: {}", msg).into(),
+                    &format!("[orchestrator] {}", d.message).into(),
                 );
             }
-            web_sys::console::error_1(
-                &format!(
-                    "[orchestrator] cannot start: {} referenced script(s) not compiled. \
-                     Open the Script Panel and reload scripts before pressing Play.",
-                    missing_scripts.len(),
-                ).into(),
-            );
+            Self::write_start_errors(&diagnostics);
             // Clean up the migration we already did
             self.actor_to_instance.clear();
             // Restore full snapshot (tiles + characters) since we're aborting
@@ -1336,9 +1370,16 @@ impl FreedomBoardGame {
                     );
                 }
                 Err(e) => {
+                    #[cfg(target_arch = "wasm32")]
                     web_sys::console::error_1(
                         &format!("[orchestrator] world gen '{}' failed: {}", worldgen_name, e).into(),
                     );
+                    Self::write_start_errors(&[StartDiagnostic {
+                        kind: "worldgen",
+                        message: format!("World gen '{}' failed: {}", worldgen_name, e),
+                        scope: Some("world_gen".into()),
+                        script_name: Some(worldgen_name.to_string()),
+                    }]);
                     // Abort startup — restore pre-play snapshot
                     self.actor_to_instance.clear();
                     if let Some(snapshot) = self.pre_play_snapshot.take() {
@@ -1371,6 +1412,7 @@ impl FreedomBoardGame {
 
         self.game_session = Some(session);
         self.pending_session_events.push(2); // playing
+        self.hud_dirty = true;
     }
 
     /// Stop the active game session and restore pre-play edit-mode state.
@@ -1398,6 +1440,7 @@ impl FreedomBoardGame {
             web_sys::console::warn_1(&"[orchestrator] game stopped but no snapshot to restore".into());
         }
         self.pending_session_events.push(3); // stopped
+        self.hud_dirty = true;
     }
 
     /// Run one orchestrator tick. Called from update() when a session is active.
@@ -1755,6 +1798,7 @@ impl FreedomBoardGame {
                 self.characters.insert(actor_id, actor);
                 self.characters_dirty = true;
                 self.character_generation += 1;
+                self.hud_dirty = true; // team composition changed
 
                 // Emit event
                 session.events.push(RulesGameEvent::UnitSpawned {
@@ -1782,6 +1826,7 @@ impl FreedomBoardGame {
                         self.actor_to_instance.remove(&actor_id);
                         self.characters_dirty = true;
                         self.character_generation += 1;
+                        self.hud_dirty = true; // team composition changed
                     }
                     session.events.push(RulesGameEvent::UnitKilled {
                         character_id: cid,
@@ -1834,6 +1879,7 @@ impl FreedomBoardGame {
                     let entry = team.resources.entry(resource_key.clone()).or_insert(0.0);
                     *entry += delta;
                     let new_val = *entry;
+                    self.hud_dirty = true; // resource changed
                     session.events.push(RulesGameEvent::ResourceChanged {
                         team: tid,
                         resource_key,
@@ -1861,6 +1907,7 @@ impl FreedomBoardGame {
                     }
                 };
                 session.transition(phase);
+                self.hud_dirty = true; // phase changed
             }
             RulesCommand::EndGame { winner_team_id } => {
                 let session = match &mut self.game_session {
@@ -1869,6 +1916,7 @@ impl FreedomBoardGame {
                 };
                 let winner = winner_team_id.map(TeamId);
                 session.transition(GamePhase::Ended { winner });
+                self.hud_dirty = true; // game ended
                 web_sys::console::log_1(
                     &format!("[orchestrator] game ended. winner: {:?}", winner).into(),
                 );
@@ -2139,6 +2187,68 @@ impl FreedomBoardGame {
     /// Entity with a sprite looked up from the engine's asset registry using
     /// the character's body_def_id, animation state, direction, and frame:
     ///   sprite key = "{body_def_id}/{anim}_{direction}/{frame}"
+    // ── HUD state serialization ──────────────────────────────────────
+
+    /// Write structured start-error diagnostics to the START_ERRORS thread_local.
+    /// Called on each start_failed path. One-shot — consumed by take_start_errors().
+    fn write_start_errors(errors: &[StartDiagnostic]) {
+        let json = serde_json::json!(errors.iter().map(|d| {
+            let mut obj = serde_json::json!({
+                "kind": d.kind,
+                "message": d.message,
+            });
+            if let Some(ref scope) = d.scope {
+                obj["scope"] = serde_json::json!(scope);
+            }
+            if let Some(ref name) = d.script_name {
+                obj["scriptName"] = serde_json::json!(name);
+            }
+            obj
+        }).collect::<Vec<_>>()).to_string();
+        START_ERRORS.with(|p| *p.borrow_mut() = Some(json));
+    }
+
+    /// Serialize current session state to a JSON DTO for the Play HUD.
+    ///
+    /// Intentionally shaped for UI consumption — not a raw GameSession dump.
+    /// Only called when `hud_dirty` is set. Writes to HUD_STATE thread_local.
+    fn write_hud_state(&self) {
+        let json = match &self.game_session {
+            Some(session) => {
+                let (ended, winner) = match &session.phase {
+                    GamePhase::Ended { winner } => (true, winner.map(|t| t.0)),
+                    _ => (false, None),
+                };
+                let teams: Vec<serde_json::Value> = session.teams.iter().map(|t| {
+                    let unit_count = session.team_characters(t.id)
+                        .iter()
+                        .filter(|c| c.alive)
+                        .count();
+                    serde_json::json!({
+                        "id": t.id.0,
+                        "name": t.name,
+                        "resources": t.resources,
+                        "unitCount": unit_count,
+                    })
+                }).collect();
+                serde_json::json!({
+                    "phase": format!("{:?}", session.phase),
+                    "mode": format!("{:?}", session.mode),
+                    "turnNumber": session.turn_number,
+                    "activeTeam": session.active_team.map(|t| t.0),
+                    "teams": teams,
+                    "ended": ended,
+                    "winner": winner,
+                }).to_string()
+            }
+            None => {
+                // Session removed (stopped) — emit null state so React clears HUD.
+                "null".to_string()
+            }
+        };
+        HUD_STATE.with(|p| *p.borrow_mut() = Some(json));
+    }
+
     // ── Effect translation (infrastructure → engine) ────────────────
 
     /// Convert world-space coordinates to screen-space pixels.
@@ -2894,6 +3004,7 @@ impl Game for FreedomBoardGame {
                 self.rules_engine.clear_scripts();
                 self.worldgen_engine.clear_scripts();
 
+                let mut compile_results: Vec<serde_json::Value> = Vec::new();
                 let mut ai_ok = 0u32;
                 let mut ai_fail = 0u32;
                 let mut rules_ok = 0u32;
@@ -2907,38 +3018,67 @@ impl Game for FreedomBoardGame {
                             match self.ai_engine.compile_script(name, &entry.source) {
                                 Ok(_) => {
                                     ai_ok += 1;
+                                    compile_results.push(serde_json::json!({
+                                        "name": name, "scope": "character_ai", "ok": true, "message": null
+                                    }));
                                 }
                                 Err(e) => {
+                                    let msg = format!("{:?}", e);
+                                    #[cfg(target_arch = "wasm32")]
                                     web_sys::console::error_1(
-                                        &format!("[freedom-board] AI script '{}' compile error: {:?}", name, e).into(),
+                                        &format!("[freedom-board] AI script '{}' compile error: {}", name, msg).into(),
                                     );
                                     ai_fail += 1;
+                                    compile_results.push(serde_json::json!({
+                                        "name": name, "scope": "character_ai", "ok": false, "message": msg
+                                    }));
                                 }
                             }
                         }
                         "rules" => {
                             match self.rules_engine.compile_script(name, &entry.source) {
-                                Ok(_) => rules_ok += 1,
+                                Ok(_) => {
+                                    rules_ok += 1;
+                                    compile_results.push(serde_json::json!({
+                                        "name": name, "scope": "rules", "ok": true, "message": null
+                                    }));
+                                }
                                 Err(e) => {
+                                    let msg = format!("{:?}", e);
+                                    #[cfg(target_arch = "wasm32")]
                                     web_sys::console::error_1(
-                                        &format!("[freedom-board] rules script '{}' compile error: {:?}", name, e).into(),
+                                        &format!("[freedom-board] rules script '{}' compile error: {}", name, msg).into(),
                                     );
                                     rules_fail += 1;
+                                    compile_results.push(serde_json::json!({
+                                        "name": name, "scope": "rules", "ok": false, "message": msg
+                                    }));
                                 }
                             }
                         }
                         "world_gen" => {
                             match self.worldgen_engine.compile_script(name, &entry.source) {
-                                Ok(_) => worldgen_count += 1,
+                                Ok(_) => {
+                                    worldgen_count += 1;
+                                    compile_results.push(serde_json::json!({
+                                        "name": name, "scope": "world_gen", "ok": true, "message": null
+                                    }));
+                                }
                                 Err(e) => {
+                                    let msg = format!("{:?}", e);
+                                    #[cfg(target_arch = "wasm32")]
                                     web_sys::console::error_1(
-                                        &format!("[freedom-board] world_gen script '{}' compile error: {:?}", name, e).into(),
+                                        &format!("[freedom-board] world_gen script '{}' compile error: {}", name, msg).into(),
                                     );
-                                    worldgen_count += 1; // still count for reporting
+                                    worldgen_count += 1;
+                                    compile_results.push(serde_json::json!({
+                                        "name": name, "scope": "world_gen", "ok": false, "message": msg
+                                    }));
                                 }
                             }
                         }
                         other => {
+                            #[cfg(target_arch = "wasm32")]
                             web_sys::console::warn_1(
                                 &format!("[freedom-board] unknown script scope '{}' for '{}'", other, name).into(),
                             );
@@ -2946,6 +3086,7 @@ impl Game for FreedomBoardGame {
                         }
                     }
                 }
+                #[cfg(target_arch = "wasm32")]
                 web_sys::console::log_1(
                     &format!(
                         "[freedom-board] scripts reloaded: AI {}/{}, rules {}/{}, worldgen {} (deferred){}",
@@ -2955,6 +3096,10 @@ impl Game for FreedomBoardGame {
                         if unknown_count > 0 { format!(", {} unknown scope", unknown_count) } else { String::new() },
                     ).into(),
                 );
+                // Store compile results for React consumption.
+                COMPILE_RESULTS.with(|p| {
+                    *p.borrow_mut() = Some(serde_json::json!(compile_results).to_string());
+                });
             }
         });
 
@@ -3069,6 +3214,12 @@ impl Game for FreedomBoardGame {
                 c: 0.0,
             });
         }
+
+        // 6. Serialize HUD state if dirty (change-gated to avoid per-frame JSON churn).
+        if self.hud_dirty {
+            self.write_hud_state();
+            self.hud_dirty = false;
+        }
     }
 
     fn render(&self, _ctx: &mut RenderContext) {
@@ -3131,6 +3282,31 @@ thread_local! {
     /// JSON string describing the currently selected character.
     /// Written by update() when selection changes, read by `take_selected_character_info()`.
     static SELECTED_CHARACTER_INFO: std::cell::RefCell<Option<String>> =
+        std::cell::RefCell::new(None);
+
+    // ── HUD state boundary channels ────────────────────────────────────
+    //
+    // These use the same take_ pattern as SELECTED_CHARACTER_INFO.
+    // The worker polls each frame; actual payload is only produced when
+    // the underlying state has changed (dirty-gated).
+    //
+    // TECH DEBT: engine.worker.ts accumulates game-specific polling hooks.
+    // These should eventually be generalized into a "custom JSON drains"
+    // mechanism rather than per-export named hooks. See effects-and-visibility-plan.md.
+
+    /// Cached HUD state JSON. Written by update() when hud_dirty is set.
+    /// Consumed by take_game_hud_state(). Empty when no change since last take.
+    static HUD_STATE: std::cell::RefCell<Option<String>> =
+        std::cell::RefCell::new(None);
+
+    /// One-shot start-error diagnostics. Written on start_failed paths.
+    /// Consumed by take_start_errors(). Empty after drain.
+    static START_ERRORS: std::cell::RefCell<Option<String>> =
+        std::cell::RefCell::new(None);
+
+    /// One-shot compile results. Written after each script reload.
+    /// Consumed by take_compile_results(). Empty after drain.
+    static COMPILE_RESULTS: std::cell::RefCell<Option<String>> =
         std::cell::RefCell::new(None);
 }
 
@@ -3501,6 +3677,43 @@ pub fn assign_character_script(actor_id_f32: f32, script_name: &str) {
 #[wasm_bindgen]
 pub fn take_selected_character_info() -> String {
     SELECTED_CHARACTER_INFO.with(|p| p.borrow_mut().take().unwrap_or_default())
+}
+
+// ── HUD state boundary exports ─────────────────────────────────────
+//
+// These follow the same take_ pattern as selected_character_info.
+// Worker polls each frame; returns empty string when no change.
+//
+// TECH DEBT: each export is a named game-specific hook in engine.worker.ts.
+// See docs/effects-and-visibility-plan.md for the debt note on generalizing
+// these into a "custom JSON drains" mechanism.
+
+/// Return change-gated HUD state JSON, or empty string if unchanged.
+///
+/// DTO shape: `{ phase, mode, turnNumber, activeTeam, teams: [{ id, name, resources, unitCount }], ended, winner }`
+/// Emitted only on discrete state changes (phase, resource, spawn/kill, start/stop).
+/// Not emitted on clock tick to avoid per-frame JSON churn.
+#[wasm_bindgen]
+pub fn take_game_hud_state() -> String {
+    HUD_STATE.with(|p| p.borrow_mut().take().unwrap_or_default())
+}
+
+/// Return start-failure diagnostics JSON, or empty string if no failure.
+///
+/// One-shot: populated on start_failed, consumed once.
+/// DTO shape: `[{ kind, message, scope?, scriptName? }]`
+#[wasm_bindgen]
+pub fn take_start_errors() -> String {
+    START_ERRORS.with(|p| p.borrow_mut().take().unwrap_or_default())
+}
+
+/// Return per-script compile results JSON, or empty string if no reload happened.
+///
+/// One-shot: populated after each script reload, consumed once.
+/// DTO shape: `[{ name, scope, ok, message }]`
+#[wasm_bindgen]
+pub fn take_compile_results() -> String {
+    COMPILE_RESULTS.with(|p| p.borrow_mut().take().unwrap_or_default())
 }
 
 // Export the game using zap-web macro.

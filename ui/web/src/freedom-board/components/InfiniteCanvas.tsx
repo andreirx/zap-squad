@@ -113,6 +113,12 @@ interface InfiniteCanvasProps {
   onSendEventReady?: (sendEvent: (msg: Record<string, unknown>) => void) => void;
   /** Called when the selected character changes in WASM. JSON string or null to deselect. */
   onSelectedCharacter?: (json: string | null) => void;
+  /** Called when HUD state changes (phase, resources, teams). Change-gated in WASM. */
+  onHudState?: (json: string) => void;
+  /** Called on start_failed with structured diagnostics. One-shot. */
+  onStartErrors?: (json: string) => void;
+  /** Called after script reload with per-script compile results. One-shot. */
+  onCompileResults?: (json: string) => void;
 }
 
 /**
@@ -161,6 +167,9 @@ export function InfiniteCanvas({
   onWorldExport,
   onSendEventReady,
   onSelectedCharacter,
+  onHudState,
+  onStartErrors,
+  onCompileResults,
 }: InfiniteCanvasProps) {
   // ── Camera state (local, sent to WASM on change) ──────────────────
   const cameraRef = useRef({ x: -5, y: -5, zoom: 64 });
@@ -362,8 +371,14 @@ export function InfiniteCanvas({
     } else if (data.type === 'selected_character') {
       const json = data.json as string | undefined;
       onSelectedCharacter?.(json && json.length > 0 ? json : null);
+    } else if (data.type === 'game_hud_state' && typeof data.json === 'string') {
+      onHudState?.(data.json);
+    } else if (data.type === 'start_errors' && typeof data.json === 'string') {
+      onStartErrors?.(data.json);
+    } else if (data.type === 'compile_results' && typeof data.json === 'string') {
+      onCompileResults?.(data.json);
     }
-  }, [onWorldExport, onSelectedCharacter]);
+  }, [onWorldExport, onSelectedCharacter, onHudState, onStartErrors, onCompileResults]);
 
   // Wrap onGameEvent to detect world changes and schedule saves
   const wrappedGameEvent = useCallback((events: Array<{ kind: number; a: number; b: number; c: number }>) => {

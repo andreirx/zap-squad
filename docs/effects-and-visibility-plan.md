@@ -406,6 +406,14 @@ Stream 2 Phase 2 is deferred indefinitely.
   compiled Rust, not Rhai. Script authors cannot customize visual effects
   in Phase 1. This is intentional -- art direction should be stable before
   exposing it to scripting.
+- **engine.worker.ts accumulates game-specific polling hooks.** The worker
+  now has 6 named Freedom Board exports: `take_world_export`,
+  `take_selected_character_info`, `take_game_hud_state`, `take_start_errors`,
+  `take_compile_results`, plus session control functions. This should
+  eventually be generalized into a "custom JSON drains" mechanism where
+  WASM registers named channels and the worker polls a single
+  `take_pending_messages()` export. Not urgent — the current hooks are
+  stable and low-maintenance — but the pattern doesn't scale to 20+ hooks.
 - **Arc lifecycle is managed by frame countdown, not engine-native lifetime.**
   The engine's `add_arc()` pushes arcs permanently. ZapSquad manages expiry
   via `effects_clear_countdown` / `BEAM_LIFETIME_FRAMES` (18 frames = 300ms).

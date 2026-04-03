@@ -6,6 +6,7 @@ import { AssetPanel } from './components/AssetPanel';
 import { ScriptPanel } from './components/ScriptPanel';
 import { CharacterPanel } from './components/CharacterPanel';
 import { WorldListModal } from './components/WorldListModal';
+import { GameHUD } from './components/GameHUD';
 import {
   loadFreedomBoardAssets,
   TileDefinition,
@@ -188,6 +189,15 @@ export function FreedomBoardPage() {
   const [gameDefLoaded, setGameDefLoaded] = useState(false);
   const sendEventRef = useRef<((msg: Record<string, unknown>) => void) | null>(null);
 
+  // ── HUD boundary state ────────────────────────────────────────────
+  // Received from WASM via take_game_hud_state() (change-gated, not per-frame).
+  const [hudState, setHudState] = useState<Record<string, unknown> | null>(null);
+  // One-shot start-failure diagnostics from take_start_errors().
+  const [startErrors, setStartErrors] = useState<Array<Record<string, unknown>> | null>(null);
+  // One-shot per-script compile results from take_compile_results().
+  // Wired to ScriptPanel for per-script status display.
+  const [_compileResults, setCompileResults] = useState<Array<Record<string, unknown>> | null>(null);
+
   // ── Script panel state ────────────────────────────────────────────
   const [showScripts, setShowScripts] = useState(false);
 
@@ -232,13 +242,15 @@ export function FreedomBoardPage() {
 
   const handlePlay = useCallback(() => {
     if (!gameDefLoaded) return;
+    setStartErrors(null); // Clear stale errors from previous attempt
     sendEventRef.current?.({ type: 'start_game' });
     // Do NOT set isPlaying here — wait for WASM SESSION_STATE acknowledgment
   }, [gameDefLoaded]);
 
   const handleStop = useCallback(() => {
     sendEventRef.current?.({ type: 'stop_game' });
-    // Do NOT set isPlaying here — wait for WASM SESSION_STATE acknowledgment
+    // Do NOT set isPlaying or hudState here — wait for WASM SESSION_STATE
+    // and hud_state acknowledgments. See comment at line 182.
   }, []);
 
   // ── Tool hotkeys (global) ────────────────────────────────────────
@@ -555,12 +567,30 @@ export function FreedomBoardPage() {
               sendEventRef.current = fn;
             }, [])}
             onSelectedCharacter={handleSelectedCharacter}
+            onHudState={useCallback((json: string) => {
+              try {
+                const parsed = JSON.parse(json);
+                setHudState(parsed === null ? null : parsed);
+              } catch { /* malformed JSON — ignore */ }
+            }, [])}
+            onStartErrors={useCallback((json: string) => {
+              try { setStartErrors(JSON.parse(json)); } catch { /* ignore */ }
+            }, [])}
+            onCompileResults={useCallback((json: string) => {
+              try { setCompileResults(JSON.parse(json)); } catch { /* ignore */ }
+            }, [])}
+          />
+          <GameHUD
+            isPlaying={isPlaying}
+            hudState={hudState}
+            startErrors={startErrors}
           />
         </div>
         {showScripts && (
           <ScriptPanel
             onReloadScripts={handleReloadScripts}
             disabled={isPlaying}
+            compileResults={_compileResults as Array<{ name: string; scope: string; ok: boolean; message: string | null }> | null}
           />
         )}
       </div>
