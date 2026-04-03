@@ -290,7 +290,9 @@ See `docs/effects-and-visibility-plan.md` for the full architecture.
    - ~~Snapshot restore tested (stop restores edit-mode characters)~~ — DONE
    - ~~Play/stop/play cycle tested (no effect leak across sessions)~~ — DONE
    - ~~HUD state emitted on stop~~ — DONE
-   - Pause/resume — NOT STARTED
+   - ~~Pause/resume~~ — DONE (2026-04-03). Infrastructure-owned paused flag,
+     orthogonal to GamePhase. Blocks orchestrator, AI, movement, player input.
+     Rendering + HUD stay active. Pause button in GameHUD. 8 integration tests.
    - Turn-based flow — NOT STARTED (deferred until turn-based combat exists)
 7. **Effects pipeline + Combat UX** — Stream 2 Phase 1, targeting, feedback, events
 8. **Fog of war** — Stream 3, can run parallel with #7

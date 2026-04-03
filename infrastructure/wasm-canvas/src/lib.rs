@@ -747,15 +747,16 @@ impl FreedomBoardGame {
                     // TurnBased mode is excluded — turn rotation and active-team
                     // gating are not yet implemented. Allowing free input in TurnBased
                     // would bypass turn order entirely.
-                    let is_active_realtime_play = self.game_session.as_ref()
-                        .map(|s| {
-                            !matches!(s.phase, GamePhase::Ended { .. })
-                            && matches!(s.mode,
-                                zapsquad_core::entities::game_rules::GameMode::RealTime
-                                | zapsquad_core::entities::game_rules::GameMode::Tactical
-                            )
-                        })
-                        .unwrap_or(false);
+                    let is_active_realtime_play = !self.paused
+                        && self.game_session.as_ref()
+                            .map(|s| {
+                                !matches!(s.phase, GamePhase::Ended { .. })
+                                && matches!(s.mode,
+                                    zapsquad_core::entities::game_rules::GameMode::RealTime
+                                    | zapsquad_core::entities::game_rules::GameMode::Tactical
+                                )
+                            })
+                            .unwrap_or(false);
                     if is_active_realtime_play && self.is_player_controlled(sel_id) {
                         let target_center = (goal_tile.x as f32 + 0.5, goal_tile.y as f32 + 0.5);
                         if let Some(target_aid) = self.find_character_at(target_center.0, target_center.1) {
@@ -1445,11 +1446,8 @@ impl FreedomBoardGame {
         self.game_session = None;
         self.actor_to_instance.clear();
 
-        // Clear effect state to prevent leaking arcs/particles/countdowns
-        // into the next play session or edit mode.
-        // pending_visual_effects and countdown are cleared here (owned by self).
-        // ctx.effects.clear() must happen in update() where EngineContext is available —
-        // signaled via effects_clear_countdown = 1 (will fire on the next tick).
+        // Clear session-related state.
+        self.paused = false;
         self.pending_visual_effects.clear();
         self.effects_clear_countdown = 1; // triggers ctx.effects.clear() on next update()
 
@@ -2447,6 +2445,7 @@ impl FreedomBoardGame {
                     "teams": teams,
                     "ended": ended,
                     "winner": winner,
+                    "paused": self.paused,
                 }).to_string()
             }
             None => {
@@ -3314,6 +3313,17 @@ impl Game for FreedomBoardGame {
         // 0g. Check for pending game session operations (load def, start, stop)
         self.check_pending_game_session();
 
+        // 0g'. Check for pending pause toggle
+        let should_toggle_pause = PENDING_PAUSE_TOGGLE.with(|p| {
+            let v = *p.borrow();
+            *p.borrow_mut() = false;
+            v
+        });
+        if should_toggle_pause && self.game_session.is_some() {
+            self.paused = !self.paused;
+            self.hud_dirty = true;
+        }
+
         // 0h. Process pending character script assignments
         PENDING_SCRIPT_ASSIGNMENT.with(|p| {
             let assignments = std::mem::take(&mut *p.borrow_mut());
@@ -3354,11 +3364,27 @@ impl Game for FreedomBoardGame {
             }
         }
 
-        // 1a. Run game session orchestrator (emit events, execute rules script, apply commands)
-        self.run_orchestrator(1.0 / 60.0);
+        // 1. Game simulation — skipped entirely when paused.
+        // Effect lifecycle and visual translation still run (arcs expire, pending
+        // effects from the last unpaused tick still render). Only active mutation
+        // (orchestrator, AI scripts, movement) is blocked.
+        if !self.paused {
+            // 1a. Run game session orchestrator (emit events, execute rules script, apply commands)
+            self.run_orchestrator(1.0 / 60.0);
 
-        // 1a'. Manage effect lifecycle: retire stale arcs.
-        // Engine arcs have no built-in lifetime — ZapSquad manages expiry here.
+            // 1b. Run Rhai scripts for characters with assigned script_ids
+            self.run_scripts();
+
+            // 1c. Update character movement (smooth interpolation toward targets)
+            self.update_character_movement();
+
+            // 1d. Update character animation frames (walk cycle, idle cycle)
+            self.update_animation_frames();
+        }
+
+        // 1e. Manage effect lifecycle: retire stale arcs.
+        // Runs even when paused so beam arcs expire naturally instead of
+        // being frozen mid-display.
         if self.effects_clear_countdown > 0 {
             self.effects_clear_countdown -= 1;
             if self.effects_clear_countdown == 0 {
@@ -3366,24 +3392,14 @@ impl Game for FreedomBoardGame {
             }
         }
 
-        // 1a''. Translate pending visual effects to engine calls.
-        // Effects were projected from domain events inside run_orchestrator.
-        // Translation happens here because EngineContext is only available in update().
+        // 1f. Translate pending visual effects to engine calls.
+        // Runs even when paused to flush any effects queued before pause.
         if !self.pending_visual_effects.is_empty() {
             let effects: Vec<VisualEffect> = self.pending_visual_effects.drain(..).collect();
             for effect in &effects {
                 self.translate_visual_effect(effect, ctx);
             }
         }
-
-        // 1b. Run Rhai scripts for characters with assigned script_ids (legacy AI path)
-        self.run_scripts();
-
-        // 1c. Update character movement (smooth interpolation toward targets)
-        self.update_character_movement();
-
-        // 1d. Update character animation frames (walk cycle, idle cycle)
-        self.update_animation_frames();
 
         // 2. Rebuild visible entities if world or camera changed
         let world_changed = self.world.generation() != self.last_rendered_generation;
@@ -3877,6 +3893,13 @@ pub fn assign_character_script(actor_id_f32: f32, script_name: &str) {
         let name = if script_name.is_empty() { None } else { Some(script_name.to_string()) };
         p.borrow_mut().push((actor_id, name));
     });
+}
+
+/// Toggle pause state. Only effective when a game session is active.
+/// Consumed on the next update() tick.
+#[wasm_bindgen]
+pub fn toggle_pause() {
+    PENDING_PAUSE_TOGGLE.with(|p| *p.borrow_mut() = true);
 }
 
 /// Return JSON info about the currently selected character, or empty string
@@ -4990,5 +5013,153 @@ mod tests {
         // After tick, hud_dirty was consumed → write_hud_state called → HUD_STATE set
         // The take_game_hud_state export drains it, but we can check hud_dirty was consumed
         assert!(!game.hud_dirty, "hud_dirty should be consumed after tick");
+    }
+
+    // ── Pause/resume ──────────────────────────────────────────────────
+
+    // Note: orchestrator pause gating is covered by pause_blocks_simulation_in_update,
+    // which verifies the real production gate in update() (paused → tick → events not
+    // drained, no arcs, no effect projection). The gate is in update(), not in
+    // run_orchestrator() itself.
+
+    #[test]
+    fn pause_blocks_player_attack() {
+        let (mut game, _, player_aid, enemy_aid) = setup_combat();
+        game.selected_character = Some(player_aid);
+        game.paused = true;
+
+        let hp_before = game.characters.get(&enemy_aid).unwrap().health;
+        game.handle_custom_event(events::MOVE_CHARACTER, 4.0, 2.0, 0.0);
+        let hp_after = game.characters.get(&enemy_aid).unwrap().health;
+
+        assert_eq!(hp_before, hp_after, "attack should be blocked while paused");
+    }
+
+    #[test]
+    fn pause_blocks_player_movement() {
+        let (mut game, _, player_aid, _) = setup_combat();
+        game.selected_character = Some(player_aid);
+        game.paused = true;
+
+        game.handle_custom_event(events::MOVE_CHARACTER, 10.0, 10.0, 0.0);
+
+        assert!(
+            !game.movement_targets.contains_key(&player_aid),
+            "movement should be blocked while paused"
+        );
+    }
+
+    #[test]
+    fn pause_blocks_simulation_in_update() {
+        let (mut game, mut ctx) = setup_with_session();
+
+        // Push attack event
+        game.game_session.as_mut().unwrap().events.push(
+            RulesGameEvent::AttackResolved {
+                attacker_id: CharacterInstanceId(1),
+                target_id: CharacterInstanceId(2),
+                damage: 10.0, hit: true,
+                attacker_pos: (0.0, 0.0), target_pos: (1.0, 1.0),
+            },
+        );
+
+        game.paused = true;
+        tick(&mut game, &mut ctx);
+
+        // Orchestrator should not have run → events not drained → no effects
+        assert_eq!(ctx.effects.arcs.len(), 0, "no arcs should appear while paused");
+        assert!(game.pending_visual_effects.is_empty(), "no effects should be projected while paused");
+
+        // Events should still be in queue (not drained)
+        let session = game.game_session.as_ref().unwrap();
+        assert!(!session.events.is_empty(), "events should not be drained while paused");
+    }
+
+    #[test]
+    fn resume_restores_simulation() {
+        let (mut game, mut ctx) = setup_with_session();
+
+        // Push attack event
+        game.game_session.as_mut().unwrap().events.push(
+            RulesGameEvent::AttackResolved {
+                attacker_id: CharacterInstanceId(1),
+                target_id: CharacterInstanceId(2),
+                damage: 10.0, hit: true,
+                attacker_pos: (0.0, 0.0), target_pos: (1.0, 1.0),
+            },
+        );
+
+        // Pause then resume
+        game.paused = true;
+        tick(&mut game, &mut ctx);
+        assert_eq!(ctx.effects.arcs.len(), 0, "paused: no arcs");
+
+        game.paused = false;
+        tick(&mut game, &mut ctx);
+
+        // Orchestrator should now have run → events drained → effects projected + translated
+        assert_eq!(ctx.effects.arcs.len(), 1, "resumed: beam arc should appear");
+    }
+
+    #[test]
+    fn pause_toggle_via_pending_flag() {
+        let (mut game, mut ctx) = setup_with_session();
+
+        assert!(!game.paused);
+
+        // Simulate toggle_pause() WASM export
+        PENDING_PAUSE_TOGGLE.with(|p| *p.borrow_mut() = true);
+        tick(&mut game, &mut ctx);
+        assert!(game.paused, "should be paused after toggle");
+
+        // Toggle again to resume
+        PENDING_PAUSE_TOGGLE.with(|p| *p.borrow_mut() = true);
+        tick(&mut game, &mut ctx);
+        assert!(!game.paused, "should be resumed after second toggle");
+    }
+
+    #[test]
+    fn stop_clears_paused_state() {
+        let (mut game, _, _, _) = setup_combat();
+        game.paused = true;
+
+        game.stop_game_session();
+
+        assert!(!game.paused, "paused should be cleared on stop");
+    }
+
+    #[test]
+    fn play_pause_resume_stop_play_no_leak() {
+        let (mut game, mut ctx) = setup_with_real_start();
+
+        // Place a character
+        let aid = ActorId(70);
+        game.characters.insert(aid, CompositeActor::new(aid, Vec2::new(5.0, 5.0), "marine"));
+
+        // Start → pause → resume → stop
+        game.start_game_session();
+        assert!(game.game_session.is_some());
+
+        game.paused = true;
+        tick(&mut game, &mut ctx);
+        assert!(game.paused);
+
+        game.paused = false;
+        tick(&mut game, &mut ctx);
+        assert!(!game.paused);
+
+        game.stop_game_session();
+        tick(&mut game, &mut ctx); // drain effects
+
+        // Verify clean state
+        assert!(!game.paused, "paused cleared after stop");
+        assert!(game.game_session.is_none());
+        assert_eq!(game.effects_clear_countdown, 0);
+        assert!(game.pending_visual_effects.is_empty());
+
+        // Second play session should start clean
+        game.start_game_session();
+        assert!(game.game_session.is_some());
+        assert!(!game.paused, "new session should not inherit paused state");
     }
 }

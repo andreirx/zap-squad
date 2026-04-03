@@ -584,6 +584,9 @@ export function FreedomBoardPage() {
             isPlaying={isPlaying}
             hudState={hudState}
             startErrors={startErrors}
+            onTogglePause={useCallback(() => {
+              sendEventRef.current?.({ type: 'toggle_pause' });
+            }, [])}
           />
         </div>
         {showScripts && (

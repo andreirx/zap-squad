@@ -33,6 +33,7 @@ interface HudState {
   teams: HudTeam[];
   ended: boolean;
   winner: number | null;
+  paused: boolean;
 }
 
 interface StartError {
@@ -46,6 +47,7 @@ interface GameHUDProps {
   isPlaying: boolean;
   hudState: Record<string, unknown> | null;
   startErrors: Array<Record<string, unknown>> | null;
+  onTogglePause?: () => void;
 }
 
 // ── Styles ─────────────────────────────────────────────────────────
@@ -108,7 +110,7 @@ const errorContainerStyle: React.CSSProperties = {
 
 // ── Component ──────────────────────────────────────────────────────
 
-export function GameHUD({ isPlaying, hudState, startErrors }: GameHUDProps) {
+export function GameHUD({ isPlaying, hudState, startErrors, onTogglePause }: GameHUDProps) {
   // Show error panel even when not playing (start_failed = not playing)
   const hasErrors = startErrors && startErrors.length > 0;
 
@@ -122,10 +124,34 @@ export function GameHUD({ isPlaying, hudState, startErrors }: GameHUDProps) {
       {/* HUD bar — visible during play */}
       {isPlaying && hud && (
         <div style={hudBarStyle}>
-          {/* Phase */}
+          {/* Pause/Resume button */}
+          {!hud.ended && onTogglePause && (
+            <button
+              onClick={onTogglePause}
+              style={{
+                padding: '2px 10px',
+                background: hud.paused ? '#4a3a00' : '#1a2a4a',
+                color: hud.paused ? '#ffd54f' : '#8899aa',
+                border: `1px solid ${hud.paused ? '#6a5a20' : '#2a3a5a'}`,
+                borderRadius: 3,
+                cursor: 'pointer',
+                fontSize: 11,
+                fontWeight: 600,
+                pointerEvents: 'auto',
+              }}
+            >
+              {hud.paused ? 'Resume' : 'Pause'}
+            </button>
+          )}
+
+          {/* Phase / Paused indicator */}
           {hud.ended ? (
             <span style={endedStyle}>
               GAME OVER{hud.winner != null ? ` — Team ${hud.winner} wins` : ''}
+            </span>
+          ) : hud.paused ? (
+            <span style={{ fontWeight: 'bold', color: '#ffd54f', fontSize: 14 }}>
+              PAUSED
             </span>
           ) : (
             <span style={phaseStyle}>{formatPhase(hud.phase)}</span>
