@@ -307,44 +307,44 @@ Marks cells within each observer's radius as `Visible`. All other previously
 `Visible` cells transition to `Explored`. `Hidden` cells outside all radii
 remain `Hidden`.
 
-### 3C. Visibility Mapper in Adapters
+### 3C. Visibility Mapper in Adapters — REVISED
 
-```rust
-// adapters/visibility_mapper.rs
+**Original plan** prescribed `map_to_mask_bytes()` for a dense engine mask.
+That approach was abandoned — see `docs/plan-fog-of-war.md` "Abandoned
+Approach" section.
 
-fn map_to_mask_bytes(team_vis: &TeamVisibility) -> Vec<u8> {
-    team_vis.grid.iter().map(|cell| match cell {
-        CellState::Hidden   => 0,
-        CellState::Explored => 128,
-        CellState::Visible  => 255,
-    }).collect()
-}
-```
+**Current implementation** provides per-cell utilities only:
+- `cell_to_byte(CellState) -> u8` (Hidden=0, Explored=128, Visible=255)
+- `fog_alpha(CellState) -> f32` (Hidden=1.0, Explored=0.5, Visible=0.0)
 
-Pure translation. The 128 value for `Explored` produces ~50% darkness in the
-engine mask. Tunable without touching core.
+**Future**: chunk-level fog projection DTOs for fog tile sprite rendering.
 
-### 3D. Wire into Infrastructure
+### 3D. Wire into Infrastructure — SUPERSEDED
 
-1. Set `GameConfig.visibility_cols` and `visibility_rows` based on world
-   bounds (or game definition parameter).
-2. Each frame during play mode:
-   - Collect observer positions and vision ranges from live characters.
-   - Call `update_visibility()` with current team's observers.
-   - Call `map_to_mask_bytes()` to produce the byte grid.
-   - Write bytes into `ctx.visibility`.
-3. Filter entity spawning: skip `ctx.scene.spawn()` for enemy characters
-   on cells where the viewing team's visibility is `Hidden`.
+**Original plan** prescribed `GameConfig.visibility_cols/rows`, per-frame
+`map_to_mask_bytes()`, and `ctx.visibility` writes. That dense engine mask
+approach was abandoned because it assumes a bounded world, which is wrong
+for the infinite-canvas product.
+
+**Current implementation** (see `docs/plan-fog-of-war.md` for full details):
+- Sparse `TeamVisibility` grids created/destroyed with session lifecycle
+- Per-tick `update_fog_of_war()` collects observers, updates per-team grids
+- `is_actor_visible_to_viewer()` gates rendering, selection, targeting
+- `is_world_pos_visible()` gates effect spawning (beams, sparks)
+- Visual fog via vector rectangles (interim — will be replaced by fog tiles)
+- No engine mask used. `GameConfig.visibility_cols/rows` = 0.
 
 ### 3E. Product Decisions (Locked)
 
 | Decision | Answer | Rationale |
 |---|---|---|
 | Fog scope | Play-mode only | Keeps authored/live state separated (VISION.md) |
-| Explored-not-visible | Dimmed (3-state byte) | Fits engine mask naturally; provides exploration memory |
-| Hidden enemies | Not rendered | No information leakage; semantically honest |
+| Explored-not-visible | Dimmed (3-state) | Provides exploration memory |
+| Hidden enemies | Not rendered | No information leakage; gated before spawn |
+| Hidden effects | Suppressed | Beams if both ends hidden; sparks if position hidden |
 | Vision model | Radius-only (Phase 1) | LOS deferred to avoid premature complexity |
 | Grid resolution | Per-tile | Matches SparseWorld granularity |
+| Storage model | Sparse chunked | Matches SparseWorld; no bounded rectangle |
 
 ### 3F. Future Engine Work (Not Planned)
 

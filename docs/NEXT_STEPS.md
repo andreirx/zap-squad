@@ -235,23 +235,32 @@ Engine is frozen at protocol v5 (zap-engine commit 3986dbe, 2026-04-02).
 
 **Goal:** Team-scoped visibility with exploration memory.
 
-See `docs/effects-and-visibility-plan.md` for the full architecture.
+See `docs/plan-fog-of-war.md` for the full implementation plan. The earlier
+fog sections in `docs/effects-and-visibility-plan.md` (3C, 3D) are superseded
+— that document has been updated with REVISED/SUPERSEDED markers.
 
-**Can run in parallel with Phase G after 3A is complete.**
+**Architecture pivot:** Dense bounded engine mask was abandoned in favor of
+sparse chunked visibility aligned to SparseWorld. No `GameConfig.visibility_cols/rows`,
+no `ctx.visibility` writes. See plan-fog-of-war.md "Abandoned Approach" for rationale.
 
 **Tasks:**
-1. TeamVisibility entity in core (Hidden / Explored / Visible per cell per team)
-2. Vision update use case (radius-only, pure function, off-target testable)
-3. Visibility mapper in adapters (CellState -> byte)
-4. Wire into infrastructure (GameConfig cols/rows, ctx.visibility, entity filter)
-5. Product tuning (dimming values, vision ranges per unit type)
+1. ~~TeamVisibility entity in core (sparse chunked, 9 tests)~~ — DONE
+2. ~~Vision update use case (radius-only, sparse-aware, 11 tests)~~ — DONE
+3. ~~Visibility mapper in adapters (cell_to_byte, fog_alpha, 2 tests)~~ — DONE
+4. ~~Infrastructure: fog grids lifecycle, entity/effect gating (11 tests)~~ — DONE
+5. ~~Fog-aware effect gating (beams/sparks suppressed at hidden cells)~~ — DONE
+6. ~~Visual fog overlay (vector rectangles, interim implementation)~~ — DONE
+7. Fog tile sprites with feathered edge transitions — NOT STARTED (replaces vector fog)
+8. Product tuning (vision ranges via character stats, dimming, edges) — NOT STARTED
 
 **Done when:**
-- Fog renders during play mode, clears on stop
-- Characters reveal terrain within their vision range
-- Previously-seen areas are dimmed, never-seen areas are black
-- Enemy characters on hidden cells are not rendered
-- Vision update logic has off-target unit tests
+- ~~Fog renders during play mode, clears on stop~~ — DONE (interim vector fog)
+- ~~Characters reveal terrain within their vision range~~ — DONE
+- ~~Previously-seen areas are dimmed, never-seen areas are dark~~ — DONE
+- ~~Enemy characters on hidden cells are not rendered~~ — DONE
+- ~~Effects at hidden cells are suppressed~~ — DONE
+- ~~Vision update logic has off-target unit tests~~ — DONE (20 core tests)
+- Fog tiles with feathered edge art replace vector rectangles — NOT DONE
 
 ---
 
